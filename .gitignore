@@ -1,34 +1,115 @@
 import * as React from 'react';
-import { FormControl, InputLabel, Select, MenuItem, Chip } from '@mui/material';
+import { TableRow, TableCell, Typography } from '@mui/material';
+import PeopleCell from './PeopleCell';
+import SelectChip from '../atoms/SelectChip';
+import ActionStatusIcon from '../atoms/ActionStatusIcon';
 
-/** getChipSx?: (value) => sx object */
-export default function SelectChip({ label, value, options, onChange, getChipSx, sx, disabled = false }) {
-  const handle = (e) => onChange?.(e.target.value || null);
+const SCOPE_OPTS = ['Yes','No','Inherit VCS','Inherit Network','Inherit VGS-T','Inherit TPD'];
+const MAT_OPTS   = ['Increase','Maintain','Decrease'];
+const PROF_OPTS  = ['Provider','Consumer','Inheritor'];
+
+const isInherit = (v) => typeof v === 'string' && v.startsWith('Inherit');
+
+const scopeChipSx = (v) => {
+  if (v === 'Yes')
+    return { bgcolor: 'success.light', color: 'success.dark', borderColor: 'success.main', borderWidth: 1, borderStyle: 'solid' };
+  if (v === 'No')
+    return { bgcolor: 'error.light',   color: 'error.dark',   borderColor: 'error.main',   borderWidth: 1, borderStyle: 'solid' };
+  // All “Inherit …” share a blue tone for clear visual grouping
+  if (isInherit(v))
+    return { bgcolor: 'primary.light', color: 'grey.900', borderColor: 'primary.main', borderWidth: 1, borderStyle: 'solid' };
+  return {};
+};
+
+const maturityChipSx = (v) => v === 'Increase'
+  ? { bgcolor: 'success.light', color: 'success.dark', borderColor: 'success.main', borderWidth: 1, borderStyle: 'solid' }
+  : v === 'Maintain'
+    ? { bgcolor: 'grey.200',   color: 'grey.900',     borderColor: 'grey.300',    borderWidth: 1, borderStyle: 'solid' }
+    : { bgcolor: 'error.light', color: 'error.dark',  borderColor: 'error.main',  borderWidth: 1, borderStyle: 'solid' };
+
+const profileChipSx = (v) => v === 'Provider'
+  ? { bgcolor: 'primary.light', color: 'grey.900', borderColor: 'primary.main', borderWidth: 1, borderStyle: 'solid' }
+  : v === 'Consumer'
+    ? { bgcolor: 'warning.light', color: 'warning.dark', borderColor: 'warning.main', borderWidth: 1, borderStyle: 'solid' }
+    : { bgcolor: 'grey.200', color: 'grey.900', borderColor: 'grey.300', borderWidth: 1, borderStyle: 'solid' };
+
+export default function ReadinessRow({ row, status, onPatch, onSave, onOpenAddModal, allowOwnerRemove = true }) {
+  const disabledMP = row.scope === 'No';
+  const disabledPT = row.scope === 'No' || isInherit(row.scope);
+
+  const handleScopeChange = (v) => {
+    const patch = { scope: v };
+    if (v === 'No') {
+      patch.maturityProjection = null;
+      patch.profileType = null;
+    } else if (isInherit(v)) {
+      patch.profileType = 'Inheritor';
+    }
+    onPatch(patch);
+  };
 
   return (
-    <FormControl fullWidth sx={sx} disabled={disabled}>
-      <InputLabel>{label}</InputLabel>
-      <Select
-        label={label}
-        size="small"
-        value={value || ''}
-        onChange={handle}
-        disabled={disabled}
-        renderValue={(val) => {
-          if (!val) return <em>Select…</em>;
-          const chipSx = getChipSx ? getChipSx(val) : { bgcolor: 'primary.light', color: 'grey.900' };
-          return (
-            <Chip
-              size="small"
-              label={val}
-              sx={{ fontWeight: 700, border: '1px solid transparent', ...chipSx }}
-            />
-          );
-        }}
-      >
-        <MenuItem value=""><em>Select…</em></MenuItem>
-        {options.map((o) => <MenuItem key={o} value={o}>{o}</MenuItem>)}
-      </Select>
-    </FormControl>
+    <TableRow hover>
+      <TableCell sx={{ whiteSpace: 'nowrap' }}>
+        <Typography fontWeight={700}>{row.orgAbbr}</Typography>
+        <Typography variant="caption" color="text.secondary">{row.orgFullName}</Typography>
+      </TableCell>
+
+      <TableCell>
+        <PeopleCell
+          value={row.subcatOwner}
+          canRemove={allowOwnerRemove}
+          onChange={(v)=>onPatch({ subcatOwner: v })}
+          onOpenAdd={()=>onOpenAddModal?.(row, 'subcatOwner')}
+          addLabel="Add/Remove Owner"
+        />
+      </TableCell>
+
+      <TableCell>
+        <PeopleCell
+          value={row.subcatCustodian}
+          canRemove
+          onChange={(v)=>onPatch({ subcatCustodian: v })}
+          onOpenAdd={()=>onOpenAddModal?.(row, 'subcatCustodian')}
+          addLabel="Add Custodian"
+        />
+      </TableCell>
+
+      <TableCell>
+        <SelectChip
+          label="Scope"
+          value={row.scope}
+          options={SCOPE_OPTS}
+          onChange={handleScopeChange}
+          getChipSx={scopeChipSx}
+        />
+      </TableCell>
+
+      <TableCell>
+        <SelectChip
+          label="Maturity"
+          value={row.maturityProjection}
+          options={MAT_OPTS}
+          onChange={(v)=>onPatch({ maturityProjection: v })}
+          getChipSx={maturityChipSx}
+          disabled={disabledMP}
+        />
+      </TableCell>
+
+      <TableCell>
+        <SelectChip
+          label="Profile Type"
+          value={isInherit(row.scope) ? 'Inheritor' : row.profileType}
+          options={PROF_OPTS}
+          onChange={(v)=>onPatch({ profileType: v })}
+          getChipSx={profileChipSx}
+          disabled={disabledPT}
+        />
+      </TableCell>
+
+      <TableCell align="center">
+        <ActionStatusIcon status={status} onClick={onSave} disabled={status==='saving'} />
+      </TableCell>
+    </TableRow>
   );
 }
