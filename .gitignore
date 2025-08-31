@@ -1,9 +1,104 @@
-WHEN @S = 'INHERIT VCS'            THEN 'Inherit VCS'
-          WHEN @S = 'INHERIT NETWORK'        THEN 'Inherit Network'
-          WHEN @S = 'INHERIT VGS-T'          THEN 'Inherit VGS-T'
-          WHEN @S = 'INHERIT TPD'            THEN 'Inherit TPD'
-          ELSE NULL
-        END;
-      IF @ScopeNorm IS NULL
-        THROW 50001, 'Invalid Scope. Allowed: Yes/No/Inherit VCS/Inherit Network/Inherit VGS-T/Inherit TPD.', 1;
-    END
+import * as React from 'react';
+import { Box, Stack, Chip, IconButton, Tooltip } from '@mui/material';
+import AddCircleOutlineIcon from '@mui/icons-material/AddCircleOutline';
+
+function splitCsv(s) { return (s || '').split(',').map(v => v.trim()).filter(Boolean); }
+function joinCsv(arr) { return arr.filter(Boolean).join(', '); }
+
+export default React.memo(function PeopleCell({
+  value,
+  canRemove,
+  onChange,
+  onOpenAdd,
+  addLabel = 'Add',
+  placement = 'rail', // 'rail' | 'inline'
+}) {
+  const names = splitCsv(value);
+  const isEmpty = names.length === 0;
+
+  const removeName = (name) => {
+    if (!canRemove) return;
+    const next = names.filter(n => n !== name);
+    onChange?.(joinCsv(next));
+  };
+
+  if (placement === 'inline') {
+    return (
+      <Stack direction="row" gap={1} flexWrap="wrap" alignItems="center" sx={{ minHeight: 44 }}>
+        {names.map((n) => (
+          <Chip
+            key={n}
+            size="small"
+            label={n}
+            sx={{ bgcolor: 'grey.200', color: 'grey.900', border: '1px solid', borderColor: 'grey.300' }}
+            onDelete={canRemove ? ()=>removeName(n) : undefined}
+          />
+        ))}
+        <Tooltip title={isEmpty ? `${addLabel} (required)` : addLabel}>
+          <IconButton
+            size="small"
+            onClick={onOpenAdd}
+            aria-label={addLabel}
+            sx={{
+              p: 0.25,
+              color: isEmpty ? 'error.main' : 'text.primary',
+              bgcolor: isEmpty ? 'error.light' : 'background.paper',
+              border: '1px solid',
+              borderColor: isEmpty ? 'error.main' : 'grey.300',
+              '&:hover': { bgcolor: isEmpty ? 'error.light' : 'grey.100' }
+            }}
+          >
+            <AddCircleOutlineIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      </Stack>
+    );
+  }
+
+  // Option A: left rail for perfectly aligned "plus" (recommended)
+  return (
+    <Box
+      sx={{
+        display: 'grid',
+        gridTemplateColumns: '28px 1fr',  // left rail + chip area
+        columnGap: 1,
+        alignItems: 'end',
+        minHeight: 56,
+      }}
+    >
+      {/* Left rail: bottom-left "plus" anchored consistently */}
+      <Box sx={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'flex-start', pb: 0.25 }}>
+        <Tooltip title={isEmpty ? `${addLabel} (required)` : addLabel}>
+          <IconButton
+            size="small"
+            onClick={onOpenAdd}
+            aria-label={addLabel}
+            sx={{
+              p: 0.25,
+              color: isEmpty ? 'error.main' : 'text.primary',
+              bgcolor: isEmpty ? 'error.light' : 'background.paper',
+              border: '1px solid',
+              borderColor: isEmpty ? 'error.main' : 'grey.300',
+              '&:hover': { bgcolor: isEmpty ? 'error.light' : 'grey.100' }
+            }}
+          >
+            <AddCircleOutlineIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      </Box>
+
+      {/* Chips to the right (never overlapped) */}
+      <Stack direction="row" gap={1} flexWrap="wrap" alignItems="flex-start">
+        {names.map((n) => (
+          <Chip
+            key={n}
+            size="small"
+            label={n}
+            sx={{ bgcolor: 'grey.200', color: 'grey.900', border: '1px solid', borderColor: 'grey.300' }}
+            onDelete={canRemove ? ()=>removeName(n) : undefined}
+          />
+        ))}
+      </Stack>
+    </Box>
+  );
+});
