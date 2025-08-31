@@ -1,0 +1,34 @@
+import * as React from 'react';
+import { FormControl, InputLabel, Select, MenuItem, Chip } from '@mui/material';
+
+/** getChipSx?: (value) => sx object */
+export default function SelectChip({ label, value, options, onChange, getChipSx, sx, disabled = false }) {
+  const handle = (e) => onChange?.(e.target.value || null);
+
+  return (
+    <FormControl fullWidth sx={sx} disabled={disabled}>
+      <InputLabel>{label}</InputLabel>
+      <Select
+        label={label}
+        size="small"
+        value={value || ''}
+        onChange={handle}
+        disabled={disabled}
+        renderValue={(val) => {
+          if (!val) return <em>Select…</em>;
+          const chipSx = getChipSx ? getChipSx(val) : { bgcolor: 'primary.light', color: 'grey.900' };
+          return (
+            <Chip
+              size="small"
+              label={val}
+              sx={{ fontWeight: 700, border: '1px solid transparent', ...chipSx }}
+            />
+          );
+        }}
+      >
+        <MenuItem value=""><em>Select…</em></MenuItem>
+        {options.map((o) => <MenuItem key={o} value={o}>{o}</MenuItem>)}
+      </Select>
+    </FormControl>
+  );
+}
