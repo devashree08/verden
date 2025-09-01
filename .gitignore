@@ -1,52 +1,20 @@
-function deriveOrgPool({ lookups, filters, facts }) {
-  const selected = (filters?.orgAbbr || []).filter(Boolean);
-  const lookupOrgs = Array.isArray(lookups?.orgs) ? lookups.orgs : [];
+// Single source of truth for row identity & custom detection.
 
-  // map: abbr -> { orgID }
-  const map = new Map();
+export const isCustom = (r) =>
+  !!(r?.isCustom || r?.customAttributeDefinition != null || r?.customAttributeNum != null);
 
-  const upsert = (abbr, id) => {
-    if (!abbr) return;
-    const curr = map.get(abbr);
-    map.set(abbr, { orgID: curr?.orgID ?? id ?? null });
-  };
-
-  const addFromLookups = (orgs) => {
-    for (const o of orgs || []) {
-      const abbr = o?.orgAbbr ?? o?.abbr ?? o?.OrgAbbr;
-      const id = o?.orgID ?? o?.orgId ?? o?.OrgID ?? null;
-      upsert(abbr, id);
-    }
-  };
-
-  const addFromFacts = (rows) => {
-    for (const r of rows || []) {
-      const abbr = r?.orgAbbr;
-      const id = r?.orgID ?? r?.orgId ?? r?.OrgID ?? null;
-      upsert(abbr, id);
-    }
-  };
-
-  if (selected.length) {
-    addFromLookups(lookupOrgs.filter(o => selected.includes(o?.orgAbbr ?? o?.abbr ?? o?.OrgAbbr)));
-    for (const abbr of selected) if (!map.has(abbr)) upsert(abbr, null);
-  } else {
-    addFromLookups(lookupOrgs);
+/** Stable key:
+ *  - Custom:  org|sub|ml|C|0|customNum
+ *  - Baseline:org|sub|ml|B|csf1|attrNum
+ */
+export const rowKey = (r) => {
+  const org = String(r?.orgID ?? '0');
+  const sub = String(r?.csF2SubcategoryID ?? '0');
+  const ml  = String(r?.maturityLevel ?? '0');
+  if (isCustom(r)) {
+    return `${org}|${sub}|${ml}|C|0|${String(r?.customAttributeNum ?? '0')}`;
   }
+  const csf1 = String(r?.csF1SubcategoryID ?? '0');
+  return `${org}|${sub}|${ml}|B|${csf1}|${String(r?.attributeNum ?? '0')}`;
+};
 
-  addFromFacts(facts);
-
-  const entries = Array.from(map.entries()).map(([orgAbbr, v]) => ({
-    orgAbbr,
-    sheetName: orgAbbr,     // <-- use abbr for the tab label
-    orgID: v.orgID,
-  }));
-
-  entries.sort((a, b) => {
-    const ai = a.orgID ?? Number.MAX_SAFE_INTEGER;
-    const bi = b.orgID ?? Number.MAX_SAFE_INTEGER;
-    return ai - bi;
-  });
-
-  return entries;
-}
