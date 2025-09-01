@@ -1,108 +1,93 @@
-// /ui/data/ExcelExport/index.js
-import ExcelJS from 'exceljs';
+// /features/attributeMapping/utils/buildSheetsForAttributeMapping.js
 
-/**
- * exportExcel({
- *   fileName: string,
- *   sheets: Array<{
- *     name: string,
- *     columns: Array<{ header: string, key: string, width?: number }>,
- *     rows: Array<Record<string, any>>,
- *     freezeHeader?: boolean,           // default: true
- *     editableHeaders?: string[],       // headers to tint
- *     editableHeaderColor?: string,     // ARGB like 'FFFDE68A' (same color for all editable headers)
- *     autoFilter?: boolean,             // default: true
- *   }>
- * })
- */
-export async function exportExcel({ fileName = 'export.xlsx', sheets = [] }) {
-  const wb = new ExcelJS.Workbook();
-  wb.created = new Date();
+export function buildSheetsForAttributeMapping({ headers = [], rows = [], finalOnly = false }) {
+  // org list from headers so we create sheets even when an org has zero rows
+  const orgs = dedupeBy(headers.map(h => ({ orgID: h.orgID, orgName: h.orgName })), x => x.orgID);
 
-  const used = new Set();
+  // sign-off per (org, subcat)
+  const signoff = new Map();
+  headers.forEach(h => {
+    const key = `${h.orgID}|${h.csF2SubcategoryID}`;
+    const cAt = h.completedAt ? new Date(h.completedAt) : null;
+    const rAt = h.reopenedAt  ? new Date(h.reopenedAt)  : null;
+    const isDone = !!(cAt && (!rAt || cAt >= rAt));
+    signoff.set(key, isDone);
+  });
 
-  for (const s of sheets) {
-    const name = uniqueSheetName(s.name || 'Sheet', used);
-    used.add(name);
+  const columns = [
+    { header: 'CSF 2.0 Function',      key: 'function',    width: 28 },
+    { header: 'CSF 2.0 Category',      key: 'category',    width: 28 },
+    { header: 'CSF 2.0 Subcategory',   key: 'subcategory', width: 34 },
+    { header: 'ML',                    key: 'ml',          width: 6  },
+    { header: 'Attribute #',           key: 'attrNum',     width: 12 },
+    { header: 'Attribute Definition',  key: 'attrDef',     width: 80 },
+    { header: 'Status',                key: 'status',      width: 14 },
+    { header: '2025 Attestation',      key: 'attest2025',  width: 18 },
+    { header: '2024 Assessor Score',   key: 'assess2024',  width: 20 },
+    { header: 'Subcategory Sign-Off?', key: 'signoff',     width: 22 },
+  ];
+  const editableHeaders = ['Status', '2025 Attestation', 'Subcategory Sign-Off?'];
 
-    const ws = wb.addWorksheet(name, {
-      views: [{ state: 'frozen', ySplit: (s.freezeHeader ?? true) ? 1 : 0 }],
-      properties: { defaultRowHeight: 16 },
+  const sheets = orgs.map(({ orgID, orgName }) => {
+    const rOrg = rows.filter(r => String(r.orgID) === String(orgID));
+
+    const inScope = finalOnly
+      ? rOrg.filter(r => {
+          const isCustom = !!(r.isCustom || r.customAttributeDefinition);
+          if (isCustom) return true;
+          return (r.selectionStatus || '') !== 'Remove';
+        })
+      : rOrg;
+
+    const excelRows = inScope.map(r => {
+      const isCustom = !!(r.isCustom || r.customAttributeDefinition);
+      const key = `${r.orgID}|${r.csF2SubcategoryID}`;
+      return {
+        function:    r.functionName || '',
+        category:    r.categoryName || '',
+        subcategory: r.csF2SubcategoryName || '',
+        ml:          r.maturityLevel ?? '',
+        attrNum:     isCustom ? (r.customAttributeNum ?? '') : (r.attributeNum ?? ''),
+        attrDef:     r.customAttributeDefinition || r.attributeDefinition || '',
+        status:      isCustom ? 'Add' : (r.selectionStatus || ''),
+        attest2025:  isCustom ? (r.customAttributeAttestation || '') : (r.selectionAttestation || ''),
+        assess2024:  r.assessScore2024 || '',
+        signoff:     signoff.get(key) ? 'Yes' : 'No',
+      };
     });
 
-    // define columns
-    ws.columns = (s.columns || []).map(col => ({
-      header: col.header,
-      key: col.key,
-      width: col.width ?? idealWidth(col.header),
-      style: { font: { size: 11 }, alignment: { vertical: 'middle', wrapText: true } },
-    }));
-
-    // header styling
-    const headerRow = ws.getRow(1);
-    headerRow.height = 20;
-    headerRow.font = { bold: true };
-    headerRow.alignment = { vertical: 'middle' };
-    headerRow.fill = {
-      type: 'pattern',
-      pattern: 'solid',
-      fgColor: { argb: 'FFF3F4F6' }, // base light gray
+    return {
+      name: orgName || `Org ${orgID}`,
+      columns,
+      rows: excelRows,                   // can be empty -> still create sheet with headers
+      freezeHeader: true,
+      editableHeaders,
+      editableHeaderColor: 'FFFDE68A',   // SAME color for all editable columns
     };
-    headerRow.border = { bottom: { style: 'thin', color: { argb: 'FFCBD5E1' } } };
-
-    // tint "editable" headers (SAME COLOR for all editable columns)
-    const editableSet = new Set(s.editableHeaders || []);
-    const editableColor = s.editableHeaderColor || 'FFFDE68A'; // amber-200
-    if (editableSet.size) {
-      for (let c = 1; c <= ws.columnCount; c++) {
-        const label = headerRow.getCell(c).value?.toString?.() || '';
-        if (editableSet.has(label)) {
-          headerRow.getCell(c).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: editableColor },
-          };
-        }
-      }
-    }
-
-    // rows
-    (s.rows || []).forEach(r => ws.addRow(r));
-
-    // auto filter
-    if (s.autoFilter ?? true) {
-      ws.autoFilter = {
-        from: { row: 1, column: 1 },
-        to:   { row: 1, column: ws.columnCount },
-      };
-    }
-  }
-
-  const buf = await wb.xlsx.writeBuffer();
-  const blob = new Blob([buf], {
-    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = fileName;
-  a.click();
-  URL.revokeObjectURL(url);
-}
 
-/* ---------------- helpers ---------------- */
-
-function uniqueSheetName(name, used) {
-  const clean = (name || 'Sheet').replace(/[:\\/?*\[\]]/g, ' ').substring(0, 31).trim() || 'Sheet';
-  if (!used.has(clean)) return clean;
-  for (let i = 2; i < 1000; i++) {
-    const candidate = (clean.substring(0, Math.max(0, 31 - (`_${i}`.length))) + `_${i}`).trim();
-    if (!used.has(candidate)) return candidate;
+  // fallbacks so file always opens
+  if (!sheets.length) {
+    sheets.push({
+      name: 'Export',
+      columns,
+      rows: [],
+      freezeHeader: true,
+      editableHeaders,
+      editableHeaderColor: 'FFFDE68A',
+    });
   }
-  return `${clean.substring(0, 27)}_${Date.now()}`.substring(0, 31);
+
+  return sheets;
 }
 
-function idealWidth(header) {
-  const base = Math.ceil((header || '').length * 1.1);
-  return Math.min(Math.max(base, 14), 40);
+/* helpers */
+function dedupeBy(arr, keyFn) {
+  const seen = new Set();
+  return arr.filter(x => {
+    const k = keyFn(x);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
