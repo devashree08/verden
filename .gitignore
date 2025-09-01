@@ -1,63 +1,218 @@
-React.useEffect(() => {
-  let cancelled = false;
+// Lightweight, reusable ExcelJS helper.
+// Usage: const { workbook, ExcelJS } = await createWorkbook();
+// ... build sheets ...
+// await downloadWorkbook(workbook, 'file.xlsx');
 
-  const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
+let ExcelJSCached = null;
 
-  // Self-excluding payloads
-  const base = debouncedFilters;
-  const forOwners = { ...base, owner: [] };       // ignore Owner selections when building Owner list
-  const forCust   = { ...base, custodian: [] };   // ignore Custodian selections when building Custodian list
+export async function ensureExcel() {
+  if (ExcelJSCached) return ExcelJSCached;
+  // dynamic import to avoid bloating your main bundle
+  ExcelJSCached = (await import('exceljs')).Workbook ? (await import('exceljs')) : await import('exceljs');
+  return ExcelJSCached;
+}
 
-  (async () => {
-    try {
-      setLoading(true);
+export async function createWorkbook() {
+  const ExcelJS = await ensureExcel();
+  const workbook = new ExcelJS.Workbook();
+  // sensible defaults
+  workbook.creator = 'CSF Portal';
+  workbook.created = new Date();
+  return { workbook, ExcelJS };
+}
 
-      // Run in parallel: base lookups + owners-self-excluding + custodians-self-excluding + facts
-      const [luBase, luOwners, luCust, rows] = await Promise.all([
-        getReadinessFilterLookups(base),
-        getReadinessFilterLookups(forOwners),
-        getReadinessFilterLookups(forCust),
-        getReadinessFacts(base),
-      ]);
+export async function downloadWorkbook(workbook, filename = 'export.xlsx') {
+  const buffer = await workbook.xlsx.writeBuffer();
+  const blob = new Blob(
+    [buffer],
+    { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+  );
+  // tiny inline saveAs to avoid pulling FileSaver as a dep
+  const a = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
 
-      if (cancelled) return;
+/** Common style utilities (use anywhere) */
+export const xStyles = {
+  headerFill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFF3F8' } },
+  headerFont: { bold: true },
+  headerBorder: { top:{style:'thin'},left:{style:'thin'},bottom:{style:'thin'},right:{style:'thin'} },
+  editableHeaderFill: { type:'pattern', pattern:'solid', fgColor:{ argb:'FFFFF3CD' } }, // Status / 2025 Attestation
+  customCellFill: { type:'pattern', pattern:'solid', fgColor:{ argb:'FFE6F7FF' } },     // custom definition cell
+  thinBorder: { top:{style:'thin'},left:{style:'thin'},bottom:{style:'thin'},right:{style:'thin'} },
+};
 
-      // owners: use self-excluding list, but guarantee currently selected values are present
-      const ownerNames = uniq([
-        ...(luOwners?.owners || []).map(o => o.fullName),
-        ...(base.owner || []),
-      ]).map(fullName => ({ fullName }));
+export function freezeHeader(ws) {
+  ws.views = [{ state: 'frozen', ySplit: 1 }];
+}
 
-      // custodians: same idea
-      const custNames = uniq([
-        ...(luCust?.custodians || []).map(c => c.fullName),
-        ...(base.custodian || []),
-      ]).map(fullName => ({ fullName }));
+export function autoSizeColumns(ws) {
+  ws.columns.forEach(col => {
+    let max = 8;
+    col.eachCell({ includeEmpty: true }, c => {
+      const v = (c.value && c.value.toString ? c.value.toString() : `${c.value ?? ''}`);
+      if (v) max = Math.max(max, v.length + 2);
+    });
+    col.width = Math.min(max, 72);
+  });
+}
 
-      const clamp = (arr, n=500) => Array.isArray(arr) ? arr.slice(0, n) : [];
+export function sanitizeSheetName(name) {
+  const n = (name || 'Sheet').replace(/[/\\?*\[\]:]/g, ' ').trim();
+  return n.length > 28 ? n.slice(0, 28) : n || 'Sheet';
+}
 
-      setLookups({
-        orgs:         luBase?.orgs || [],
-        subcategories:luBase?.subcategories || [],
-        owners:       clamp(ownerNames),
-        custodians:   clamp(custNames),
-        scopes: luBase?.scopes?.length
-          ? luBase.scopes
-          : ['Yes','No','Inherit VCS','Inherit Network','Inherit VGS-T','Inherit TPD'],
-        profileTypes: luBase?.profileTypes?.length ? luBase.profileTypes : ['Provider','Consumer','Inheritor'],
-      });
 
-      setFacts(rows || []);
-      setScPage(0); // reset subcategory pager on new dataset
-    } catch (e) {
-      console.error(e);
-      toast.error(e.message || 'Failed to load data');
-    } finally {
-      if (!cancelled) setLoading(false);
+import { createWorkbook, downloadWorkbook, xStyles, freezeHeader, autoSizeColumns, sanitizeSheetName } from '../../../ui/data/ExcelExport';
+import { fetchAttributeFeed } from '../api/attributeApi';
+import { normalizeHeaders, normalizeRows } from '../utils/normalizeFeed';
+
+// Build & download a workbook for Attribute Mapping.
+// If filters are empty -> export ALL orgs & ALL subcats (they’ll filter locally).
+// If filters present -> export only filtered data.
+// Tabs are per org (always show org tabs that exist in headers, even with 0 rows).
+export async function exportAttributeWorkbook({ filters, filename = 'CSF-Attribute-Mapping.xlsx' }) {
+  // 1) Fetch a fresh, full dataset. IMPORTANT: do NOT constrain to the active org/subcat.
+  const resp = await fetchAttributeFeed({
+    orgIds:           filters.orgIds?.length ? filters.orgIds : undefined, // pass only if filter provided
+    functionIds:      filters.functionIds,
+    categoryIds:      filters.categoryIds,
+    subcatIds:        filters.subcatIds,
+    ownerNames:       filters.ownerNames,
+    custodianNames:   filters.custodianNames,
+    maturity:         filters.maturity,
+    finalOnly:        !!filters.finalOnly,   // honor user’s toggle
+    search:           filters.search || ''
+  });
+
+  const headers = normalizeHeaders(resp.headers || []);
+  const rows    = normalizeRows(resp.rows || []);
+
+  // 2) Group by org (ensure “all org names present regardless”)
+  const orgs = Array.from(new Map(headers.map(h => [h.orgID, { orgID: h.orgID, orgName: h.orgName }])).values())
+    .sort((a,b) => a.orgID - b.orgID);
+
+  const { workbook, ExcelJS } = await createWorkbook();
+
+  for (const org of orgs) {
+    const ws = workbook.addWorksheet(sanitizeSheetName(org.orgName || `Org ${org.orgID}`), {
+      views: [{ state: 'frozen', ySplit: 1 }]
+    });
+
+    // ---------- Attributes table (at top; sticky header row) ----------
+    const cols = [
+      { header: 'CSF 2.0 Subcategory',  key: 'csf2', width: 36 },
+      { header: 'Attribute Definition', key: 'def',  width: 72 },
+      { header: 'ML',                   key: 'ml',   width: 6  },         // number only (3/4)
+      { header: 'CSF 1.1 Subcat',       key: 'csf1', width: 16 },
+      { header: 'Status',               key: 'status', width: 14 },       // editable header highlight
+      { header: '2025 Attestation',     key: 'attest', width: 18 },       // editable header highlight
+      { header: '2024 Assessor Score',  key: 'score', width: 18 },
+    ];
+    ws.columns = cols;
+
+    // Style header row
+    const headerRow = ws.getRow(1);
+    headerRow.values = cols.map(c => c.header);
+    headerRow.height = 20;
+    headerRow.eachCell((cell, colNumber) => {
+      cell.font = xStyles.headerFont;
+      cell.fill = xStyles.headerFill;
+      cell.border = xStyles.headerBorder;
+      // Editable columns: Status (5), 2025 Attestation (6)
+      if (colNumber === 5 || colNumber === 6) {
+        cell.fill = xStyles.editableHeaderFill;
+      }
+      cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+    });
+    freezeHeader(ws); // sticky headers (globally)
+
+    // Rows for this org
+    const orgRows = rows.filter(r => r.orgID === org.orgID);
+
+    // Emit detail rows (Attributes first, then we’ll put Summary below)
+    let rIx = 2;
+    for (const r of orgRows) {
+      const isCustom = !!r.customAttributeDefinition || Number(r.csF1SubcategoryID) === 0;
+
+      const defCellVal = r.customAttributeDefinition || r.attributeDefinition || '';
+      const rowVals = {
+        csf2: r.csF2SubcategoryName || '',
+        def:  defCellVal,
+        ml:   Number(r.maturityLevel) || null,     // number only
+        csf1: isCustom ? '' : (r.csF1SubcategoryName || ''),
+        status: isCustom ? '' : (r.selectionStatus || ''),
+        attest: isCustom ? (r.customAttributeAttestation || '') : (r.selectionAttestation || ''),
+        score: r.assessScore2024 || '',
+      };
+
+      const row = ws.getRow(rIx++);
+      row.values = [ rowVals.csf2, rowVals.def, rowVals.ml, rowVals.csf1, rowVals.status, rowVals.attest, rowVals.score ];
+      row.alignment = { vertical: 'top', wrapText: true };
+
+      // Custom definition cell styling + normal border
+      if (isCustom) {
+        const defCell = ws.getCell(`B${row.number}`);
+        defCell.fill = xStyles.customCellFill;
+        defCell.border = xStyles.thinBorder;
+      }
     }
-  })();
 
-  return () => { cancelled = true; };
-  // IMPORTANT: only depend on filters so the effect doesn't re-run for toast identity changes
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [debouncedFilters]);
+    autoSizeColumns(ws);
+
+    // ---------- Summary section (below the attributes table) ----------
+    // one blank line
+    const startSummary = ws.lastRow ? ws.lastRow.number + 2 : 4;
+    const hdr = headers.filter(h => h.orgID === org.orgID);
+
+    if (hdr.length) {
+      const title = ws.getCell(`A${startSummary}`);
+      title.value = 'Summary (per CSF 2.0 Subcategory)';
+      title.font = { bold: true };
+      ws.mergeCells(`A${startSummary}:D${startSummary}`);
+
+      const sRow = startSummary + 1;
+      ws.getRow(sRow).values = ['CSF 2.0 Subcategory', 'Kept', 'Removed', 'Custom'];
+      ws.getRow(sRow).eachCell(c => { c.font = xStyles.headerFont; c.fill = xStyles.headerFill; c.border = xStyles.headerBorder; });
+
+      let sr = sRow + 1;
+      // collapse duplicates by subcat
+      const bySub = new Map();
+      for (const h of hdr) {
+        const k = `${h.csF2SubcategoryID}|${h.csF2SubcategoryName}`;
+        const acc = bySub.get(k) || { kept:0, removed:0, custom:0 };
+        acc.kept    += Number(h.keptCount || 0);
+        acc.removed += Number(h.removedCount || 0);
+        acc.custom  += Number(h.customCount || 0);
+        bySub.set(k, acc);
+      }
+      [...bySub.entries()]
+        .sort((a,b) => a[0].localeCompare(b[0]))
+        .forEach(([key, acc]) => {
+          const [, name] = key.split('|');
+          const row = ws.getRow(sr++);
+          row.values = [name, acc.kept, acc.removed, acc.custom];
+          row.eachCell(c => c.border = xStyles.thinBorder);
+        });
+    }
+  }
+
+  await downloadWorkbook(workbook, filename);
+}
+
+
+
+
+--
+
++ const handleExport = () => {
++   // hand the full filter state (the builder decides how to apply it)
++   exportAttributeWorkbook({ filters });
++ };
+
