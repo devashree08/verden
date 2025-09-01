@@ -1,218 +1,143 @@
-// Lightweight, reusable ExcelJS helper.
-// Usage: const { workbook, ExcelJS } = await createWorkbook();
-// ... build sheets ...
-// await downloadWorkbook(workbook, 'file.xlsx');
+// Tiny wrapper around SheetJS
+// npm i xlsx
+import * as XLSX from 'xlsx';
 
-let ExcelJSCached = null;
+/**
+ * downloadXlsx({
+ *   rows: Array<any>,
+ *   columns: [{ header: string, value: (row) => any, width?: number }],
+ *   fileName: string,
+ *   sheetName?: string
+ * })
+ */
+export function downloadXlsx({ rows, columns, fileName, sheetName = 'Sheet1' }) {
+  const headerRow = columns.map(c => c.header);
+  const dataRows  = rows.map(r => columns.map(c => c.value(r)));
 
-export async function ensureExcel() {
-  if (ExcelJSCached) return ExcelJSCached;
-  // dynamic import to avoid bloating your main bundle
-  ExcelJSCached = (await import('exceljs')).Workbook ? (await import('exceljs')) : await import('exceljs');
-  return ExcelJSCached;
+  const ws = XLSX.utils.aoa_to_sheet([headerRow, ...dataRows]);
+
+  // Column widths
+  ws['!cols'] = columns.map(c => ({ wch: c.width ?? 24 }));
+
+  // Freeze header + enable filter
+  ws['!freeze'] = { xSplit: 0, ySplit: 1 };
+  ws['!autofilter'] = { ref: XLSX.utils.encode_range({
+    s: { r: 0, c: 0 },
+    e: { r: 0, c: columns.length - 1 }
+  })};
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  XLSX.writeFile(wb, fileName);
 }
-
-export async function createWorkbook() {
-  const ExcelJS = await ensureExcel();
-  const workbook = new ExcelJS.Workbook();
-  // sensible defaults
-  workbook.creator = 'CSF Portal';
-  workbook.created = new Date();
-  return { workbook, ExcelJS };
-}
-
-export async function downloadWorkbook(workbook, filename = 'export.xlsx') {
-  const buffer = await workbook.xlsx.writeBuffer();
-  const blob = new Blob(
-    [buffer],
-    { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
-  );
-  // tiny inline saveAs to avoid pulling FileSaver as a dep
-  const a = document.createElement('a');
-  const url = URL.createObjectURL(blob);
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-/** Common style utilities (use anywhere) */
-export const xStyles = {
-  headerFill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFF3F8' } },
-  headerFont: { bold: true },
-  headerBorder: { top:{style:'thin'},left:{style:'thin'},bottom:{style:'thin'},right:{style:'thin'} },
-  editableHeaderFill: { type:'pattern', pattern:'solid', fgColor:{ argb:'FFFFF3CD' } }, // Status / 2025 Attestation
-  customCellFill: { type:'pattern', pattern:'solid', fgColor:{ argb:'FFE6F7FF' } },     // custom definition cell
-  thinBorder: { top:{style:'thin'},left:{style:'thin'},bottom:{style:'thin'},right:{style:'thin'} },
-};
-
-export function freezeHeader(ws) {
-  ws.views = [{ state: 'frozen', ySplit: 1 }];
-}
-
-export function autoSizeColumns(ws) {
-  ws.columns.forEach(col => {
-    let max = 8;
-    col.eachCell({ includeEmpty: true }, c => {
-      const v = (c.value && c.value.toString ? c.value.toString() : `${c.value ?? ''}`);
-      if (v) max = Math.max(max, v.length + 2);
-    });
-    col.width = Math.min(max, 72);
-  });
-}
-
-export function sanitizeSheetName(name) {
-  const n = (name || 'Sheet').replace(/[/\\?*\[\]:]/g, ' ').trim();
-  return n.length > 28 ? n.slice(0, 28) : n || 'Sheet';
-}
-
-
-import { createWorkbook, downloadWorkbook, xStyles, freezeHeader, autoSizeColumns, sanitizeSheetName } from '../../../ui/data/ExcelExport';
-import { fetchAttributeFeed } from '../api/attributeApi';
-import { normalizeHeaders, normalizeRows } from '../utils/normalizeFeed';
-
-// Build & download a workbook for Attribute Mapping.
-// If filters are empty -> export ALL orgs & ALL subcats (they’ll filter locally).
-// If filters present -> export only filtered data.
-// Tabs are per org (always show org tabs that exist in headers, even with 0 rows).
-export async function exportAttributeWorkbook({ filters, filename = 'CSF-Attribute-Mapping.xlsx' }) {
-  // 1) Fetch a fresh, full dataset. IMPORTANT: do NOT constrain to the active org/subcat.
-  const resp = await fetchAttributeFeed({
-    orgIds:           filters.orgIds?.length ? filters.orgIds : undefined, // pass only if filter provided
-    functionIds:      filters.functionIds,
-    categoryIds:      filters.categoryIds,
-    subcatIds:        filters.subcatIds,
-    ownerNames:       filters.ownerNames,
-    custodianNames:   filters.custodianNames,
-    maturity:         filters.maturity,
-    finalOnly:        !!filters.finalOnly,   // honor user’s toggle
-    search:           filters.search || ''
-  });
-
-  const headers = normalizeHeaders(resp.headers || []);
-  const rows    = normalizeRows(resp.rows || []);
-
-  // 2) Group by org (ensure “all org names present regardless”)
-  const orgs = Array.from(new Map(headers.map(h => [h.orgID, { orgID: h.orgID, orgName: h.orgName }])).values())
-    .sort((a,b) => a.orgID - b.orgID);
-
-  const { workbook, ExcelJS } = await createWorkbook();
-
-  for (const org of orgs) {
-    const ws = workbook.addWorksheet(sanitizeSheetName(org.orgName || `Org ${org.orgID}`), {
-      views: [{ state: 'frozen', ySplit: 1 }]
-    });
-
-    // ---------- Attributes table (at top; sticky header row) ----------
-    const cols = [
-      { header: 'CSF 2.0 Subcategory',  key: 'csf2', width: 36 },
-      { header: 'Attribute Definition', key: 'def',  width: 72 },
-      { header: 'ML',                   key: 'ml',   width: 6  },         // number only (3/4)
-      { header: 'CSF 1.1 Subcat',       key: 'csf1', width: 16 },
-      { header: 'Status',               key: 'status', width: 14 },       // editable header highlight
-      { header: '2025 Attestation',     key: 'attest', width: 18 },       // editable header highlight
-      { header: '2024 Assessor Score',  key: 'score', width: 18 },
-    ];
-    ws.columns = cols;
-
-    // Style header row
-    const headerRow = ws.getRow(1);
-    headerRow.values = cols.map(c => c.header);
-    headerRow.height = 20;
-    headerRow.eachCell((cell, colNumber) => {
-      cell.font = xStyles.headerFont;
-      cell.fill = xStyles.headerFill;
-      cell.border = xStyles.headerBorder;
-      // Editable columns: Status (5), 2025 Attestation (6)
-      if (colNumber === 5 || colNumber === 6) {
-        cell.fill = xStyles.editableHeaderFill;
-      }
-      cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
-    });
-    freezeHeader(ws); // sticky headers (globally)
-
-    // Rows for this org
-    const orgRows = rows.filter(r => r.orgID === org.orgID);
-
-    // Emit detail rows (Attributes first, then we’ll put Summary below)
-    let rIx = 2;
-    for (const r of orgRows) {
-      const isCustom = !!r.customAttributeDefinition || Number(r.csF1SubcategoryID) === 0;
-
-      const defCellVal = r.customAttributeDefinition || r.attributeDefinition || '';
-      const rowVals = {
-        csf2: r.csF2SubcategoryName || '',
-        def:  defCellVal,
-        ml:   Number(r.maturityLevel) || null,     // number only
-        csf1: isCustom ? '' : (r.csF1SubcategoryName || ''),
-        status: isCustom ? '' : (r.selectionStatus || ''),
-        attest: isCustom ? (r.customAttributeAttestation || '') : (r.selectionAttestation || ''),
-        score: r.assessScore2024 || '',
-      };
-
-      const row = ws.getRow(rIx++);
-      row.values = [ rowVals.csf2, rowVals.def, rowVals.ml, rowVals.csf1, rowVals.status, rowVals.attest, rowVals.score ];
-      row.alignment = { vertical: 'top', wrapText: true };
-
-      // Custom definition cell styling + normal border
-      if (isCustom) {
-        const defCell = ws.getCell(`B${row.number}`);
-        defCell.fill = xStyles.customCellFill;
-        defCell.border = xStyles.thinBorder;
-      }
-    }
-
-    autoSizeColumns(ws);
-
-    // ---------- Summary section (below the attributes table) ----------
-    // one blank line
-    const startSummary = ws.lastRow ? ws.lastRow.number + 2 : 4;
-    const hdr = headers.filter(h => h.orgID === org.orgID);
-
-    if (hdr.length) {
-      const title = ws.getCell(`A${startSummary}`);
-      title.value = 'Summary (per CSF 2.0 Subcategory)';
-      title.font = { bold: true };
-      ws.mergeCells(`A${startSummary}:D${startSummary}`);
-
-      const sRow = startSummary + 1;
-      ws.getRow(sRow).values = ['CSF 2.0 Subcategory', 'Kept', 'Removed', 'Custom'];
-      ws.getRow(sRow).eachCell(c => { c.font = xStyles.headerFont; c.fill = xStyles.headerFill; c.border = xStyles.headerBorder; });
-
-      let sr = sRow + 1;
-      // collapse duplicates by subcat
-      const bySub = new Map();
-      for (const h of hdr) {
-        const k = `${h.csF2SubcategoryID}|${h.csF2SubcategoryName}`;
-        const acc = bySub.get(k) || { kept:0, removed:0, custom:0 };
-        acc.kept    += Number(h.keptCount || 0);
-        acc.removed += Number(h.removedCount || 0);
-        acc.custom  += Number(h.customCount || 0);
-        bySub.set(k, acc);
-      }
-      [...bySub.entries()]
-        .sort((a,b) => a[0].localeCompare(b[0]))
-        .forEach(([key, acc]) => {
-          const [, name] = key.split('|');
-          const row = ws.getRow(sr++);
-          row.values = [name, acc.kept, acc.removed, acc.custom];
-          row.eachCell(c => c.border = xStyles.thinBorder);
-        });
-    }
-  }
-
-  await downloadWorkbook(workbook, filename);
-}
-
-
 
 
 --
 
-+ const handleExport = () => {
-+   // hand the full filter state (the builder decides how to apply it)
-+   exportAttributeWorkbook({ filters });
-+ };
+import { downloadXlsx } from '../../../ui/data/xlsxExport';
+
+// helper: completed?
+function isCompleted(header) {
+  if (!header) return false;
+  const cAt = header.completedAt ? new Date(header.completedAt) : null;
+  const rAt = header.reopenedAt  ? new Date(header.reopenedAt)  : null;
+  return !!(cAt && (!rAt || cAt >= rAt));
+}
+
+/**
+ * Export rows exactly as requested:
+ * Columns:
+ *  CSF 2.0 Function | CSF 2.0 Category | CSF 2.0 Subcategory | ML | Attribute # |
+ *  Attribute Definition | Status | 2025 Attestation | 2024 Assessor Score | Subcategory Sign-Off?
+ *
+ * @param {Array} rows        - the currently displayed rows (respect your Final View toggle upstream)
+ * @param {Array} headers     - full headers feed (for sign-off lookup)
+ * @param {number} orgID      - active org id (sign-off is org-scoped)
+ * @param {string} fileName   - e.g. 'CSF-Attribute-Mapping.xlsx'
+ */
+export function exportAttributeRowsToXlsx(rows, headers, orgID, fileName) {
+  // Build (orgID|subcatID) -> header map for sign-off
+  const hmap = new Map();
+  headers.forEach(h => {
+    hmap.set(`${h.orgID}|${h.csF2SubcategoryID}`, h);
+  });
+
+  const isCustom = (r) => !!r.customAttributeDefinition;
+  const columns = [
+    {
+      header: 'CSF 2.0 Function',
+      width: 28,
+      value: (r) => r.functionName || ''
+    },
+    {
+      header: 'CSF 2.0 Category',
+      width: 28,
+      value: (r) => r.categoryName || ''
+    },
+    {
+      header: 'CSF 2.0 Subcategory',
+      width: 26,
+      value: (r) => r.csF2SubcategoryName || ''
+    },
+    {
+      header: 'ML',
+      width: 6,
+      value: (r) => r.maturityLevel ?? ''
+    },
+    {
+      header: 'Attribute #',
+      width: 12,
+      value: (r) => isCustom(r) ? (r.customAttributeNum ?? '') : (r.attributeNum ?? '')
+    },
+    {
+      header: 'Attribute Definition',
+      width: 60,
+      value: (r) => isCustom(r) ? (r.customAttributeDefinition || '') : (r.attributeDefinition || '')
+    },
+    {
+      header: 'Status',
+      width: 12,
+      value: (r) => isCustom(r) ? 'Add' : (r.selectionStatus || '')
+    },
+    {
+      header: '2025 Attestation',
+      width: 18,
+      value: (r) => isCustom(r) ? (r.customAttributeAttestation || '') : (r.selectionAttestation || '')
+    },
+    {
+      header: '2024 Assessor Score',
+      width: 22,
+      value: (r) => r.assessScore2024 || ''
+    },
+    {
+      header: 'Subcategory Sign-Off?',
+      width: 22,
+      value: (r) => {
+        const h = hmap.get(`${orgID}|${r.csF2SubcategoryID}`);
+        return isCompleted(h) ? 'Yes' : 'No';
+      }
+    },
+  ];
+
+  downloadXlsx({
+    rows,
+    columns,
+    fileName,
+    sheetName: 'Attribute Mapping'
+  });
+}
+
+
+--
+
+// BEFORE
+// const handleExport = () => displayRows?.length && exportRowsAsCsv(displayRows, 'csf-attribute-rows.csv');
+
+// AFTER
+import { exportAttributeRowsToXlsx } from '../utils/exportAttributeXlsx';
+
+const handleExport = () => {
+  if (!displayRows?.length) return;
+  exportAttributeRowsToXlsx(displayRows, headers, activeOrgID, 'CSF-Attribute-Mapping.xlsx');
+};
 
