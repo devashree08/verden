@@ -1,6 +1,63 @@
+React.useEffect(() => {
+  let cancelled = false;
+
   const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
 
   // Self-excluding payloads
   const base = debouncedFilters;
   const forOwners = { ...base, owner: [] };       // ignore Owner selections when building Owner list
   const forCust   = { ...base, custodian: [] };   // ignore Custodian selections when building Custodian list
+
+  (async () => {
+    try {
+      setLoading(true);
+
+      // Run in parallel: base lookups + owners-self-excluding + custodians-self-excluding + facts
+      const [luBase, luOwners, luCust, rows] = await Promise.all([
+        getReadinessFilterLookups(base),
+        getReadinessFilterLookups(forOwners),
+        getReadinessFilterLookups(forCust),
+        getReadinessFacts(base),
+      ]);
+
+      if (cancelled) return;
+
+      // owners: use self-excluding list, but guarantee currently selected values are present
+      const ownerNames = uniq([
+        ...(luOwners?.owners || []).map(o => o.fullName),
+        ...(base.owner || []),
+      ]).map(fullName => ({ fullName }));
+
+      // custodians: same idea
+      const custNames = uniq([
+        ...(luCust?.custodians || []).map(c => c.fullName),
+        ...(base.custodian || []),
+      ]).map(fullName => ({ fullName }));
+
+      const clamp = (arr, n=500) => Array.isArray(arr) ? arr.slice(0, n) : [];
+
+      setLookups({
+        orgs:         luBase?.orgs || [],
+        subcategories:luBase?.subcategories || [],
+        owners:       clamp(ownerNames),
+        custodians:   clamp(custNames),
+        scopes: luBase?.scopes?.length
+          ? luBase.scopes
+          : ['Yes','No','Inherit VCS','Inherit Network','Inherit VGS-T','Inherit TPD'],
+        profileTypes: luBase?.profileTypes?.length ? luBase.profileTypes : ['Provider','Consumer','Inheritor'],
+      });
+
+      setFacts(rows || []);
+      setScPage(0); // reset subcategory pager on new dataset
+    } catch (e) {
+      console.error(e);
+      toast.error(e.message || 'Failed to load data');
+    } finally {
+      if (!cancelled) setLoading(false);
+    }
+  })();
+
+  return () => { cancelled = true; };
+  // IMPORTANT: only depend on filters so the effect doesn't re-run for toast identity changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [debouncedFilters]);
