@@ -1,143 +1,127 @@
-// Tiny wrapper around SheetJS
-// npm i xlsx
-import * as XLSX from 'xlsx';
+// /ui/data/ExcelExport/index.js
+import ExcelJS from 'exceljs';
 
 /**
- * downloadXlsx({
- *   rows: Array<any>,
- *   columns: [{ header: string, value: (row) => any, width?: number }],
- *   fileName: string,
- *   sheetName?: string
- * })
+ * exportExcel({ sheets, fileName })
+ * sheets: Array<{
+ *   name: string,
+ *   columns: Array<{ header: string, key: string, width?: number }>,
+ *   rows: Array<Record<string, any>>,
+ *   highlightHeaders?: string[] // headers to color (e.g., ['Status','2025 Attestation','Subcategory Sign-Off?'])
+ * }>
  */
-export function downloadXlsx({ rows, columns, fileName, sheetName = 'Sheet1' }) {
-  const headerRow = columns.map(c => c.header);
-  const dataRows  = rows.map(r => columns.map(c => c.value(r)));
+export async function exportExcel({ sheets = [], fileName = 'export.xlsx' }) {
+  const wb = new ExcelJS.Workbook();
+  wb.created = new Date();
 
-  const ws = XLSX.utils.aoa_to_sheet([headerRow, ...dataRows]);
+  const usedNames = new Set();
+  for (const s of sheets) {
+    const wsName = uniqueSheetName(s.name || 'Sheet', usedNames);
+    usedNames.add(wsName);
 
-  // Column widths
-  ws['!cols'] = columns.map(c => ({ wch: c.width ?? 24 }));
+    const ws = wb.addWorksheet(wsName, {
+      views: [{ state: 'frozen', xSplit: 0, ySplit: 1 }], // sticky header
+      properties: { defaultRowHeight: 16 },
+    });
 
-  // Freeze header + enable filter
-  ws['!freeze'] = { xSplit: 0, ySplit: 1 };
-  ws['!autofilter'] = { ref: XLSX.utils.encode_range({
-    s: { r: 0, c: 0 },
-    e: { r: 0, c: columns.length - 1 }
-  })};
+    // Columns
+    ws.columns = (s.columns || []).map(col => ({
+      header: col.header,
+      key: col.key,
+      width: col.width || idealWidth(col.header),
+      style: { font: { size: 11 }, alignment: { vertical: 'middle', wrapText: true } },
+    }));
 
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, sheetName);
-  XLSX.writeFile(wb, fileName);
-}
+    // Header styles
+    const headerRow = ws.getRow(1);
+    headerRow.height = 20;
+    headerRow.font = { bold: true };
+    headerRow.alignment = { vertical: 'middle' };
+    headerRow.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFF3F4F6' }, // light gray
+    };
+    headerRow.border = {
+      bottom: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+    };
 
-
---
-
-import { downloadXlsx } from '../../../ui/data/xlsxExport';
-
-// helper: completed?
-function isCompleted(header) {
-  if (!header) return false;
-  const cAt = header.completedAt ? new Date(header.completedAt) : null;
-  const rAt = header.reopenedAt  ? new Date(header.reopenedAt)  : null;
-  return !!(cAt && (!rAt || cAt >= rAt));
-}
-
-/**
- * Export rows exactly as requested:
- * Columns:
- *  CSF 2.0 Function | CSF 2.0 Category | CSF 2.0 Subcategory | ML | Attribute # |
- *  Attribute Definition | Status | 2025 Attestation | 2024 Assessor Score | Subcategory Sign-Off?
- *
- * @param {Array} rows        - the currently displayed rows (respect your Final View toggle upstream)
- * @param {Array} headers     - full headers feed (for sign-off lookup)
- * @param {number} orgID      - active org id (sign-off is org-scoped)
- * @param {string} fileName   - e.g. 'CSF-Attribute-Mapping.xlsx'
- */
-export function exportAttributeRowsToXlsx(rows, headers, orgID, fileName) {
-  // Build (orgID|subcatID) -> header map for sign-off
-  const hmap = new Map();
-  headers.forEach(h => {
-    hmap.set(`${h.orgID}|${h.csF2SubcategoryID}`, h);
-  });
-
-  const isCustom = (r) => !!r.customAttributeDefinition;
-  const columns = [
-    {
-      header: 'CSF 2.0 Function',
-      width: 28,
-      value: (r) => r.functionName || ''
-    },
-    {
-      header: 'CSF 2.0 Category',
-      width: 28,
-      value: (r) => r.categoryName || ''
-    },
-    {
-      header: 'CSF 2.0 Subcategory',
-      width: 26,
-      value: (r) => r.csF2SubcategoryName || ''
-    },
-    {
-      header: 'ML',
-      width: 6,
-      value: (r) => r.maturityLevel ?? ''
-    },
-    {
-      header: 'Attribute #',
-      width: 12,
-      value: (r) => isCustom(r) ? (r.customAttributeNum ?? '') : (r.attributeNum ?? '')
-    },
-    {
-      header: 'Attribute Definition',
-      width: 60,
-      value: (r) => isCustom(r) ? (r.customAttributeDefinition || '') : (r.attributeDefinition || '')
-    },
-    {
-      header: 'Status',
-      width: 12,
-      value: (r) => isCustom(r) ? 'Add' : (r.selectionStatus || '')
-    },
-    {
-      header: '2025 Attestation',
-      width: 18,
-      value: (r) => isCustom(r) ? (r.customAttributeAttestation || '') : (r.selectionAttestation || '')
-    },
-    {
-      header: '2024 Assessor Score',
-      width: 22,
-      value: (r) => r.assessScore2024 || ''
-    },
-    {
-      header: 'Subcategory Sign-Off?',
-      width: 22,
-      value: (r) => {
-        const h = hmap.get(`${orgID}|${r.csF2SubcategoryID}`);
-        return isCompleted(h) ? 'Yes' : 'No';
+    // Optional colored headers
+    const highlightSet = new Set(s.highlightHeaders || []);
+    if (highlightSet.size) {
+      for (let c = 1; c <= ws.columns.length; c++) {
+        const cell = headerRow.getCell(c);
+        const label = cell.value?.toString?.() || '';
+        if (highlightSet.has(label)) {
+          cell.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: pickHeaderColor(label) },
+          };
+        }
       }
-    },
-  ];
+    }
 
-  downloadXlsx({
-    rows,
-    columns,
-    fileName,
-    sheetName: 'Attribute Mapping'
+    // Rows
+    (s.rows || []).forEach((r) => ws.addRow(r));
+
+    // Auto filter across header row
+    if (ws.columnCount > 0) {
+      ws.autoFilter = {
+        from: { row: 1, column: 1 },
+        to:   { row: 1, column: ws.columnCount },
+      };
+    }
+
+    // Make "Attribute Definition" wrap a bit nicer
+    const defColIndex = ws.columns.findIndex(c => c.header === 'Attribute Definition');
+    if (defColIndex >= 0) {
+      ws.getColumn(defColIndex + 1).alignment = { vertical: 'middle', wrapText: true };
+      ws.getColumn(defColIndex + 1).width = Math.max(ws.getColumn(defColIndex + 1).width, 60);
+    }
+  }
+
+  // Write + trigger download
+  const buffer = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
+/* ---------------- helpers ---------------- */
 
---
+function uniqueSheetName(name, used) {
+  // Excel sheet name limit = 31 chars; disallow: : \ / ? * [ ]
+  const cleaned = (name || 'Sheet')
+    .replace(/[:\\/?*\[\]]/g, ' ')
+    .substring(0, 31)
+    .trim() || 'Sheet';
 
-// BEFORE
-// const handleExport = () => displayRows?.length && exportRowsAsCsv(displayRows, 'csf-attribute-rows.csv');
+  if (!used.has(cleaned)) return cleaned;
 
-// AFTER
-import { exportAttributeRowsToXlsx } from '../utils/exportAttributeXlsx';
+  // append counters if duplicate
+  for (let i = 2; i < 1000; i++) {
+    const candidate = (cleaned.substring(0, Math.max(0, 31 - (`_${i}`.length))) + `_${i}`).trim();
+    if (!used.has(candidate)) return candidate;
+  }
+  return `${cleaned.substring(0, 27)}_${Date.now()}`.substring(0, 31);
+}
 
-const handleExport = () => {
-  if (!displayRows?.length) return;
-  exportAttributeRowsToXlsx(displayRows, headers, activeOrgID, 'CSF-Attribute-Mapping.xlsx');
-};
+function idealWidth(header) {
+  const base = Math.min(Math.max(Math.ceil((header || '').length * 1.1), 14), 32);
+  return base;
+}
 
+function pickHeaderColor(label) {
+  // Specific colored headers per your requirement
+  if (label === 'Status') return 'FFFDE68A';               // amber 200
+  if (label === '2025 Attestation') return 'FFBAE6FD';     // sky 200
+  if (label === 'Subcategory Sign-Off?') return 'FFE9D5FF';// violet 200
+  return 'FFF3F4F6'; // fallback (same as base header)
+}
