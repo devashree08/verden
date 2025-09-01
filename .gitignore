@@ -1,20 +1,28 @@
-// Single source of truth for row identity & custom detection.
+// Central styles for Status & Attestation chips.
+import { alpha } from '@mui/material/styles';
 
-export const isCustom = (r) =>
-  !!(r?.isCustom || r?.customAttributeDefinition != null || r?.customAttributeNum != null);
-
-/** Stable key:
- *  - Custom:  org|sub|ml|C|0|customNum
- *  - Baseline:org|sub|ml|B|csf1|attrNum
- */
-export const rowKey = (r) => {
-  const org = String(r?.orgID ?? '0');
-  const sub = String(r?.csF2SubcategoryID ?? '0');
-  const ml  = String(r?.maturityLevel ?? '0');
-  if (isCustom(r)) {
-    return `${org}|${sub}|${ml}|C|0|${String(r?.customAttributeNum ?? '0')}`;
+/** Meet | Partially Meet | Does Not Meet */
+export function attestationChipSx(theme, value) {
+  switch (value) {
+    case 'Meet':           return { bgcolor: theme.palette.success.main,   color: theme.palette.common.white };
+    case 'Partially Meet': return { bgcolor: theme.palette.warning.main,   color: theme.palette.common.black };
+    case 'Does Not Meet':  return { bgcolor: theme.palette.error.main,     color: theme.palette.common.white };
+    default:               return { bgcolor: theme.palette.grey[300],      color: theme.palette.text.primary };
   }
-  const csf1 = String(r?.csF1SubcategoryID ?? '0');
-  return `${org}|${sub}|${ml}|B|${csf1}|${String(r?.attributeNum ?? '0')}`;
-};
+}
 
+/** Keep | Remove; default to "light" appearance suitable for Select renderValue */
+export function statusChipSx(theme, value, { variant = 'light' } = {}) {
+  const { success, error, grey, text, common } = theme.palette;
+
+  if (variant === 'light') {
+    if (value === 'Keep')   return { bgcolor: success.light, color: success.dark, borderColor: alpha(success.main, 0.4) };
+    if (value === 'Remove') return { bgcolor: error.light,   color: error.dark,   borderColor: alpha(error.main,   0.4) };
+    return { bgcolor: grey[200], color: text.primary, borderColor: grey[300] };
+  }
+
+  // "deep" filled style if you ever need it
+  if (value === 'Keep')   return { bgcolor: success.main, color: common.white };
+  if (value === 'Remove') return { bgcolor: error.main,   color: common.white };
+  return { bgcolor: grey[300], color: text.primary };
+}
