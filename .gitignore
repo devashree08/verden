@@ -2,37 +2,43 @@
 import ExcelJS from 'exceljs';
 
 /**
- * exportExcel({ sheets, fileName })
- * sheets: Array<{
- *   name: string,
- *   columns: Array<{ header: string, key: string, width?: number }>,
- *   rows: Array<Record<string, any>>,
- *   highlightHeaders?: string[] // headers to color (e.g., ['Status','2025 Attestation','Subcategory Sign-Off?'])
- * }>
+ * exportExcel({
+ *   fileName: string,
+ *   sheets: Array<{
+ *     name: string,
+ *     columns: Array<{ header: string, key: string, width?: number }>,
+ *     rows: Array<Record<string, any>>,
+ *     freezeHeader?: boolean,           // default: true
+ *     editableHeaders?: string[],       // headers to tint
+ *     editableHeaderColor?: string,     // ARGB like 'FFFDE68A' (same color for all editable headers)
+ *     autoFilter?: boolean,             // default: true
+ *   }>
+ * })
  */
-export async function exportExcel({ sheets = [], fileName = 'export.xlsx' }) {
+export async function exportExcel({ fileName = 'export.xlsx', sheets = [] }) {
   const wb = new ExcelJS.Workbook();
   wb.created = new Date();
 
-  const usedNames = new Set();
-  for (const s of sheets) {
-    const wsName = uniqueSheetName(s.name || 'Sheet', usedNames);
-    usedNames.add(wsName);
+  const used = new Set();
 
-    const ws = wb.addWorksheet(wsName, {
-      views: [{ state: 'frozen', xSplit: 0, ySplit: 1 }], // sticky header
+  for (const s of sheets) {
+    const name = uniqueSheetName(s.name || 'Sheet', used);
+    used.add(name);
+
+    const ws = wb.addWorksheet(name, {
+      views: [{ state: 'frozen', ySplit: (s.freezeHeader ?? true) ? 1 : 0 }],
       properties: { defaultRowHeight: 16 },
     });
 
-    // Columns
+    // define columns
     ws.columns = (s.columns || []).map(col => ({
       header: col.header,
       key: col.key,
-      width: col.width || idealWidth(col.header),
+      width: col.width ?? idealWidth(col.header),
       style: { font: { size: 11 }, alignment: { vertical: 'middle', wrapText: true } },
     }));
 
-    // Header styles
+    // header styling
     const headerRow = ws.getRow(1);
     headerRow.height = 20;
     headerRow.font = { bold: true };
@@ -40,50 +46,40 @@ export async function exportExcel({ sheets = [], fileName = 'export.xlsx' }) {
     headerRow.fill = {
       type: 'pattern',
       pattern: 'solid',
-      fgColor: { argb: 'FFF3F4F6' }, // light gray
+      fgColor: { argb: 'FFF3F4F6' }, // base light gray
     };
-    headerRow.border = {
-      bottom: { style: 'thin', color: { argb: 'FFCBD5E1' } },
-    };
+    headerRow.border = { bottom: { style: 'thin', color: { argb: 'FFCBD5E1' } } };
 
-    // Optional colored headers
-    const highlightSet = new Set(s.highlightHeaders || []);
-    if (highlightSet.size) {
-      for (let c = 1; c <= ws.columns.length; c++) {
-        const cell = headerRow.getCell(c);
-        const label = cell.value?.toString?.() || '';
-        if (highlightSet.has(label)) {
-          cell.fill = {
+    // tint "editable" headers (SAME COLOR for all editable columns)
+    const editableSet = new Set(s.editableHeaders || []);
+    const editableColor = s.editableHeaderColor || 'FFFDE68A'; // amber-200
+    if (editableSet.size) {
+      for (let c = 1; c <= ws.columnCount; c++) {
+        const label = headerRow.getCell(c).value?.toString?.() || '';
+        if (editableSet.has(label)) {
+          headerRow.getCell(c).fill = {
             type: 'pattern',
             pattern: 'solid',
-            fgColor: { argb: pickHeaderColor(label) },
+            fgColor: { argb: editableColor },
           };
         }
       }
     }
 
-    // Rows
-    (s.rows || []).forEach((r) => ws.addRow(r));
+    // rows
+    (s.rows || []).forEach(r => ws.addRow(r));
 
-    // Auto filter across header row
-    if (ws.columnCount > 0) {
+    // auto filter
+    if (s.autoFilter ?? true) {
       ws.autoFilter = {
         from: { row: 1, column: 1 },
         to:   { row: 1, column: ws.columnCount },
       };
     }
-
-    // Make "Attribute Definition" wrap a bit nicer
-    const defColIndex = ws.columns.findIndex(c => c.header === 'Attribute Definition');
-    if (defColIndex >= 0) {
-      ws.getColumn(defColIndex + 1).alignment = { vertical: 'middle', wrapText: true };
-      ws.getColumn(defColIndex + 1).width = Math.max(ws.getColumn(defColIndex + 1).width, 60);
-    }
   }
 
-  // Write + trigger download
-  const buffer = await wb.xlsx.writeBuffer();
-  const blob = new Blob([buffer], {
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], {
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   });
   const url = URL.createObjectURL(blob);
@@ -97,31 +93,16 @@ export async function exportExcel({ sheets = [], fileName = 'export.xlsx' }) {
 /* ---------------- helpers ---------------- */
 
 function uniqueSheetName(name, used) {
-  // Excel sheet name limit = 31 chars; disallow: : \ / ? * [ ]
-  const cleaned = (name || 'Sheet')
-    .replace(/[:\\/?*\[\]]/g, ' ')
-    .substring(0, 31)
-    .trim() || 'Sheet';
-
-  if (!used.has(cleaned)) return cleaned;
-
-  // append counters if duplicate
+  const clean = (name || 'Sheet').replace(/[:\\/?*\[\]]/g, ' ').substring(0, 31).trim() || 'Sheet';
+  if (!used.has(clean)) return clean;
   for (let i = 2; i < 1000; i++) {
-    const candidate = (cleaned.substring(0, Math.max(0, 31 - (`_${i}`.length))) + `_${i}`).trim();
+    const candidate = (clean.substring(0, Math.max(0, 31 - (`_${i}`.length))) + `_${i}`).trim();
     if (!used.has(candidate)) return candidate;
   }
-  return `${cleaned.substring(0, 27)}_${Date.now()}`.substring(0, 31);
+  return `${clean.substring(0, 27)}_${Date.now()}`.substring(0, 31);
 }
 
 function idealWidth(header) {
-  const base = Math.min(Math.max(Math.ceil((header || '').length * 1.1), 14), 32);
-  return base;
-}
-
-function pickHeaderColor(label) {
-  // Specific colored headers per your requirement
-  if (label === 'Status') return 'FFFDE68A';               // amber 200
-  if (label === '2025 Attestation') return 'FFBAE6FD';     // sky 200
-  if (label === 'Subcategory Sign-Off?') return 'FFE9D5FF';// violet 200
-  return 'FFF3F4F6'; // fallback (same as base header)
+  const base = Math.ceil((header || '').length * 1.1);
+  return Math.min(Math.max(base, 14), 40);
 }
