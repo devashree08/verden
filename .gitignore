@@ -1,133 +1,52 @@
-// src/features/readiness/utils/exportReadinessExcel.js
-import { exportExcel } from '../../../ui/data/ExcelExport';
-
-/**
- * Export readiness data to Excel (one sheet per Org).
- * - facts: array already filtered by server (what the page shows)
- * - lookups: lookups.orgs used to ensure per-org sheets exist even with 0 rows
- * - filters: current filter object ({ orgAbbr?: string[] })
- * - fileName?: optional custom name
- */
-export async function exportReadinessExcel({ facts = [], lookups = {}, filters = {}, fileName }) {
-  const sheets = deriveOrgPool({ lookups, filters, facts }).map(({ orgAbbr, sheetName }) => ({
-    name: sheetName,
-    columns: READINESS_EXPORT_COLUMNS,
-    rows: (facts || [])
-      .filter(r => r.orgAbbr === orgAbbr)
-      .map(r => ({
-        subcategoryName: r.subcategoryName,
-        subcategoryDescription: r.subcategoryDescription,
-        relatedCsf1_1Subcategories: r.relatedCsf1_1Subcategories,
-        subcatOwner: r.subcatOwner || '',
-        subcatCustodian: r.subcatCustodian || '',
-        scope: r.scope || '',
-        maturityProjection: r.maturityProjection || '',
-        profileType: r.profileType || '',
-      })),
-    freezeHeader: true,
-    editableHeaders: EDITABLE_HEADERS,
-    editableHeaderColor: EDITABLE_COLOR,
-    autoFilter: true,
-  }));
-
-  await exportExcel({
-    fileName: fileName || defaultFileName('CSF2_Org_Readiness'),
-    sheets,
-  });
-}
-
-/* ---------------- local config ---------------- */
-
-const READINESS_EXPORT_COLUMNS = [
-  { header: 'Subcategory',             key: 'subcategoryName',            width: 18 },
-  { header: 'Subcategory Description', key: 'subcategoryDescription',     width: 40 },
-  { header: 'Related CSF 1.1',         key: 'relatedCsf1_1Subcategories', width: 24 },
-  { header: 'Owner(s)',                key: 'subcatOwner',                width: 28 },
-  { header: 'Custodian(s)',            key: 'subcatCustodian',            width: 28 },
-  { header: 'Scope',                   key: 'scope',                      width: 16 },
-  { header: 'Maturity Projection',     key: 'maturityProjection',         width: 20 },
-  { header: 'Profile Type',            key: 'profileType',                width: 16 },
-];
-
-const EDITABLE_HEADERS = ['Scope', 'Maturity Projection', 'Profile Type'];
-const EDITABLE_COLOR   = 'FFFDE68A'; // amber-200
-
-/* ---------------- helpers ---------------- */
-
-function defaultFileName(prefix) {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${prefix}_${yyyy}-${mm}-${dd}.xlsx`;
-}
-
-/**
- * Build ordered list of orgs to create sheets for.
- * - If org filters exist, use that order.
- * - Else, use all orgs from lookups (still create sheet even if 0 rows).
- * - Facts can refine friendly names.
- */
 function deriveOrgPool({ lookups, filters, facts }) {
   const selected = (filters?.orgAbbr || []).filter(Boolean);
   const lookupOrgs = Array.isArray(lookups?.orgs) ? lookups.orgs : [];
 
-  // map: abbr -> friendly name
+  // map: abbr -> { orgID }
   const map = new Map();
+
+  const upsert = (abbr, id) => {
+    if (!abbr) return;
+    const curr = map.get(abbr);
+    map.set(abbr, { orgID: curr?.orgID ?? id ?? null });
+  };
 
   const addFromLookups = (orgs) => {
     for (const o of orgs || []) {
-      const abbr =
-        o?.orgAbbr ?? o?.abbr ?? o?.OrgAbbr;
-      if (!abbr) continue;
-      const friendly =
-        (o.orgFullName && o.orgFullName.trim()) ||
-        (o.orgName && o.orgName.trim()) ||
-        (o.OrgFullName && String(o.OrgFullName).trim()) ||
-        abbr;
-      if (!map.has(abbr)) map.set(abbr, friendly);
+      const abbr = o?.orgAbbr ?? o?.abbr ?? o?.OrgAbbr;
+      const id = o?.orgID ?? o?.orgId ?? o?.OrgID ?? null;
+      upsert(abbr, id);
     }
   };
 
   const addFromFacts = (rows) => {
     for (const r of rows || []) {
       const abbr = r?.orgAbbr;
-      if (!abbr) continue;
-      const friendly = (r.orgFullName && r.orgFullName.trim()) || abbr;
-      if (!map.has(abbr)) map.set(abbr, friendly);
+      const id = r?.orgID ?? r?.orgId ?? r?.OrgID ?? null;
+      upsert(abbr, id);
     }
   };
 
   if (selected.length) {
-    // seed selected orgs first (controls tab order)
     addFromLookups(lookupOrgs.filter(o => selected.includes(o?.orgAbbr ?? o?.abbr ?? o?.OrgAbbr)));
-    // ensure every selected abbr exists in the map (even if missing from lookups)
-    for (const abbr of selected) if (!map.has(abbr)) map.set(abbr, abbr);
+    for (const abbr of selected) if (!map.has(abbr)) upsert(abbr, null);
   } else {
-    // no org filter -> all lookup orgs get a sheet (even with 0 rows)
     addFromLookups(lookupOrgs);
   }
 
-  // facts can improve names for the same abbr
   addFromFacts(facts);
 
-  const entries = Array.from(map.entries()).map(([orgAbbr, sheetName]) => ({ orgAbbr, sheetName }));
+  const entries = Array.from(map.entries()).map(([orgAbbr, v]) => ({
+    orgAbbr,
+    sheetName: orgAbbr,     // <-- use abbr for the tab label
+    orgID: v.orgID,
+  }));
 
-  if (selected.length) {
-    const rank = new Map(selected.map((a, i) => [a, i]));
-    entries.sort((a, b) => (rank.get(a.orgAbbr) ?? 1e9) - (rank.get(b.orgAbbr) ?? 1e9));
-  } else {
-    entries.sort((a, b) => String(a.sheetName).localeCompare(String(b.sheetName)));
-  }
+  entries.sort((a, b) => {
+    const ai = a.orgID ?? Number.MAX_SAFE_INTEGER;
+    const bi = b.orgID ?? Number.MAX_SAFE_INTEGER;
+    return ai - bi;
+  });
+
   return entries;
 }
-
-
-
-const handleExport = async () => {
-  try {
-    await exportReadinessExcel({ facts, lookups, filters });
-  } catch (e) {
-    toast.error(e.message || 'Export failed');
-  }
-};
