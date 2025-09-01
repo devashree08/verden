@@ -1,128 +1,215 @@
-// src/features/attributeMapping/components/molecules/AttributeFilterBar.jsx
+// src/features/attributeMapping/components/organisms/RightHeaderComposite.jsx
+import * as React from 'react';
+import {
+  Box, Paper, Typography, Chip, IconButton,
+  Stack, Divider
+} from '@mui/material';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
+import ExpandLessIcon  from '@mui/icons-material/ExpandLess';
+import ExpandableText from '../atoms/ExpandableText';
+import SubcatCompletionControls from '../molecules/SubcatCompletionControls';
 
-import React from 'react';
-import { Box } from '@mui/material';
-import { FilterBar } from '../../../../ui/patterns/FilterBar';
-import MultiSelectSearch from '../../../../ui/core/MultiSelectSearch';
-import Switch from '../../../../ui/core/Switch';
-import { fetchAttributeFilterLookups } from '../../api/attributeApi';
-import { ensureSelected, MATURITY_OPTIONS } from '../../utils/filters';
+/* -------------------- helpers -------------------- */
 
-export default function AttributeFilterBar({ value, onChange, onExport }) {
-  const [opts, setOpts] = React.useState({
-    functions: [], categories: [], subcategories: [], owners: [], custodians: []
-  });
+const Card = ({ title, children, sx }) => (
+  <Paper variant="outlined" sx={{ p: 1.5, borderRadius: 2, ...sx }}>
+    <Typography variant="overline" sx={{ letterSpacing: .6, color: 'text.secondary' }}>
+      {title}
+    </Typography>
+    {children}
+  </Paper>
+);
 
-  // ---- self-excluded, cross-filtered lookups (debounced + race-guarded) ----
-  const reqSeq = React.useRef(0);
+const TitleAndText = ({ title, text }) => (
+  <Box>
+    <Typography variant="subtitle1" sx={{ fontWeight: 800, mb: .25 }}>{title}</Typography>
+    <Typography variant="body2" color="text.secondary">{text || '—'}</Typography>
+  </Box>
+);
 
-  React.useEffect(() => {
-    const mySeq = ++reqSeq.current;
-    const debounce = setTimeout(async () => {
-      // helper: omit one facet while applying the rest
-      const others = (omit) => ({
-        functionIds:    omit === 'functions'     ? undefined : value.functionIds,
-        categoryIds:    omit === 'categories'    ? undefined : value.categoryIds,
-        subcatIds:      omit === 'subcategories' ? undefined : value.subcatIds,
-        ownerNames:     omit === 'owners'        ? undefined : value.ownerNames,
-        custodianNames: omit === 'custodians'    ? undefined : value.custodianNames,
-      });
+const splitCsv = (csv) => (csv || '').split(',').map(s => s.trim()).filter(Boolean);
 
-      try {
-        const [
-          fns, cats, subs, owns, custs,
-        ] = await Promise.all([
-          fetchAttributeFilterLookups(others('functions')),
-          fetchAttributeFilterLookups(others('categories')),
-          fetchAttributeFilterLookups(others('subcategories')),
-          fetchAttributeFilterLookups(others('owners')),
-          fetchAttributeFilterLookups(others('custodians')),
-        ]);
-
-        // if a newer request started, drop these results
-        if (mySeq !== reqSeq.current) return;
-
-        setOpts({
-          functions:     (fns.functions     || []).map(x => ({ value: x.functionID,   label: x.functionName })),
-          categories:    (cats.categories   || []).map(x => ({ value: x.categoryID,   label: x.categoryName })),
-          subcategories: (subs.subcategories|| []).map(x => ({ value: x.subcategoryID, label: x.subcategoryName })),
-          owners:        (owns.owners       || []).map(x => ({ value: x.fullName,     label: x.fullName })),
-          custodians:    (custs.custodians  || []).map(x => ({ value: x.fullName,     label: x.fullName })),
-        });
-      } catch {
-        // swallow; keep previous options so UI stays usable
-      }
-    }, 250); // debounce a touch for snappier UX
-
-    return () => clearTimeout(debounce);
-  }, [
-    value.functionIds,
-    value.categoryIds,
-    value.subcatIds,
-    value.ownerNames,
-    value.custodianNames,
-  ]);
-
-  const filtersLayout = (
-    <Box
-      sx={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
-        gap: 2,
-        alignItems: 'center',
-      }}
-    >
-      <MultiSelectSearch
-        label="Functions"
-        value={value.functionIds}
-        options={ensureSelected(opts.functions, value.functionIds)}
-        onChange={(v) => onChange({ ...value, functionIds: v })}
-      />
-      <MultiSelectSearch
-        label="Categories"
-        value={value.categoryIds}
-        options={ensureSelected(opts.categories, value.categoryIds)}
-        onChange={(v) => onChange({ ...value, categoryIds: v })}
-      />
-      <MultiSelectSearch
-        label="Subcategories"
-        value={value.subcatIds}
-        options={ensureSelected(opts.subcategories, value.subcatIds)}
-        onChange={(v) => onChange({ ...value, subcatIds: v })}
-      />
-      <MultiSelectSearch
-        label="Owners"
-        value={value.ownerNames}
-        options={ensureSelected(opts.owners, value.ownerNames)}
-        onChange={(v) => onChange({ ...value, ownerNames: v })}
-      />
-      <MultiSelectSearch
-        label="Custodians"
-        value={value.custodianNames}
-        options={ensureSelected(opts.custodians, value.custodianNames)}
-        onChange={(v) => onChange({ ...value, custodianNames: v })}
-      />
-      <MultiSelectSearch
-        label="Maturity"
-        value={value.maturity}
-        options={ensureSelected(MATURITY_OPTIONS, value.maturity)}
-        onChange={(v) => onChange({ ...value, maturity: v })}
-      />
-      <Switch
-        label="Final view (hide Removed)"
-        checked={!!value.finalOnly}
-        onChange={(checked) => onChange({ ...value, finalOnly: checked })}
-      />
-    </Box>
+function renderNameChips(names, prefix, max = 3) {
+  if (!names?.length) return null;
+  const shown = names.slice(0, max);
+  const extra = names.length - shown.length;
+  return (
+    <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+      {shown.map((n, i) => (
+        <Chip key={`${prefix}-${i}`} size="small" label={`${prefix}: ${n}`} />
+      ))}
+      {extra > 0 && <Chip size="small" variant="outlined" label={`+${extra} more`} />}
+    </Stack>
   );
+}
+
+// Safer than about:blank + document.write; less likely to be blocked.
+function openHtmlInNewWindow(title, text) {
+  const safe = (s = '') =>
+    s.replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"/>
+<title>${safe(title)}</title>
+<style>
+  body{font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.6;color:#1D2939}
+  h2{margin:0 0 12px;font-size:20px;font-weight:800}
+  pre{white-space:pre-wrap;word-wrap:break-word;margin:0}
+</style></head><body>
+  <h2>${safe(title)}</h2>
+  <pre>${safe(text || '—')}</pre>
+</body></html>`;
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  window.open(url, '_blank', 'noopener,noreferrer');
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+/* -------------------- component -------------------- */
+
+export default function RightHeaderComposite({
+  header,
+  ownerCsv,
+  custodianCsv,
+  onCompletionUpdated
+}) {
+  const [collapsed, setCollapsed] = React.useState(false);
+  if (!header) return null;
+
+  // associated 1.1 subcategories (already normalized on the page)
+  const assoc = React.useMemo(() => header.csf11Mapped ?? [], [header.csf11Mapped]);
+
+  const owners = splitCsv(ownerCsv);
+  const custodians = splitCsv(custodianCsv);
 
   return (
-    <FilterBar
-      filtersLeft={filtersLayout}
-      searchValue={value.search}
-      onSearchChange={(s) => onChange({ ...value, search: s })}
-      onExport={onExport}
-      exportLabel="Export Excel"
-    />
+    <Box>
+      {/* Summary strip — click to collapse/expand the details below (Sign-off is excluded) */}
+      <Paper
+        variant="outlined"
+        sx={{ p: 1, borderRadius: 2, mb: 1 }}
+        onClick={() => setCollapsed(c => !c)}
+      >
+        <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap" useFlexGap>
+          <Typography variant="subtitle1" sx={{ fontWeight: 800, mr: 1 }}>
+            {header.csF2SubcategoryName}
+          </Typography>
+          {renderNameChips(owners, 'Owner')}
+          {renderNameChips(custodians, 'Custodian')}
+          <Box sx={{ flex: 1 }} />
+          <IconButton
+            size="small"
+            onClick={(e) => { e.stopPropagation(); setCollapsed(c => !c); }}
+          >
+            {collapsed ? <ExpandMoreIcon/> : <ExpandLessIcon/>}
+          </IconButton>
+        </Stack>
+      </Paper>
+
+      {/* Always-visible: SUBCATEGORY SIGN-OFF (excluded from collapse) */}
+      <Box sx={{ mt: 1.5, mb: 2 }}>
+        <Card title="SUBCATEGORY SIGN-OFF">
+          <SubcatCompletionControls
+            orgID={header.orgID}
+            csF2SubcategoryID={header.csF2SubcategoryID}
+            header={header}
+            onPatchHeader={(_, __, patch) => onCompletionUpdated?.(patch)}
+          />
+        </Card>
+      </Box>
+
+      {/* Collapsible details */}
+      {!collapsed && (
+        <Box
+          sx={{
+            display: 'grid',
+            gridTemplateColumns: { xs: '1fr', xl: 'minmax(720px, 3fr) minmax(320px, 1fr)' },
+            gap: 2,
+            mb: 2,
+          }}
+        >
+          {/* Left cluster: Function / Category / Subcategory + 2 long-text sections */}
+          <Box
+            sx={{
+              minWidth: 0,
+              display: 'grid',
+              gridTemplateColumns: 'repeat(3, minmax(220px, 1fr))',
+              gap: 2
+            }}
+          >
+            <Card title="FUNCTION">
+              <TitleAndText title={header.functionName} text={header.functionLanguage} />
+            </Card>
+
+            <Card title="CATEGORY">
+              <TitleAndText title={header.categoryName} text={header.categoryLanguage} />
+            </Card>
+
+            <Card title="CSF 2.0 SUBCATEGORY">
+              <TitleAndText title={header.csF2SubcategoryName} text={header.csF2SubcategoryLanguage} />
+              {(owners.length || custodians.length) && (
+                <>
+                  <Divider sx={{ my: 1 }} />
+                  <Typography variant="overline" sx={{ color: 'text.secondary' }}>
+                    OWNER / CUSTODIAN
+                  </Typography>
+                  <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap sx={{ mt: .5 }}>
+                    {owners.map((n, i) => <Chip key={`o-${i}`} label={`Owner: ${n}`} size="small" />)}
+                    {custodians.map((n, i) => <Chip key={`c-${i}`} label={`Custodian: ${n}`} size="small" />)}
+                  </Stack>
+                </>
+              )}
+            </Card>
+
+            {/* Two long-text panes */}
+            <Box
+              sx={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(2, 1fr)',
+                gap: 1,
+                gridColumn: '1 / span 3',
+              }}
+            >
+              <Card title={<Typography variant='caption' sx={{ fontWeight: 900, color: 'black' }}>Change Summary</Typography>}>
+                <ExpandableText
+                  text={header.changeSummary}
+                  maxLines={4}
+                  onOpenDialog={() => openHtmlInNewWindow('Change Summary', header.changeSummary)}
+                />
+              </Card>
+
+              <Card title={<Typography variant='caption' sx={{ fontWeight: 900, color: 'black' }}>Implementation Examples</Typography>}>
+                <ExpandableText
+                  text={header.implementationExamples}
+                  maxLines={4}
+                  onOpenDialog={() => openHtmlInNewWindow('Implementation Examples', header.implementationExamples)}
+                />
+              </Card>
+            </Box>
+          </Box>
+
+          {/* Right column: Associated 1.1 subcategories */}
+          <Box sx={{ display: 'grid', gap: 2 }}>
+            <Card title="ASSOCIATED 1.1 SUBCATEGORIES">
+              {assoc.length === 0 ? (
+                <Typography variant="body2" color="text.disabled">None.</Typography>
+              ) : (
+                <Box component="ul" sx={{ pl: 3, m: 0 }}>
+                  {assoc.map(a => (
+                    <li key={a.id}>
+                      <Typography variant="subtitle1" sx={{ fontWeight: 800, mb: .25 }}>
+                        {a.name}
+                      </Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        {a.lang}
+                      </Typography>
+                    </li>
+                  ))}
+                </Box>
+              )}
+            </Card>
+          </Box>
+        </Box>
+      )}
+    </Box>
   );
 }
