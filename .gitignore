@@ -121,3 +121,13 @@ function deriveOrgPool({ lookups, filters, facts }) {
   }
   return entries;
 }
+
+
+
+const handleExport = async () => {
+  try {
+    await exportReadinessExcel({ facts, lookups, filters });
+  } catch (e) {
+    toast.error(e.message || 'Export failed');
+  }
+};
