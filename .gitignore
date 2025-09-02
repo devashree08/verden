@@ -1,157 +1,179 @@
--- 1) Clear target table
-TRUNCATE TABLE dbo.owner_mapping;
-GO
+CREATE OR ALTER PROCEDURE dbo.SyncOwnerMappingFromReadiness
+    @AsOfDate      date = CAST(GETDATE() AS date),
+    @ActiveThrough date = '9999-12-31'   -- change to '2028-12-01' if you must cap active rows
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
--- 2) Insert from dbo.analysis (Owner/Custodian), splitting names, normalizing subcat, joining org & ref tables,
---    and enriching with PZID/ContactEmail from dbo.adomfeed via fuzzy name match.
-WITH A AS (
+    BEGIN TRAN;
+
+    /* 1) Build normalized source from readiness (one row per person/role) */
+    IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
+    CREATE TABLE #src
+    (
+        OrgID                int           NOT NULL,
+        CSF_2_0_SubacatID    int           NOT NULL,
+        FullName             nvarchar(400) NOT NULL,
+        ContactRole          varchar(50)   NOT NULL,
+        PZID                 varchar(100)  NULL,
+        ContactEmail         varchar(254)  NULL
+    );
+
+    WITH Raw AS (
+        SELECT
+            r.OrgID,
+            r.SubcatID,
+            v.RoleName,
+            v.NameCSV
+        FROM dbo.readiness r
+        CROSS APPLY (VALUES
+            ('Owner',     r.SubcatOwner),
+            ('Custodian', r.SubcatCustodian)
+        ) v(RoleName, NameCSV)
+        WHERE r.OrgID IS NOT NULL
+          AND r.SubcatID IS NOT NULL
+          AND v.NameCSV IS NOT NULL
+          AND LTRIM(RTRIM(CONVERT(varchar(max), v.NameCSV))) <> ''
+    ),
+    Split AS (
+        SELECT
+            OrgID,
+            SubcatID,
+            RoleName AS ContactRole,
+            LTRIM(RTRIM(s.value)) AS FullName
+        FROM Raw
+        CROSS APPLY STRING_SPLIT(CONVERT(varchar(max), Raw.NameCSV), ',') AS s
+        WHERE LTRIM(RTRIM(s.value)) <> ''
+    ),
+    Clean AS (
+        SELECT DISTINCT
+            OrgID,
+            SubcatID,
+            ContactRole,
+            FullName,
+            -- cleaned variations for name matching
+            UPPER(LTRIM(RTRIM(
+                REPLACE(REPLACE(REPLACE(REPLACE(FullName, ',', ' '), '.', ' '), '''', ''), '  ', ' ')
+            ))) AS CleanName,
+            UPPER(
+                REPLACE(REPLACE(REPLACE(REPLACE(FullName, ' ', ''), ',', ''), '.', ''), '''', '')
+            ) AS CompactName
+        FROM Split
+    ),
+    Enriched AS (
+        SELECT
+            c.OrgID,
+            c.SubcatID         AS CSF_2_0_SubacatID,
+            c.FullName,
+            c.ContactRole,
+            af_match.PZID,
+            af_match.ContactEmail
+        FROM Clean c
+        OUTER APPLY (
+            -- prefer exact compact match; fallback to first/last token LIKE
+            SELECT TOP (1)
+                af.PZID,
+                af.ContactEmail
+            FROM dbo.adomfeed af
+            CROSS APPLY (
+                SELECT
+                    UPPER(LTRIM(RTRIM(
+                        REPLACE(REPLACE(REPLACE(REPLACE(af.FullName, ',', ' '), '.', ' '), '''', ''), '  ', ' ')
+                    ))) AS CleanAF,
+                    UPPER(REPLACE(REPLACE(REPLACE(REPLACE(af.FullName, ' ', ''), ',', ''), '.', ''), '''', '')) AS CompactAF
+            ) afx
+            CROSS APPLY (
+                SELECT
+                    CASE WHEN CHARINDEX(' ', c.CleanName) > 0
+                         THEN LEFT(c.CleanName, CHARINDEX(' ', c.CleanName) - 1)
+                         ELSE c.CleanName END AS FirstTok,
+                    CASE WHEN CHARINDEX(' ', REVERSE(c.CleanName)) > 0
+                         THEN RIGHT(c.CleanName, CHARINDEX(' ', REVERSE(c.CleanName)) - 1)
+                         ELSE c.CleanName END AS LastTok
+            ) t
+            WHERE afx.CompactAF = c.CompactName
+               OR (
+                    LEN(t.FirstTok) >= 3 AND LEN(t.LastTok) >= 3
+                    AND afx.CleanAF LIKE '%' + t.FirstTok + '%'
+                    AND afx.CleanAF LIKE '%' + t.LastTok  + '%'
+                  )
+            ORDER BY
+                CASE WHEN afx.CompactAF = c.CompactName THEN 0 ELSE 1 END,
+                LEN(af.FullName),
+                af.PZID
+        ) af_match
+    )
+    INSERT INTO #src (OrgID, CSF_2_0_SubacatID, FullName, ContactRole, PZID, ContactEmail)
+    SELECT OrgID, CSF_2_0_SubacatID, FullName, ContactRole, PZID, ContactEmail
+    FROM Enriched;
+
+    /* 2) Expire active rows that are no longer present in readiness */
+    UPDATE tgt
+        SET tgt.Status = 'I',
+            tgt.Exp_Dt = DATEADD(DAY, -1, @AsOfDate)
+    FROM dbo.owner_mapping AS tgt
+    WHERE tgt.Status = 'A'
+      AND (tgt.Exp_Dt IS NULL OR tgt.Exp_Dt >= @AsOfDate)
+      AND NOT EXISTS (
+            SELECT 1
+            FROM #src s
+            WHERE s.OrgID              = tgt.OrgID
+              AND s.CSF_2_0_SubacatID  = tgt.CSF_2_0_SubacatID
+              AND s.FullName           = tgt.FullName
+              AND s.ContactRole        = tgt.ContactRole
+      );
+
+    /* 3) Insert new active rows that are in readiness but not yet active in owner_mapping */
+    INSERT INTO dbo.owner_mapping
+    (
+        OrgID,
+        CSF_2_0_SubacatID,
+        PZID,
+        FullName,
+        ContactEmail,
+        ContactRole,
+        Eff_Dt,
+        Exp_Dt,
+        Status
+    )
     SELECT
-        a.BU,
-        a._2_0_subcategory,
-        a.[_2025_Owner],
-        a.[_2025_Custodian]
-    FROM dbo.analysis AS a
-),
--- Unpivot Owner/Custodian into rows
-Roles AS (
-    SELECT
-        BU,
-        _2_0_subcategory,
-        RoleName,
-        NameList
-    FROM A
-    CROSS APPLY (VALUES
-        ('Owner',     [_2025_Owner]),
-        ('Custodian', [_2025_Custodian])
-    ) v(RoleName, NameList)
-    WHERE NameList IS NOT NULL
-      AND LTRIM(RTRIM(CONVERT(varchar(max), NameList))) <> ''
-),
--- Split comma-separated names into one row per person; trim whitespace
-SplitNames AS (
-    SELECT
-        r.BU,
-        r._2_0_subcategory,
-        r.RoleName AS ContactRole,
-        LTRIM(RTRIM(s.value)) AS FullName
-    FROM Roles r
-    CROSS APPLY STRING_SPLIT(CONVERT(varchar(max), r.NameList), ',') AS s
-    WHERE LTRIM(RTRIM(s.value)) <> ''
-),
--- Normalize subcategory: pad single-digit suffix after the last '-' with a leading zero.
--- 'DE.AE-2'  -> 'DE.AE-02'
--- 'DE.AE-10' -> unchanged
-NormSubcat AS (
-    SELECT
-        sn.BU,
-        sn._2_0_subcategory,
-        sn.ContactRole,
-        sn.FullName,
-        CASE
-            WHEN CHARINDEX('-', sn._2_0_subcategory) > 0 THEN
-                CASE
-                    WHEN LEN(RIGHT(sn._2_0_subcategory, CHARINDEX('-', REVERSE(sn._2_0_subcategory)) - 1)) = 1
-                        THEN CONCAT(
-                            LEFT(sn._2_0_subcategory,
-                                 LEN(sn._2_0_subcategory) - (CHARINDEX('-', REVERSE(sn._2_0_subcategory)))),
-                            '-0',
-                            RIGHT(sn._2_0_subcategory, CHARINDEX('-', REVERSE(sn._2_0_subcategory)) - 1)
-                        )
-                    ELSE sn._2_0_subcategory
-                END
-            ELSE sn._2_0_subcategory
-        END AS SubcatName_Normalized
-    FROM SplitNames sn
-),
--- Pre-compute cleaned/compact names for robust matching to adomfeed
-PrepNames AS (
-    SELECT
-        n.BU,
-        n.SubcatName_Normalized,
-        n.ContactRole,
-        n.FullName,
-        -- CleanName: upper, punctuation -> spaces, trimmed
-        UPPER(LTRIM(RTRIM(
-            REPLACE(REPLACE(REPLACE(REPLACE(n.FullName, ',', ' '), '.', ' '), '''', ''), '  ', ' ')
-        ))) AS CleanName,
-        -- CompactName: upper, remove spaces & punctuation entirely
-        UPPER(
-            REPLACE(REPLACE(REPLACE(REPLACE(n.FullName, ' ', ''), ',', ''), '.', ''), '''', '')
-        ) AS CompactName
-    FROM NormSubcat n
-),
--- Join to Org, Subcat, and enrich with adomfeed (PZID/ContactEmail)
-Joined AS (
-    SELECT DISTINCT
-        ol.OrgID,
-        rs.SubcatID AS CSF_2_0_SubacatID,
-        p.FullName,
-        p.ContactRole,
-        af_match.PZID,
-        af_match.ContactEmail
-    FROM PrepNames p
-    INNER JOIN dbo.orglist     AS ol ON ol.OrgAbbr    = p.BU
-    INNER JOIN ref.CSF2_Subcat AS rs ON rs.subcatName = p.SubcatName_Normalized
-    OUTER APPLY (
-        -- Try to find the best adomfeed match for this FullName
-        SELECT TOP (1)
-            af.PZID,
-            af.ContactEmail
-        FROM dbo.adomfeed af
-        CROSS APPLY (
-            SELECT
-                -- adomfeed cleaned/compact forms to mirror PrepNames
-                UPPER(LTRIM(RTRIM(
-                    REPLACE(REPLACE(REPLACE(REPLACE(af.FullName, ',', ' '), '.', ' '), '''', ''), '  ', ' ')
-                ))) AS CleanAF,
-                UPPER(
-                    REPLACE(REPLACE(REPLACE(REPLACE(af.FullName, ' ', ''), ',', ''), '.', ''), '''', '')
-                ) AS CompactAF
-        ) afx
-        CROSS APPLY (
-            -- derive first/last token from p.CleanName for tolerant LIKE matching
-            SELECT
-                CASE
-                    WHEN CHARINDEX(' ', p.CleanName) > 0
-                        THEN LEFT(p.CleanName, CHARINDEX(' ', p.CleanName) - 1)
-                    ELSE p.CleanName
-                END AS FirstTok,
-                CASE
-                    WHEN CHARINDEX(' ', REVERSE(p.CleanName)) > 0
-                        THEN RIGHT(p.CleanName, CHARINDEX(' ', REVERSE(p.CleanName)) - 1)
-                    ELSE p.CleanName
-                END AS LastTok
-        ) t
-        WHERE
-            -- 1) exact compact match (ignoring spaces/punctuation)
-            afx.CompactAF = p.CompactName
-            -- 2) or tolerant: both first & last tokens appear somewhere (handles order/extra whitespace)
-            OR (afx.CleanAF LIKE '%' + t.FirstTok + '%'
-                AND afx.CleanAF LIKE '%' + t.LastTok  + '%')
-        ORDER BY af.PZID  -- deterministic pick if multiple matches
-    ) af_match
-)
-INSERT INTO dbo.owner_mapping
-(
-    OrgID,
-    CSF_2_0_SubacatID,
-    PZID,
-    FullName,
-    ContactEmail,
-    ContactRole,
-    Eff_Dt,
-    Exp_Dt,
-    Status
-)
-SELECT
-    j.OrgID,
-    j.CSF_2_0_SubacatID,
-    j.PZID,
-    j.FullName,
-    j.ContactEmail,
-    j.ContactRole,
-    CAST('2025-08-01' AS date) AS Eff_Dt,
-    CAST('2028-12-01' AS date) AS Exp_Dt,
-    'A' AS Status
-FROM Joined j;
+        s.OrgID,
+        s.CSF_2_0_SubacatID,
+        s.PZID,
+        s.FullName,
+        s.ContactEmail,
+        s.ContactRole,
+        @AsOfDate        AS Eff_Dt,
+        @ActiveThrough   AS Exp_Dt,
+        'A'              AS Status
+    FROM #src s
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM dbo.owner_mapping t
+        WHERE t.OrgID             = s.OrgID
+          AND t.CSF_2_0_SubacatID = s.CSF_2_0_SubacatID
+          AND t.FullName          = s.FullName
+          AND t.ContactRole       = s.ContactRole
+          AND t.Status            = 'A'
+          AND (t.Exp_Dt IS NULL OR t.Exp_Dt >= @AsOfDate)
+    );
+
+    /* 4) (Optional) Refresh contact info for active rows that match on keys but have different PZID/Email */
+    UPDATE t
+        SET t.PZID         = s.PZID,
+            t.ContactEmail = s.ContactEmail
+    FROM dbo.owner_mapping t
+    JOIN #src s
+      ON s.OrgID             = t.OrgID
+     AND s.CSF_2_0_SubacatID = t.CSF_2_0_SubacatID
+     AND s.FullName          = t.FullName
+     AND s.ContactRole       = t.ContactRole
+    WHERE t.Status = 'A'
+      AND (t.Exp_Dt IS NULL OR t.Exp_Dt >= @AsOfDate)
+      AND (ISNULL(t.PZID,'') <> ISNULL(s.PZID,'')
+        OR ISNULL(t.ContactEmail,'') <> ISNULL(s.ContactEmail,''));
+
+    COMMIT;
+END
 GO
