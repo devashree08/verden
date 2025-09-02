@@ -1,93 +1,98 @@
-/* OPTIONAL: uncomment if this load is a full refresh
-TRUNCATE TABLE dbo.readiness;
+-- 1) Clear target table
+TRUNCATE TABLE dbo.owner_mapping;
 GO
-*/
 
+-- 2) Insert from dbo.analysis (Owner/Custodian), splitting names, normalizing subcat, joining org & ref tables
 WITH A AS (
     SELECT
         a.BU,
         a._2_0_subcategory,
         a.[_2025_Owner],
-        a.[_2025_Custodian],
-        a.In_Scope
+        a.[_2025_Custodian]
     FROM dbo.analysis AS a
-    WHERE a._2_0_subcategory IS NOT NULL
 ),
--- Normalize subcategory: pad a single-digit suffix after the last '-' with a leading zero
-Norm AS (
+-- Unpivot Owner/Custodian into rows
+Roles AS (
     SELECT
-        a.BU,
-        a._2_0_subcategory,
+        BU,
+        _2_0_subcategory,
+        RoleName,
+        NameList
+    FROM A
+    CROSS APPLY (VALUES
+        ('Owner',     [_2025_Owner]),
+        ('Custodian', [_2025_Custodian])
+    ) v(RoleName, NameList)
+    WHERE NameList IS NOT NULL AND LTRIM(RTRIM(CONVERT(varchar(max), NameList))) <> ''
+),
+-- Split comma-separated names into one row per person; trim whitespace
+SplitNames AS (
+    SELECT
+        r.BU,
+        r._2_0_subcategory,
+        r.RoleName AS ContactRole,
+        LTRIM(RTRIM(s.value)) AS FullName
+    FROM Roles r
+    CROSS APPLY STRING_SPLIT(CONVERT(varchar(max), r.NameList), ',') AS s
+    WHERE LTRIM(RTRIM(s.value)) <> ''
+),
+-- Normalize subcategory: pad single-digit suffix after the last '-' with a leading zero.
+-- 'DE.AE-2'  -> 'DE.AE-02'
+-- 'DE.AE-10' -> unchanged
+NormSubcat AS (
+    SELECT
+        sn.BU,
+        sn._2_0_subcategory,
+        sn.ContactRole,
+        sn.FullName,
         CASE
-            WHEN CHARINDEX('-', a._2_0_subcategory) > 0 THEN
+            WHEN CHARINDEX('-', sn._2_0_subcategory) > 0 THEN
                 CASE
-                    WHEN LEN(RIGHT(a._2_0_subcategory, CHARINDEX('-', REVERSE(a._2_0_subcategory)) - 1)) = 1
+                    WHEN LEN(RIGHT(sn._2_0_subcategory, CHARINDEX('-', REVERSE(sn._2_0_subcategory)) - 1)) = 1
                         THEN CONCAT(
-                            LEFT(a._2_0_subcategory,
-                                 LEN(a._2_0_subcategory) - (CHARINDEX('-', REVERSE(a._2_0_subcategory)))),
+                            LEFT(sn._2_0_subcategory,
+                                 LEN(sn._2_0_subcategory) - (CHARINDEX('-', REVERSE(sn._2_0_subcategory)))),
                             '-0',
-                            RIGHT(a._2_0_subcategory, CHARINDEX('-', REVERSE(a._2_0_subcategory)) - 1)
+                            RIGHT(sn._2_0_subcategory, CHARINDEX('-', REVERSE(sn._2_0_subcategory)) - 1)
                         )
-                    ELSE a._2_0_subcategory
+                    ELSE sn._2_0_subcategory
                 END
-            ELSE a._2_0_subcategory
-        END AS SubcatName_Normalized,
-        LTRIM(RTRIM(CONVERT(varchar(max), a.[_2025_Owner])))     AS OwnerRaw,
-        LTRIM(RTRIM(CONVERT(varchar(max), a.[_2025_Custodian]))) AS CustodianRaw,
-        a.In_Scope
-    FROM A a
+            ELSE sn._2_0_subcategory
+        END AS SubcatName_Normalized
+    FROM SplitNames sn
 ),
--- Join to org and subcat lookup tables
+-- Join to Org and Subcat lookup tables
 Joined AS (
-    SELECT
+    SELECT DISTINCT
         ol.OrgID,
-        ol.OrgFullName,
-        ol.OrgAbbr,
-        br.SubcatID,
-        br.SubcatName,
-        br.SubcatDescription,
-        br.[RelatedcSF1_1] AS RelatedCSF1_1,
-        n.OwnerRaw,
-        n.CustodianRaw,
-        n.In_Scope
-    FROM Norm n
-    INNER JOIN dbo.orglist  AS ol ON ol.OrgAbbr     = n.BU
-    INNER JOIN dbo.bu_ready AS br ON br.SubcatName  = n.SubcatName_Normalized
-),
--- Roll up to one row per (OrgID, SubcatID); keep Owner/Custodian comma-separated
-Rolled AS (
-    SELECT
-        j.OrgID,
-        j.OrgFullName,
-        j.OrgAbbr,
-        j.SubcatID,
-        j.SubcatName,
-        j.SubcatDescription,
-        j.RelatedCSF1_1,
-        STRING_AGG(NULLIF(j.OwnerRaw, ''), ', ')     AS SubcatOwner,
-        STRING_AGG(NULLIF(j.CustodianRaw, ''), ', ') AS SubcatCustodian,
-        MAX(j.In_Scope)                               AS [Scope]
-    FROM Joined j
-    GROUP BY
-        j.OrgID, j.OrgFullName, j.OrgAbbr,
-        j.SubcatID, j.SubcatName, j.SubcatDescription, j.RelatedCSF1_1
+        rs.SubcatID AS CSF_2_0_SubacatID,
+        n.FullName,
+        n.ContactRole
+    FROM NormSubcat n
+    INNER JOIN dbo.orglist      AS ol ON ol.OrgAbbr    = n.BU
+    INNER JOIN ref.CSF2_Subcat  AS rs ON rs.subcatName = n.SubcatName_Normalized
 )
-INSERT INTO dbo.readiness
+INSERT INTO dbo.owner_mapping
 (
-    OrgID, OrgFullName, OrgAbbr,
-    SubcatOwner, SubcatCustodian,
-    SubcatID, SubcatName, SubcatDescription, RelatedCSF1_1Subcat,
-    [Scope], MaturityProject, ConsumingFromOrg, Department, LastUpdatedBy, LastUpdatedDate
+    OrgID,
+    CSF_2_0_SubacatID,
+    PZID,
+    FullName,
+    ContactEmail,
+    ContactRole,
+    Eff_Dt,
+    Exp_Dt,
+    Status
 )
 SELECT
-    r.OrgID, r.OrgFullName, r.OrgAbbr,
-    r.SubcatOwner, r.SubcatCustodian,
-    r.SubcatID, r.SubcatName, r.SubcatDescription, r.RelatedCSF1_1,
-    r.[Scope],
-    NULL AS MaturityProject,
-    NULL AS ConsumingFromOrg,
-    NULL AS Department,
-    NULL AS LastUpdatedBy,
-    NULL AS LastUpdatedDate
-FROM Rolled r;
+    j.OrgID,
+    j.CSF_2_0_SubacatID,
+    NULL                               AS PZID,
+    j.FullName,
+    NULL                               AS ContactEmail,
+    j.ContactRole,
+    CAST('2025-08-01' AS date)         AS Eff_Dt,
+    CAST('2028-12-01' AS date)         AS Exp_Dt,
+    'A'                                AS Status
+FROM Joined j;
 GO
