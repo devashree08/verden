@@ -1,215 +1,93 @@
-// src/features/attributeMapping/components/organisms/RightHeaderComposite.jsx
-import * as React from 'react';
-import {
-  Box, Paper, Typography, Chip, IconButton,
-  Stack, Divider
-} from '@mui/material';
-import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
-import ExpandLessIcon  from '@mui/icons-material/ExpandLess';
-import ExpandableText from '../atoms/ExpandableText';
-import SubcatCompletionControls from '../molecules/SubcatCompletionControls';
+/* OPTIONAL: uncomment if this load is a full refresh
+TRUNCATE TABLE dbo.readiness;
+GO
+*/
 
-/* -------------------- helpers -------------------- */
-
-const Card = ({ title, children, sx }) => (
-  <Paper variant="outlined" sx={{ p: 1.5, borderRadius: 2, ...sx }}>
-    <Typography variant="overline" sx={{ letterSpacing: .6, color: 'text.secondary' }}>
-      {title}
-    </Typography>
-    {children}
-  </Paper>
-);
-
-const TitleAndText = ({ title, text }) => (
-  <Box>
-    <Typography variant="subtitle1" sx={{ fontWeight: 800, mb: .25 }}>{title}</Typography>
-    <Typography variant="body2" color="text.secondary">{text || '—'}</Typography>
-  </Box>
-);
-
-const splitCsv = (csv) => (csv || '').split(',').map(s => s.trim()).filter(Boolean);
-
-function renderNameChips(names, prefix, max = 3) {
-  if (!names?.length) return null;
-  const shown = names.slice(0, max);
-  const extra = names.length - shown.length;
-  return (
-    <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-      {shown.map((n, i) => (
-        <Chip key={`${prefix}-${i}`} size="small" label={`${prefix}: ${n}`} />
-      ))}
-      {extra > 0 && <Chip size="small" variant="outlined" label={`+${extra} more`} />}
-    </Stack>
-  );
-}
-
-// Safer than about:blank + document.write; less likely to be blocked.
-function openHtmlInNewWindow(title, text) {
-  const safe = (s = '') =>
-    s.replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
-  const html = `<!doctype html>
-<html><head><meta charset="utf-8"/>
-<title>${safe(title)}</title>
-<style>
-  body{font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;margin:24px;line-height:1.6;color:#1D2939}
-  h2{margin:0 0 12px;font-size:20px;font-weight:800}
-  pre{white-space:pre-wrap;word-wrap:break-word;margin:0}
-</style></head><body>
-  <h2>${safe(title)}</h2>
-  <pre>${safe(text || '—')}</pre>
-</body></html>`;
-  const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  window.open(url, '_blank', 'noopener,noreferrer');
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
-}
-
-/* -------------------- component -------------------- */
-
-export default function RightHeaderComposite({
-  header,
-  ownerCsv,
-  custodianCsv,
-  onCompletionUpdated
-}) {
-  const [collapsed, setCollapsed] = React.useState(false);
-  if (!header) return null;
-
-  // associated 1.1 subcategories (already normalized on the page)
-  const assoc = React.useMemo(() => header.csf11Mapped ?? [], [header.csf11Mapped]);
-
-  const owners = splitCsv(ownerCsv);
-  const custodians = splitCsv(custodianCsv);
-
-  return (
-    <Box>
-      {/* Summary strip — click to collapse/expand the details below (Sign-off is excluded) */}
-      <Paper
-        variant="outlined"
-        sx={{ p: 1, borderRadius: 2, mb: 1 }}
-        onClick={() => setCollapsed(c => !c)}
-      >
-        <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap" useFlexGap>
-          <Typography variant="subtitle1" sx={{ fontWeight: 800, mr: 1 }}>
-            {header.csF2SubcategoryName}
-          </Typography>
-          {renderNameChips(owners, 'Owner')}
-          {renderNameChips(custodians, 'Custodian')}
-          <Box sx={{ flex: 1 }} />
-          <IconButton
-            size="small"
-            onClick={(e) => { e.stopPropagation(); setCollapsed(c => !c); }}
-          >
-            {collapsed ? <ExpandMoreIcon/> : <ExpandLessIcon/>}
-          </IconButton>
-        </Stack>
-      </Paper>
-
-      {/* Always-visible: SUBCATEGORY SIGN-OFF (excluded from collapse) */}
-      <Box sx={{ mt: 1.5, mb: 2 }}>
-        <Card title="SUBCATEGORY SIGN-OFF">
-          <SubcatCompletionControls
-            orgID={header.orgID}
-            csF2SubcategoryID={header.csF2SubcategoryID}
-            header={header}
-            onPatchHeader={(_, __, patch) => onCompletionUpdated?.(patch)}
-          />
-        </Card>
-      </Box>
-
-      {/* Collapsible details */}
-      {!collapsed && (
-        <Box
-          sx={{
-            display: 'grid',
-            gridTemplateColumns: { xs: '1fr', xl: 'minmax(720px, 3fr) minmax(320px, 1fr)' },
-            gap: 2,
-            mb: 2,
-          }}
-        >
-          {/* Left cluster: Function / Category / Subcategory + 2 long-text sections */}
-          <Box
-            sx={{
-              minWidth: 0,
-              display: 'grid',
-              gridTemplateColumns: 'repeat(3, minmax(220px, 1fr))',
-              gap: 2
-            }}
-          >
-            <Card title="FUNCTION">
-              <TitleAndText title={header.functionName} text={header.functionLanguage} />
-            </Card>
-
-            <Card title="CATEGORY">
-              <TitleAndText title={header.categoryName} text={header.categoryLanguage} />
-            </Card>
-
-            <Card title="CSF 2.0 SUBCATEGORY">
-              <TitleAndText title={header.csF2SubcategoryName} text={header.csF2SubcategoryLanguage} />
-              {(owners.length || custodians.length) && (
-                <>
-                  <Divider sx={{ my: 1 }} />
-                  <Typography variant="overline" sx={{ color: 'text.secondary' }}>
-                    OWNER / CUSTODIAN
-                  </Typography>
-                  <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap sx={{ mt: .5 }}>
-                    {owners.map((n, i) => <Chip key={`o-${i}`} label={`Owner: ${n}`} size="small" />)}
-                    {custodians.map((n, i) => <Chip key={`c-${i}`} label={`Custodian: ${n}`} size="small" />)}
-                  </Stack>
-                </>
-              )}
-            </Card>
-
-            {/* Two long-text panes */}
-            <Box
-              sx={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(2, 1fr)',
-                gap: 1,
-                gridColumn: '1 / span 3',
-              }}
-            >
-              <Card title={<Typography variant='caption' sx={{ fontWeight: 900, color: 'black' }}>Change Summary</Typography>}>
-                <ExpandableText
-                  text={header.changeSummary}
-                  maxLines={4}
-                  onOpenDialog={() => openHtmlInNewWindow('Change Summary', header.changeSummary)}
-                />
-              </Card>
-
-              <Card title={<Typography variant='caption' sx={{ fontWeight: 900, color: 'black' }}>Implementation Examples</Typography>}>
-                <ExpandableText
-                  text={header.implementationExamples}
-                  maxLines={4}
-                  onOpenDialog={() => openHtmlInNewWindow('Implementation Examples', header.implementationExamples)}
-                />
-              </Card>
-            </Box>
-          </Box>
-
-          {/* Right column: Associated 1.1 subcategories */}
-          <Box sx={{ display: 'grid', gap: 2 }}>
-            <Card title="ASSOCIATED 1.1 SUBCATEGORIES">
-              {assoc.length === 0 ? (
-                <Typography variant="body2" color="text.disabled">None.</Typography>
-              ) : (
-                <Box component="ul" sx={{ pl: 3, m: 0 }}>
-                  {assoc.map(a => (
-                    <li key={a.id}>
-                      <Typography variant="subtitle1" sx={{ fontWeight: 800, mb: .25 }}>
-                        {a.name}
-                      </Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        {a.lang}
-                      </Typography>
-                    </li>
-                  ))}
-                </Box>
-              )}
-            </Card>
-          </Box>
-        </Box>
-      )}
-    </Box>
-  );
-}
+WITH A AS (
+    SELECT
+        a.BU,
+        a._2_0_subcategory,
+        a.[_2025_Owner],
+        a.[_2025_Custodian],
+        a.In_Scope
+    FROM dbo.analysis AS a
+    WHERE a._2_0_subcategory IS NOT NULL
+),
+-- Normalize subcategory: pad a single-digit suffix after the last '-' with a leading zero
+Norm AS (
+    SELECT
+        a.BU,
+        a._2_0_subcategory,
+        CASE
+            WHEN CHARINDEX('-', a._2_0_subcategory) > 0 THEN
+                CASE
+                    WHEN LEN(RIGHT(a._2_0_subcategory, CHARINDEX('-', REVERSE(a._2_0_subcategory)) - 1)) = 1
+                        THEN CONCAT(
+                            LEFT(a._2_0_subcategory,
+                                 LEN(a._2_0_subcategory) - (CHARINDEX('-', REVERSE(a._2_0_subcategory)))),
+                            '-0',
+                            RIGHT(a._2_0_subcategory, CHARINDEX('-', REVERSE(a._2_0_subcategory)) - 1)
+                        )
+                    ELSE a._2_0_subcategory
+                END
+            ELSE a._2_0_subcategory
+        END AS SubcatName_Normalized,
+        LTRIM(RTRIM(CONVERT(varchar(max), a.[_2025_Owner])))     AS OwnerRaw,
+        LTRIM(RTRIM(CONVERT(varchar(max), a.[_2025_Custodian]))) AS CustodianRaw,
+        a.In_Scope
+    FROM A a
+),
+-- Join to org and subcat lookup tables
+Joined AS (
+    SELECT
+        ol.OrgID,
+        ol.OrgFullName,
+        ol.OrgAbbr,
+        br.SubcatID,
+        br.SubcatName,
+        br.SubcatDescription,
+        br.[RelatedcSF1_1] AS RelatedCSF1_1,
+        n.OwnerRaw,
+        n.CustodianRaw,
+        n.In_Scope
+    FROM Norm n
+    INNER JOIN dbo.orglist  AS ol ON ol.OrgAbbr     = n.BU
+    INNER JOIN dbo.bu_ready AS br ON br.SubcatName  = n.SubcatName_Normalized
+),
+-- Roll up to one row per (OrgID, SubcatID); keep Owner/Custodian comma-separated
+Rolled AS (
+    SELECT
+        j.OrgID,
+        j.OrgFullName,
+        j.OrgAbbr,
+        j.SubcatID,
+        j.SubcatName,
+        j.SubcatDescription,
+        j.RelatedCSF1_1,
+        STRING_AGG(NULLIF(j.OwnerRaw, ''), ', ')     AS SubcatOwner,
+        STRING_AGG(NULLIF(j.CustodianRaw, ''), ', ') AS SubcatCustodian,
+        MAX(j.In_Scope)                               AS [Scope]
+    FROM Joined j
+    GROUP BY
+        j.OrgID, j.OrgFullName, j.OrgAbbr,
+        j.SubcatID, j.SubcatName, j.SubcatDescription, j.RelatedCSF1_1
+)
+INSERT INTO dbo.readiness
+(
+    OrgID, OrgFullName, OrgAbbr,
+    SubcatOwner, SubcatCustodian,
+    SubcatID, SubcatName, SubcatDescription, RelatedCSF1_1Subcat,
+    [Scope], MaturityProject, ConsumingFromOrg, Department, LastUpdatedBy, LastUpdatedDate
+)
+SELECT
+    r.OrgID, r.OrgFullName, r.OrgAbbr,
+    r.SubcatOwner, r.SubcatCustodian,
+    r.SubcatID, r.SubcatName, r.SubcatDescription, r.RelatedCSF1_1,
+    r.[Scope],
+    NULL AS MaturityProject,
+    NULL AS ConsumingFromOrg,
+    NULL AS Department,
+    NULL AS LastUpdatedBy,
+    NULL AS LastUpdatedDate
+FROM Rolled r;
+GO
