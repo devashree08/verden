@@ -2,7 +2,8 @@
 TRUNCATE TABLE dbo.owner_mapping;
 GO
 
--- 2) Insert from dbo.analysis (Owner/Custodian), splitting names, normalizing subcat, joining org & ref tables
+-- 2) Insert from dbo.analysis (Owner/Custodian), splitting names, normalizing subcat, joining org & ref tables,
+--    and enriching with PZID/ContactEmail from dbo.adomfeed via fuzzy name match.
 WITH A AS (
     SELECT
         a.BU,
@@ -23,7 +24,8 @@ Roles AS (
         ('Owner',     [_2025_Owner]),
         ('Custodian', [_2025_Custodian])
     ) v(RoleName, NameList)
-    WHERE NameList IS NOT NULL AND LTRIM(RTRIM(CONVERT(varchar(max), NameList))) <> ''
+    WHERE NameList IS NOT NULL
+      AND LTRIM(RTRIM(CONVERT(varchar(max), NameList))) <> ''
 ),
 -- Split comma-separated names into one row per person; trim whitespace
 SplitNames AS (
@@ -61,16 +63,73 @@ NormSubcat AS (
         END AS SubcatName_Normalized
     FROM SplitNames sn
 ),
--- Join to Org and Subcat lookup tables
+-- Pre-compute cleaned/compact names for robust matching to adomfeed
+PrepNames AS (
+    SELECT
+        n.BU,
+        n.SubcatName_Normalized,
+        n.ContactRole,
+        n.FullName,
+        -- CleanName: upper, punctuation -> spaces, trimmed
+        UPPER(LTRIM(RTRIM(
+            REPLACE(REPLACE(REPLACE(REPLACE(n.FullName, ',', ' '), '.', ' '), '''', ''), '  ', ' ')
+        ))) AS CleanName,
+        -- CompactName: upper, remove spaces & punctuation entirely
+        UPPER(
+            REPLACE(REPLACE(REPLACE(REPLACE(n.FullName, ' ', ''), ',', ''), '.', ''), '''', '')
+        ) AS CompactName
+    FROM NormSubcat n
+),
+-- Join to Org, Subcat, and enrich with adomfeed (PZID/ContactEmail)
 Joined AS (
     SELECT DISTINCT
         ol.OrgID,
         rs.SubcatID AS CSF_2_0_SubacatID,
-        n.FullName,
-        n.ContactRole
-    FROM NormSubcat n
-    INNER JOIN dbo.orglist      AS ol ON ol.OrgAbbr    = n.BU
-    INNER JOIN ref.CSF2_Subcat  AS rs ON rs.subcatName = n.SubcatName_Normalized
+        p.FullName,
+        p.ContactRole,
+        af_match.PZID,
+        af_match.ContactEmail
+    FROM PrepNames p
+    INNER JOIN dbo.orglist     AS ol ON ol.OrgAbbr    = p.BU
+    INNER JOIN ref.CSF2_Subcat AS rs ON rs.subcatName = p.SubcatName_Normalized
+    OUTER APPLY (
+        -- Try to find the best adomfeed match for this FullName
+        SELECT TOP (1)
+            af.PZID,
+            af.ContactEmail
+        FROM dbo.adomfeed af
+        CROSS APPLY (
+            SELECT
+                -- adomfeed cleaned/compact forms to mirror PrepNames
+                UPPER(LTRIM(RTRIM(
+                    REPLACE(REPLACE(REPLACE(REPLACE(af.FullName, ',', ' '), '.', ' '), '''', ''), '  ', ' ')
+                ))) AS CleanAF,
+                UPPER(
+                    REPLACE(REPLACE(REPLACE(REPLACE(af.FullName, ' ', ''), ',', ''), '.', ''), '''', '')
+                ) AS CompactAF
+        ) afx
+        CROSS APPLY (
+            -- derive first/last token from p.CleanName for tolerant LIKE matching
+            SELECT
+                CASE
+                    WHEN CHARINDEX(' ', p.CleanName) > 0
+                        THEN LEFT(p.CleanName, CHARINDEX(' ', p.CleanName) - 1)
+                    ELSE p.CleanName
+                END AS FirstTok,
+                CASE
+                    WHEN CHARINDEX(' ', REVERSE(p.CleanName)) > 0
+                        THEN RIGHT(p.CleanName, CHARINDEX(' ', REVERSE(p.CleanName)) - 1)
+                    ELSE p.CleanName
+                END AS LastTok
+        ) t
+        WHERE
+            -- 1) exact compact match (ignoring spaces/punctuation)
+            afx.CompactAF = p.CompactName
+            -- 2) or tolerant: both first & last tokens appear somewhere (handles order/extra whitespace)
+            OR (afx.CleanAF LIKE '%' + t.FirstTok + '%'
+                AND afx.CleanAF LIKE '%' + t.LastTok  + '%')
+        ORDER BY af.PZID  -- deterministic pick if multiple matches
+    ) af_match
 )
 INSERT INTO dbo.owner_mapping
 (
@@ -87,12 +146,12 @@ INSERT INTO dbo.owner_mapping
 SELECT
     j.OrgID,
     j.CSF_2_0_SubacatID,
-    NULL                               AS PZID,
+    j.PZID,
     j.FullName,
-    NULL                               AS ContactEmail,
+    j.ContactEmail,
     j.ContactRole,
-    CAST('2025-08-01' AS date)         AS Eff_Dt,
-    CAST('2028-12-01' AS date)         AS Exp_Dt,
-    'A'                                AS Status
+    CAST('2025-08-01' AS date) AS Eff_Dt,
+    CAST('2028-12-01' AS date) AS Exp_Dt,
+    'A' AS Status
 FROM Joined j;
 GO
