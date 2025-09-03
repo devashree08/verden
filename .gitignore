@@ -1,31 +1,69 @@
-using Microsoft.AspNetCore.Authorization;
-using System.Security.Claims;
+namespace Maturity.Portal.Configurations;
 
-namespace Maturity.Portal.Authorization;
-
-/// Creates a policy on-the-fly that requires portal:policy == <policyName>
-/// if the policy wasn't explicitly registered.
-public sealed class DynamicPolicyProvider(IAuthorizationPolicyProvider fallback)
-    : IAuthorizationPolicyProvider
+public sealed class HeaderIdentityOptions
 {
-    private readonly IAuthorizationPolicyProvider _fallback = fallback;
+    // SSO header keys
+    public string HeaderUserName { get; init; } = "pzid";
+    public string HeaderEid      { get; init; } = "eid";
+    public string HeaderEmail    { get; init; } = "email";
+    public string HeaderFirst    { get; init; } = "firstName";
+    public string HeaderLast     { get; init; } = "lastName";
 
-    public Task<AuthorizationPolicy?> GetDefaultPolicyAsync()
-        => _fallback.GetDefaultPolicyAsync();
+    // Dev convenience: allow header-only auth when true and env.IsDevelopment()
+    public bool AllowHeaderFallbackInDevelopment { get; init; } = true;
+}
 
-    public Task<AuthorizationPolicy?> GetFallbackPolicyAsync()
-        => _fallback.GetFallbackPolicyAsync();
 
-    public async Task<AuthorizationPolicy?> GetPolicyAsync(string policyName)
+
+namespace Maturity.Portal.Configurations;
+
+public sealed class PolicyCacheOptions
+{
+    public int Minutes { get; init; } = 5;
+}
+
+
+
+namespace Maturity.Portal.Configurations;
+
+public sealed class SecureHeaderOptions
+{
+    public bool EnableHsts { get; init; } = true;
+    public int  HstsMaxAgeDays { get; init; } = 365;
+    public bool IncludeSubdomains { get; init; } = true;
+    public bool Preload { get; init; } = true;
+}
+
+using System.Data.Common;
+
+namespace Maturity.Portal.Data;
+
+public interface IDbConnectionFactory
+{
+    Task<DbConnection> OpenAsync(CancellationToken ct = default);
+}
+
+
+
+using System.Data.Common;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Configuration;
+
+namespace Maturity.Portal.Data;
+
+/// Simple factory that opens a fresh SqlConnection from configuration.
+/// Set "ConnectionStrings:AppDb" in appsettings / secret store / key vault binding.
+public sealed class SqlDbConnectionFactory(IConfiguration config) : IDbConnectionFactory
+{
+    private readonly string _cs = config.GetConnectionString("AppDb")
+        ?? throw new InvalidOperationException("ConnectionStrings:AppDb is not configured.");
+
+    public async Task<DbConnection> OpenAsync(CancellationToken ct = default)
     {
-        var existing = await _fallback.GetPolicyAsync(policyName);
-        if (existing is not null) return existing;
-
-        var p = new AuthorizationPolicyBuilder()
-            .RequireAuthenticatedUser()
-            .RequireClaim(PortalClaimTypes.Policy, policyName)
-            .Build();
-
-        return p;
+        var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        return conn;
     }
 }
+
+
