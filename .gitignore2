@@ -1,0 +1,861 @@
+Folder layout
+Authorization/
+  DynamicPolicyProvider.cs
+  PortalClaimTypes.cs
+  PortalPolicies.cs          // ← FILL: your policy names (Admin, Edit.Area.All, etc.)
+  PortalCompositePolicies.cs // ← OPTIONAL: composites like AreaWrite (Admin OR Edit.Area.All)
+
+Configurations/
+  HeaderIdentityOptions.cs
+  PolicyCacheOptions.cs
+  SecureHeaderOptions.cs
+
+Data/
+  IDbConnectionFactory.cs
+  SqlDbConnectionFactory.cs
+
+Errors/
+  GlobalExceptionHandler.cs
+
+Extensions/
+  ClaimsPrincipalExtensions.cs
+  ServiceCollectionExtensions.cs
+  ApplicationBuilderExtensions.cs
+  SecureHeaderExtensions.cs
+  SerilogExtensions.cs
+
+Middlewares/
+  SsoIdentityMiddleware.cs
+  CorrelationLoggingMiddleware.cs
+
+Models/
+  UserPermissionsDto.cs
+
+Services/
+  IPortalPolicyService.cs
+  PortalPolicyService.cs
+
+Controllers/
+  AuthController.cs
+  AdminDebugController.cs
+
+appsettings.json
+{
+  "ConnectionStrings": {
+    "AppDb": "Server=.;Database=YourDb;Integrated Security=true;"
+  },
+  "PortalLogging": {
+    "Directory": "D:\\YourApp\\Logs",
+    "MinimumLevel": "Information"
+  },
+  "Auth": {
+    "Headers": {
+      "HeaderUserName":  "pzid",
+      "HeaderEid":       "eid",
+      "HeaderEmail":     "email",
+      "HeaderFirstName": "firstName",
+      "HeaderLastName":  "lastName",
+
+      "ItemUserNameKey":  "pzid",
+      "ItemEidKey":       "eid",
+      "ItemEmailKey":     "email",
+      "ItemFirstNameKey": "firstName",
+      "ItemLastNameKey":  "lastName",
+
+      "AllowHeaderFallbackInDevelopment": true
+    },
+    "PolicyCache": {
+      "Minutes": 5
+    }
+  },
+  "Security": {
+    "Headers": {
+      "EnableHsts": true,
+      "HstsMaxAgeDays": 365,
+      "IncludeSubdomains": true,
+      "Preload": true
+    }
+  }
+}
+
+
+Program.cs
+using Microsoft.AspNetCore.Authentication.Negotiate;
+using Microsoft.AspNetCore.Authorization;
+using YourApp.Authorization;
+using YourApp.Data;
+using YourApp.Errors;
+using YourApp.Extensions;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Serilog (file JSON)
+builder.UsePortalSerilog();
+
+// Hide server header
+builder.WebHost.ConfigureKestrel(o => o.AddServerHeader = false);
+
+// CORS (named policy; example origins)
+var MyAllowSpecificOrigins = "_myAllowSpecificOrigins";
+builder.Services.AddCors(o => o.AddPolicy(MyAllowSpecificOrigins, p =>
+    p.WithOrigins("http://localhost:5173", "https://portal.acme.com")
+     .WithMethods("GET","POST","PATCH")
+     .AllowAnyHeader()
+     .AllowCredentials()
+));
+
+builder.Services.AddRequestTimeouts(o => o.DefaultPolicy = new RequestTimeoutPolicy { Timeout = TimeSpan.FromSeconds(50) });
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+// SP-only DB access
+builder.Services.AddScoped<IDbConnectionFactory, SqlDbConnectionFactory>();
+
+// AuthN (IWA/Kerberos via Negotiate)
+builder.Services.AddAuthentication(NegotiateDefaults.AuthenticationScheme).AddNegotiate();
+
+// AuthZ + dynamic provider + options
+builder.Services.AddPortalPolicyServices(builder.Configuration);
+
+builder.Services.AddProblemDetails(opt =>
+{
+    opt.CustomizeProblemDetails = ctx =>
+        ctx.ProblemDetails.Extensions["correlationId"] = ctx.HttpContext.TraceIdentifier;
+});
+builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+
+var app = builder.Build();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.UseExceptionHandler();                 // 1) early
+app.UseHttpsRedirection();
+app.UseSecureHeaders(app.Environment);     // 2) security headers/HSTS
+
+app.UseCors(MyAllowSpecificOrigins);
+app.UseRequestTimeouts();
+
+app.UseAuthentication();                   // 3) authN
+app.UsePortalSsoIdentity();                // 4) SSO headers → primary PortalSso identity + policies
+app.UseAuthorization();                    // 5) authZ
+
+app.UsePortalCorrelationLogging();         // 6) enrich logs with correlationId/eid/userName
+app.UsePortalRequestLogging();
+
+app.MapControllers();
+app.Run();
+
+
+
+
+Authorization/PortalClaimTypes.cs
+#nullable enable
+using System.Security.Claims;
+
+namespace YourApp.Authorization;
+
+public static class PortalClaimTypes
+{
+    public const string Policy   = "portal:policy"; // one per policy string from SP
+    public const string EID      = "portal:eid";
+    public const string UserName = ClaimTypes.Name;       // pzid goes here (primary identity name)
+    public const string Email    = ClaimTypes.Email;
+    public const string GivenName= ClaimTypes.GivenName;
+    public const string Surname  = ClaimTypes.Surname;
+}
+
+
+
+
+
+Authorization/PortalPolicies.cs !! HAVE TO FILL CUSTOM
+#nullable enable
+namespace YourApp.Authorization;
+
+/// Strings must match what dbo.sp_GetPortalPolicies returns.
+///
+/// Examples:
+///   // GEF:
+///   // public const string Admin = "Admin";
+///   // public const string Edit_TDM_All    = "Edit.TDM.All";
+///   // public const string Edit_Access_All = "Edit.Access.All";
+///   // public const string Edit_CustomerUpdate = "Edit.CustomerUpdate";
+///
+///   // Maturity:
+///   // public const string Admin = "Admin";
+///   // public const string Edit_VCS_All     = "Edit.VCS.All";
+///   // public const string Edit_TPD_All     = "Edit.TPD.All";
+///   // public const string Edit_Network_All = "Edit.Network.All";
+///   // public const string Edit_VGST_All    = "Edit.VGS-T.All";
+public static class PortalPolicies
+{
+    public const string Admin = "Admin";
+    // Add app-specific edit policies here…
+}
+
+
+Authorization/PortalCompositePolicies.cs
+
+#nullable enable
+using Microsoft.AspNetCore.Authorization;
+
+namespace YourApp.Authorization;
+
+/// Composite “OR” policies for cleaner controller attributes.
+/// Examples:
+///   // GEF:
+///   // public const string TdmWrite    = "TdmWrite";    // Admin OR Edit.TDM.All OR Edit.CustomerUpdate
+///   // public const string AccessWrite = "AccessWrite"; // Admin OR Edit.Access.All OR Edit.CustomerUpdate
+///
+///   // Maturity:
+///   // public const string VcsWrite     = "VcsWrite";     // Admin OR Edit.VCS.All
+///   // public const string TpdWrite     = "TpdWrite";     // Admin OR Edit.TPD.All
+///   // public const string NetworkWrite = "NetworkWrite"; // Admin OR Edit.Network.All
+///   // public const string VgstWrite    = "VgstWrite";    // Admin OR Edit.VGS-T.All
+public static class PortalCompositePolicies
+{
+    // Define string constants as needed, then register them in ServiceCollectionExtensions
+}
+
+
+
+
+Authorization/DynamicPolicyProvider.cs
+#nullable enable
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Options;
+
+namespace YourApp.Authorization;
+
+public sealed class DynamicPolicyProvider(IAuthorizationPolicyProvider fallback)
+    : IAuthorizationPolicyProvider
+{
+    private readonly IAuthorizationPolicyProvider _fallback = fallback;
+
+    public Task<AuthorizationPolicy?> GetDefaultPolicyAsync()  => _fallback.GetDefaultPolicyAsync();
+    public Task<AuthorizationPolicy?> GetFallbackPolicyAsync() => _fallback.GetFallbackPolicyAsync();
+
+    public async Task<AuthorizationPolicy?> GetPolicyAsync(string policyName)
+    {
+        var existing = await _fallback.GetPolicyAsync(policyName);
+        if (existing is not null) return existing;
+
+        return new AuthorizationPolicyBuilder()
+            .RequireAuthenticatedUser()
+            .RequireClaim(PortalClaimTypes.Policy, policyName)
+            .Build();
+    }
+}
+
+
+
+Configurations/HeaderIdentityOptions.cs
+#nullable enable
+namespace YourApp.Configurations;
+
+public sealed class HeaderIdentityOptions
+{
+    public string HeaderUserName   { get; init; } = "pzid";
+    public string HeaderEid        { get; init; } = "eid";
+    public string HeaderEmail      { get; init; } = "email";
+    public string HeaderFirstName  { get; init; } = "firstName";
+    public string HeaderLastName   { get; init; } = "lastName";
+
+    public string ItemUserNameKey  { get; init; } = "pzid";
+    public string ItemEidKey       { get; init; } = "eid";
+    public string ItemEmailKey     { get; init; } = "email";
+    public string ItemFirstNameKey { get; init; } = "firstName";
+    public string ItemLastNameKey  { get; init; } = "lastName";
+
+    public bool AllowHeaderFallbackInDevelopment { get; init; } = true;
+}
+
+
+
+Configurations/PolicyCacheOptions.cs
+
+#nullable enable
+namespace YourApp.Configurations;
+
+public sealed class PolicyCacheOptions
+{
+    public int Minutes { get; init; } = 5;
+}
+
+
+
+Data/IDbConnectionFactory.cs
+
+public interface IDbConnectionFactory
+{
+    Task<DbConnection> OpenAsync(CancellationToken ct = default);
+}
+
+
+
+Data/SqlDbConnectionFactory.cs -- need to change this
+
+public sealed class SqlDbConnectionFactory(IConfiguration config) : IDbConnectionFactory
+{
+    private readonly string? _cs = config.GetConnectionString("AppDb");
+
+    public async Task<DbConnection> OpenAsync(CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(_cs))
+            throw new InvalidOperationException("ConnectionStrings:AppDb is missing.");
+        var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        return conn;
+    }
+}
+
+
+
+Services/IPortalPolicyService.cs
+public interface IPortalPolicyService
+{
+    /// Calls dbo.sp_PortalPolicies and returns policy names.
+    /// Username (pzid) is primary; EID is fallback.
+    Task<IReadOnlyList<string>> GetPoliciesAsync(string? userName, string? eid, CancellationToken ct = default);
+}
+
+
+Services/PortalPolicyService.cs
+
+
+
+#nullable enable
+using System.Data;
+using System.Data.Common;
+using Dapper;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using YourApp.Configurations;
+using YourApp.Data;
+
+namespace YourApp.Services;
+
+
+public sealed class PortalPolicyService(
+    IDbConnectionFactory dbFactory,
+    IMemoryCache cache,
+    TimeProvider clock,
+    IOptions<PolicyCacheOptions> cacheOpts,
+    ILogger<PortalPolicyService> log
+) : IPortalPolicyService
+{
+    private readonly IDbConnectionFactory _db = dbFactory;
+    private readonly IMemoryCache _cache = cache;
+    private readonly TimeProvider _clock = clock;
+    private readonly PolicyCacheOptions _opts = cacheOpts.Value;
+    private readonly ILogger<PortalPolicyService> _log = log;
+
+    public async Task<IReadOnlyList<string>> GetPoliciesAsync(string? userName, string? eid, CancellationToken ct = default)
+    {
+        var key = userName ?? eid ?? "anon";
+        if (_cache.TryGetValue($"pol::{key}", out IReadOnlyList<string>? cached) && cached is not null)
+            return cached;
+
+        try
+        {
+            await using DbConnection conn = await _db.OpenAsync(ct);
+            var p = new DynamicParameters();
+            p.Add("@UserEID",  eid,      DbType.String);
+            p.Add("@UserName", userName, DbType.String);
+
+            var list = (await conn.QueryAsync<string>(
+                "dbo.usp_PortalPolicies_GetForUser",
+                p, commandType: CommandType.StoredProcedure)).ToList().AsReadOnly();
+
+            // Warn if authenticated but no membership (front-end should show NoMembership)
+            if ((userName ?? eid) is not null && list.Count == 0)
+                _log.LogWarning("Authenticated user has NO membership in feed. user={User} eid={Eid}", userName, eid);
+
+            _cache.Set($"pol::{key}", list, _clock.GetUtcNow().AddMinutes(_opts.Minutes));
+            return list;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Policy SP failed for user={User} eid={Eid}", userName, eid);
+            return Array.Empty<string>(); // fail-closed for writes
+        }
+    }
+}
+
+
+
+
+
+Middlewares/SsoIdentityMiddleware.cs (primary identity = PortalSso)
+
+
+#nullable enable
+using System.Security.Claims;
+using Microsoft.Extensions.Options;
+using YourApp.Authorization;
+using YourApp.Configurations;
+using YourApp.Services;
+
+namespace YourApp.Middlewares;
+
+public sealed class SsoIdentityMiddleware(
+    RequestDelegate next,
+    IOptions<HeaderIdentityOptions> opt
+)
+{
+    private readonly RequestDelegate _next = next;
+    private readonly HeaderIdentityOptions _h = opt.Value;
+
+    public async Task InvokeAsync(HttpContext ctx)
+    {
+        static string? First(params string?[] v) => v.FirstOrDefault(s => !string.IsNullOrWhiteSpace(s))?.Trim();
+        string? H(string k) => string.IsNullOrWhiteSpace(k) ? null : ctx.Request.Headers[k].FirstOrDefault()?.Trim();
+        string? I(string k) => string.IsNullOrWhiteSpace(k) ? null : (ctx.Items.TryGetValue(k, out var v) ? v?.ToString()?.Trim() : null);
+
+        // Resolve identity from Headers → Items → existing claims
+        var userName = First(H(_h.HeaderUserName),  I(_h.ItemUserNameKey),  ctx.User?.Identity?.Name);
+        var eid      = First(H(_h.HeaderEid),       I(_h.ItemEidKey),       ctx.User?.FindFirst(PortalClaimTypes.EID)?.Value);
+        var email    = First(H(_h.HeaderEmail),     I(_h.ItemEmailKey),     ctx.User?.FindFirst(PortalClaimTypes.Email)?.Value);
+        var first    = First(H(_h.HeaderFirstName), I(_h.ItemFirstNameKey), ctx.User?.FindFirst(PortalClaimTypes.GivenName)?.Value);
+        var last     = First(H(_h.HeaderLastName),  I(_h.ItemLastNameKey),  ctx.User?.FindFirst(PortalClaimTypes.Surname)?.Value);
+
+        if (string.IsNullOrWhiteSpace(userName) && string.IsNullOrWhiteSpace(eid))
+        {
+            await _next(ctx);
+            return;
+        }
+
+        // Resolve policies via SP
+        var polSvc   = ctx.RequestServices.GetRequiredService<IPortalPolicyService>();
+        var policies = await polSvc.GetPoliciesAsync(userName, eid, ctx.RequestAborted);
+
+        // Build primary PortalSso identity (Name = pzid)
+        var portal = new ClaimsIdentity(authenticationType: "PortalSso", nameType: ClaimTypes.Name, roleType: ClaimTypes.Role);
+        void Add(string t, string? v) { if (!string.IsNullOrWhiteSpace(v)) portal.AddClaim(new Claim(t, v)); }
+        Add(PortalClaimTypes.UserName,  userName);
+        Add(PortalClaimTypes.EID,       eid);
+        Add(PortalClaimTypes.Email,     email);
+        Add(PortalClaimTypes.GivenName, first);
+        Add(PortalClaimTypes.Surname,   last);
+
+        foreach (var p in policies)
+            if (!string.IsNullOrWhiteSpace(p)) portal.AddClaim(new Claim(PortalClaimTypes.Policy, p));
+
+        var identities = new List<ClaimsIdentity>(1 + (ctx.User?.Identities.Count() ?? 0)) { portal };
+        if (ctx.User is { } existing && existing.Identities.Any())
+            identities.AddRange(existing.Identities);
+
+        ctx.User = new ClaimsPrincipal(identities);
+        await _next(ctx);
+    }
+}
+
+
+
+
+Middlewares/CorrelationLoggingMiddleware.cs
+#nullable enable
+using Serilog.Context;
+using YourApp.Authorization;
+
+namespace YourApp.Middlewares;
+
+public sealed class CorrelationLoggingMiddleware(RequestDelegate next)
+{
+    private const string CorrelationHeader = "X-Correlation-ID";
+    private readonly RequestDelegate _next = next;
+
+    public async Task InvokeAsync(HttpContext ctx)
+    {
+        var inbound = ctx.Request.Headers[CorrelationHeader].FirstOrDefault()
+                   ?? ctx.Request.Headers["X-Request-ID"].FirstOrDefault();
+        var correlationId = string.IsNullOrWhiteSpace(inbound) ? ctx.TraceIdentifier : inbound.Trim();
+
+        ctx.Response.Headers[CorrelationHeader] = correlationId;
+
+        var eid  = ctx.User?.FindFirst(PortalClaimTypes.EID)?.Value ?? string.Empty;
+        var user = ctx.User?.Identity?.Name ?? string.Empty;
+
+        using (LogContext.PushProperty("correlationId", correlationId))
+        using (LogContext.PushProperty("eid", eid))
+        using (LogContext.PushProperty("userName", user))
+        {
+            await _next(ctx);
+        }
+    }
+}
+
+
+
+Extensions/ServiceCollectionExtensions.cs
+
+
+
+#nullable enable
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Options;
+using YourApp.Authorization;
+using YourApp.Configurations;
+using YourApp.Middlewares;
+using YourApp.Services;
+
+namespace YourApp.Extensions;
+
+public static class ServiceCollectionExtensions
+{
+    public static IServiceCollection AddPortalPolicyServices(this IServiceCollection services, IConfiguration config)
+    {
+        services.Configure<HeaderIdentityOptions>(config.GetSection("Auth:Headers"));
+        services.Configure<PolicyCacheOptions>(config.GetSection("Auth:PolicyCache"));
+
+        services.AddMemoryCache();
+        services.AddSingleton<TimeProvider>(TimeProvider.System);
+
+        services.AddScoped<IPortalPolicyService, PortalPolicyService>();
+
+        // AuthZ with fallback “authenticated”
+        services.AddAuthorizationBuilder()
+            .SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build());
+
+        // Register composite policies here if you use them (optional):
+        services.PostConfigure<AuthorizationOptions>(options =>
+        {
+            // Example composites (uncomment/customize):
+            // options.AddPolicy(PortalCompositePolicies.VcsWrite,
+            //   p => p.RequireAssertion(ctx =>
+            //        ctx.User.HasClaim(PortalClaimTypes.Policy, PortalPolicies.Admin) ||
+            //        ctx.User.HasClaim(PortalClaimTypes.Policy, PortalPolicies.Edit_VCS_All)));
+        });
+
+        // Dynamic provider
+        services.AddSingleton<IAuthorizationPolicyProvider>(sp =>
+        {
+            var opt = sp.GetRequiredService<IOptions<AuthorizationOptions>>();
+            return new DynamicPolicyProvider(new DefaultAuthorizationPolicyProvider(opt));
+        });
+
+        return services;
+    }
+}
+
+
+
+Extensions/ApplicationBuilderExtensions.cs
+
+#nullable enable
+using YourApp.Middlewares;
+
+namespace YourApp.Extensions;
+
+public static class ApplicationBuilderExtensions
+{
+    public static IApplicationBuilder UsePortalSsoIdentity(this IApplicationBuilder app)
+        => app.UseMiddleware<SsoIdentityMiddleware>();
+
+    public static IApplicationBuilder UsePortalCorrelationLogging(this IApplicationBuilder app)
+        => app.UseMiddleware<CorrelationLoggingMiddleware>();
+
+    public static IApplicationBuilder UsePortalRequestLogging(this IApplicationBuilder app)
+    {
+        // Serilog request logging (minimal)
+        return app.UseSerilogRequestLogging();
+    }
+}
+
+
+
+Extensions/SecureHeaderExtensions
+
+
+#nullable enable
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
+using YourApp.Configurations;
+
+namespace YourApp.Extensions;
+
+public static class SecureHeaderExtensions
+{
+    public static IApplicationBuilder UseSecureHeaders(
+        this IApplicationBuilder app,
+        IWebHostEnvironment env,
+        SecureHeaderOptions? explicitOptions = null)
+    {
+        var resolved = explicitOptions
+            ?? app.ApplicationServices.GetService<IOptions<SecureHeaderOptions>>()?.Value
+            ?? new SecureHeaderOptions();
+
+        app.Use(async (ctx, next) =>
+        {
+            var h = ctx.Response.Headers;
+            if (!h.ContainsKey("X-Content-Type-Options"))             h.Append("X-Content-Type-Options", "nosniff");
+            if (!h.ContainsKey("X-Frame-Options"))                    h.Append("X-Frame-Options", "SAMEORIGIN");
+            if (!h.ContainsKey("Referrer-Policy"))                    h.Append("Referrer-Policy", "no-referrer");
+            if (!h.ContainsKey("X-Permitted-Cross-Domain-Policies"))  h.Append("X-Permitted-Cross-Domain-Policies", "none");
+            if (!h.ContainsKey("Permissions-Policy"))                 h.Append("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+            await next();
+        });
+
+        if (!env.IsDevelopment() && resolved.EnableHsts)
+            app.UseHsts();
+
+        return app;
+    }
+}
+
+public sealed class SecureHeaderOptions
+{
+    public bool EnableHsts { get; init; } = true;
+    public int  HstsMaxAgeDays { get; init; } = 365;
+    public bool IncludeSubdomains { get; init; } = true;
+    public bool Preload { get; init; } = true;
+}
+
+
+
+
+Extensions/SerilogExtensions.cs
+
+#nullable enable
+using Serilog;
+using Serilog.Events;
+
+namespace YourApp.Extensions;
+
+public static class SerilogExtensions
+{
+    public static void UsePortalSerilog(this WebApplicationBuilder builder)
+    {
+        var dir = builder.Configuration["PortalLogging:Directory"] ?? "D:\\Logs";
+        var min = builder.Configuration["PortalLogging:MinimumLevel"] ?? "Information";
+        var level = Enum.TryParse(min, true, out LogEventLevel l) ? l : LogEventLevel.Information;
+
+        Directory.CreateDirectory(dir);
+
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Is(level)
+            .Enrich.FromLogContext()
+            .WriteTo.File(
+                path: Path.Combine(dir, "portal_.log"),
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: 30,
+                shared: true,
+                formatProvider: null)
+            .CreateLogger();
+
+        builder.Host.UseSerilog(Log.Logger, dispose: true);
+    }
+}
+
+
+
+Extensions/ClaimsPrincipalExtensions.cs
+#nullable enable
+using System.Security.Claims;
+using YourApp.Authorization;
+
+namespace YourApp.Extensions;
+
+public static class ClaimsPrincipalExtensions
+{
+    public static string GetDisplayName(this ClaimsPrincipal u)
+    {
+        var first = u.FindFirst(PortalClaimTypes.GivenName)?.Value;
+        var last  = u.FindFirst(PortalClaimTypes.Surname)?.Value;
+        var name  = string.Join(' ', new[] { first, last }.Where(s => !string.IsNullOrWhiteSpace(s)));
+        return string.IsNullOrWhiteSpace(name) ? (u.Identity?.Name ?? "Unknown") : name.Trim();
+    }
+}
+
+
+Errors/GlobalExceptionHandler.cs
+#nullable enable
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.SqlClient;
+
+namespace YourApp.Errors;
+
+public sealed class GlobalExceptionHandler : IExceptionHandler
+{
+    public async ValueTask<bool> TryHandleAsync(HttpContext ctx, Exception ex, CancellationToken ct)
+    {
+        var (status, title) = ex switch
+        {
+            SqlException sql when sql.Number is 51002 or 51013 => (StatusCodes.Status403Forbidden, "Forbidden"),
+            SqlException sql when sql.Number is 51003           => (StatusCodes.Status404NotFound,  "Not Found"),
+            _                                                   => (StatusCodes.Status500InternalServerError, "Internal Server Error")
+        };
+
+        var pd = new ProblemDetails
+        {
+            Status = status,
+            Title  = title,
+            Detail = status == 500 ? "An unexpected error occurred." : null,
+            Instance = ctx.Request.Path
+        };
+        pd.Extensions["correlationId"] = ctx.TraceIdentifier;
+
+        ctx.Response.StatusCode = status;
+        await ctx.Response.WriteAsJsonAsync(pd, ct);
+        return true;
+    }
+}
+
+Models/UserPermissionsDto.cs
+#nullable enable
+namespace YourApp.Models;
+
+public sealed class UserPermissionsDto
+{
+    public bool   IsAuthenticated { get; init; }
+    public string? UserName       { get; init; }
+    public string? EID            { get; init; }
+    public string  DisplayName    { get; init; } = string.Empty;
+
+    public bool IsPortalUser      { get; init; }
+    public string MembershipState { get; init; } = "Authorized"; // or "NoMembership"
+
+    public IReadOnlyList<string> Policies { get; init; } = Array.Empty<string>();
+
+    // EXAMPLES (uncomment if useful to your UI):
+    // public bool IsAdmin        { get; init; }
+    // public bool CanEditVCS     { get; init; }
+    // public bool CanEditTPD     { get; init; }
+    // public bool CanEditNetwork { get; init; }
+    // public bool CanEditVGST    { get; init; }
+}
+
+Controllers/AuthController.cs
+#nullable enable
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using YourApp.Authorization;
+using YourApp.Extensions;
+using YourApp.Models;
+
+namespace YourApp.Controllers;
+
+/// Frontend reads this to toggle UI affordances.
+[ApiController]
+[Route("api/auth")]
+public sealed class AuthController : ControllerBase
+{
+    [HttpGet("user-permissions")]
+    [Authorize]
+    public ActionResult<UserPermissionsDto> GetUserPermissions()
+    {
+        var u = User;
+        var policies = u.FindAll(PortalClaimTypes.Policy)
+                        .Select(c => c.Value)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+        var dto = new UserPermissionsDto
+        {
+            IsAuthenticated = u.Identity?.IsAuthenticated ?? false,
+            UserName        = u.Identity?.Name,                  // pzid
+            EID             = u.FindFirst(PortalClaimTypes.EID)?.Value,
+            DisplayName     = u.GetDisplayName(),
+            Policies        = policies,
+            IsPortalUser    = policies.Count > 0,
+            MembershipState = policies.Count > 0 ? "Authorized" : "NoMembership"
+        };
+
+        // EXAMPLE flags (match your app’s policy constants):
+        // bool has(string p) => policies.Contains(p, StringComparer.OrdinalIgnoreCase);
+        // dto.IsAdmin        = has(PortalPolicies.Admin);
+        // dto.CanEditVCS     = dto.IsAdmin || has(PortalPolicies.Edit_VCS_All);
+        // dto.CanEditTPD     = dto.IsAdmin || has(PortalPolicies.Edit_TPD_All);
+        // dto.CanEditNetwork = dto.IsAdmin || has(PortalPolicies.Edit_Network_All);
+        // dto.CanEditVGST    = dto.IsAdmin || has(PortalPolicies.Edit_VGST_All);
+
+        return Ok(dto);
+    }
+}
+
+Controllers/AdminDebugController.cs (Admin-only)
+#nullable enable
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+using System.Security.Claims;
+using YourApp.Authorization;
+using YourApp.Configurations;
+
+namespace YourApp.Controllers;
+
+/// Admin-only diagnostics to see headers/items/claims.
+/// Keep enabled only for admins (or disable in prod).
+[ApiController]
+[Route("api/admin")]
+public sealed class AdminDebugController(IOptions<HeaderIdentityOptions> opts, IWebHostEnvironment env) : ControllerBase
+{
+    private readonly HeaderIdentityOptions _h = opts.Value;
+    private readonly IWebHostEnvironment _env = env;
+
+    [HttpGet("debug-identity")]
+    [Authorize(Policy = PortalPolicies.Admin)]
+    public IActionResult DebugIdentity()
+    {
+        string? H(string k) => string.IsNullOrWhiteSpace(k) ? null : Request.Headers[k].FirstOrDefault();
+        string? I(string k) => string.IsNullOrWhiteSpace(k) ? null : (HttpContext.Items.TryGetValue(k, out var v) ? v?.ToString() : null);
+
+        var hdr = new { userName = H(_h.HeaderUserName), eid = H(_h.HeaderEid), email = H(_h.HeaderEmail), first = H(_h.HeaderFirstName), last = H(_h.HeaderLastName) };
+        var itm = new { userName = I(_h.ItemUserNameKey), eid = I(_h.ItemEidKey), email = I(_h.ItemEmailKey), first = I(_h.ItemFirstNameKey), last = I(_h.ItemLastNameKey) };
+        var rawClaims = User.Claims.Select(c => new { c.Type, c.Value }).ToList();
+
+        var guess = !string.IsNullOrWhiteSpace(itm.userName) || !string.IsNullOrWhiteSpace(itm.eid) ? "HttpContext.Items (SSO agent)"
+                 : !string.IsNullOrWhiteSpace(hdr.userName) || !string.IsNullOrWhiteSpace(hdr.eid) ? "Request Headers (SSO proxy)"
+                 : !string.IsNullOrWhiteSpace(User.Identity?.AuthenticationType) ? $"Authentication Scheme: {User.Identity.AuthenticationType}"
+                 : "Unknown";
+
+        return Ok(new
+        {
+            environment = _env.EnvironmentName,
+            isAuthenticated = User.Identity?.IsAuthenticated ?? false,
+            authenticationType = User.Identity?.AuthenticationType,
+            name = User.Identity?.Name,  // pzid if PortalSso is primary
+            eid  = User.FindFirst(PortalClaimTypes.EID)?.Value,
+            headers = hdr,
+            items = itm,
+            policies = rawClaims.Where(c => c.Type == PortalClaimTypes.Policy).Select(c => c.Value).OrderBy(v => v),
+            sourceGuess = guess,
+            rawClaims
+        });
+    }
+}
+
+
+
+How to “fill the blanks” per project
+
+Return the right strings from your SP.
+dbo.usp_PortalPolicies_GetForUser(@UserEID, @UserName) must return one row per PolicyName.
+
+GEF example: Admin, Edit.TDM.All, Edit.Access.All, Edit.CustomerUpdate, …
+
+Maturity example: Admin, Edit.VCS.All, Edit.TPD.All, Edit.Network.All, Edit.VGS-T.All.
+
+Define those in PortalPolicies.cs.
+Add constants that match exactly (case-insensitive compare is okay, but be consistent).
+
+(Optional) Add composites in PortalCompositePolicies.cs and register them in ServiceCollectionExtensions using options.AddPolicy("X", p => p.RequireAssertion(...)).
+
+Annotate controllers.
+
+Full page write: [Authorize(Policy = PortalCompositePolicies.VcsWrite)] (Admin OR Edit.VCS.All).
+
+Admin only: [Authorize(Policy = PortalPolicies.Admin)].
+
+Field-limited (like GEF’s “CustomerUpdate”): keep your existing filter attribute, or enforce in SP with role flags.
+
+Frontend calls /api/auth/user-permissions once; if IsAuthenticated=true but IsPortalUser=false, show a banner: “You’re signed in but don’t have portal access. Contact your admin.”
