@@ -1,68 +1,461 @@
-CREATE OR ALTER PROC dbo.usp_PortalPolicies_GetForUser
-    @UserEID    NVARCHAR(64)  = NULL,
-    @UserName   NVARCHAR(256) = NULL
-AS
-BEGIN
-    SET NOCOUNT ON;
+namespace Gef.Portal.Authorization;
 
-    IF @UserEID IS NULL AND @UserName IS NULL
-        THROW 50071, 'Either @UserEID or @UserName is required.', 1;
+/// Leaf policies your SP returns for Maturity Portal
+public static class PortalPolicies
+{
+    public const string Admin             = "Admin";
+    public const string Edit_VCS_All      = "Edit.VCS.All";
+    public const string Edit_TPD_All      = "Edit.TPD.All";
+    public const string Edit_Network_All  = "Edit.Network.All";
+    public const string Edit_VGST_All     = "Edit.VGS-T.All";
+}
 
-    ;WITH m AS (
-        SELECT *
-        FROM dbo.AdGroupFeed
-        WHERE
-            (@UserEID IS NOT NULL AND UserEID = @UserEID)
-            OR (
-                @UserEID IS NULL AND @UserName IS NOT NULL
-                AND UPPER(LTRIM(RTRIM(UserName))) = UPPER(LTRIM(RTRIM(@UserName)))
-            )
-    ),
-    admin_flag AS (
-        SELECT CASE WHEN EXISTS (
-                   SELECT 1 FROM m
-                   WHERE UPPER(GroupName) = 'CYBER_PORTAL_ADMINS'
-               ) THEN 1 ELSE 0 END AS IsAdmin
-    ),
-    org_memberships AS (
-        SELECT DISTINCT om.OrgId, om.OrgCode
-        FROM m
-        JOIN dbo.Portal_OrgMap om
-          ON om.GroupNameLike IS NOT NULL
-         AND UPPER(m.GroupName) LIKE UPPER(om.GroupNameLike)
-    ),
-    any_membership AS (
-        SELECT CASE WHEN EXISTS (SELECT 1 FROM org_memberships) THEN 1 ELSE 0 END AS HasAny
-    )
-    SELECT PolicyName
-    FROM (
-        -- Baseline: PortalUser if in any mapped org or an admin
-        SELECT 'PortalUser' AS PolicyName, 1 AS keep
-        FROM any_membership a
-        CROSS JOIN admin_flag f
-        WHERE a.HasAny = 1 OR f.IsAdmin = 1
 
-        UNION ALL
-        -- Admin
-        SELECT 'Admin', 1
-        FROM admin_flag
-        WHERE IsAdmin = 1
+using Microsoft.AspNetCore.Authorization;
+using System.Security.Claims;
 
-        UNION ALL
-        -- Admins get all org Edit policies
-        SELECT 'Edit.' + om.OrgCode + '.All', 1
-        FROM admin_flag f
-        JOIN dbo.Portal_OrgMap om
-          ON f.IsAdmin = 1
+namespace Gef.Portal.Authorization;
 
-        UNION ALL
-        -- Members get their own org Edit policies
-        SELECT 'Edit.' + om.OrgCode + '.All', 1
-        FROM org_memberships om
-    ) x
-    WHERE keep = 1
-    GROUP BY PolicyName
-    ORDER BY PolicyName;
-END
-GO
+/// Route-level “can this user post anything in Maturity?”
+/// Org-specific check is done by the OrgScopedAuthorize filter below.
+public static class PortalCompositePolicies
+{
+    public const string MaturityWrite = "MaturityWrite";
+
+    public static void Register(AuthorizationOptions options)
+    {
+        options.AddPolicy(MaturityWrite, p => p.RequireAssertion(ctx =>
+            Has(ctx.User, PortalPolicies.Admin) ||
+            Has(ctx.User, PortalPolicies.Edit_VCS_All) ||
+            Has(ctx.User, PortalPolicies.Edit_TPD_All) ||
+            Has(ctx.User, PortalPolicies.Edit_Network_All) ||
+            Has(ctx.User, PortalPolicies.Edit_VGST_All)
+        ));
+    }
+
+    private static bool Has(ClaimsPrincipal u, string policy)
+        => u.HasClaim(PortalClaimTypes.Policy, policy);
+}
+
+
+
+using System.Security.Claims;
+
+namespace Gef.Portal.Authorization;
+
+public static class PortalClaimTypes
+{
+    public const string Policy   = "portal:policy";
+    public const string EID      = "portal:eid";
+    public const string UserName = ClaimTypes.Name;       // pzid → Name
+    public const string GivenName= ClaimTypes.GivenName;
+    public const string Surname  = ClaimTypes.Surname;
+    public const string Email    = ClaimTypes.Email;
+}
+
+
+
+namespace Gef.Portal.Services;
+
+public interface IPortalPolicyService
+{
+    Task<IReadOnlyList<string>> GetPoliciesAsync(string? userName, string? eid, CancellationToken ct = default);
+}
+
+
+using System.Data;
+using Dapper;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Gef.Portal.Configurations;
+
+namespace Gef.Portal.Services;
+
+/// SP-only policy resolver with short in-memory caching
+public sealed class PortalPolicyService(
+    GEF_DbContext db,
+    IMemoryCache cache,
+    TimeProvider clock,
+    IOptions<PolicyCacheOptions> cacheOptions,
+    ILogger<PortalPolicyService> logger
+) : IPortalPolicyService
+{
+    private readonly GEF_DbContext _db = db;
+    private readonly IMemoryCache _cache = cache;
+    private readonly TimeProvider _clock = clock;
+    private readonly PolicyCacheOptions _opts = cacheOptions.Value;
+    private readonly ILogger<PortalPolicyService> _log = logger;
+
+    public async Task<IReadOnlyList<string>> GetPoliciesAsync(string? userName, string? eid, CancellationToken ct = default)
+    {
+        // 👇 Username (pzid) primary, EID fallback
+        var idKey    = userName ?? eid ?? "anon";
+        var cacheKey = $"pol::{idKey}";
+        if (_cache.TryGetValue(cacheKey, out IReadOnlyList<string>? cached) && cached is not null)
+            return cached;
+
+        try
+        {
+            await using var conn = _db.Database.GetDbConnection();
+            if (conn.State != ConnectionState.Open) await conn.OpenAsync(ct);
+
+            var p = new DynamicParameters();
+            p.Add("@UserEID",  eid,      DbType.String);
+            p.Add("@UserName", userName, DbType.String);
+
+            var list = (await conn.QueryAsync<string>(
+                "dbo.usp_PortalPolicies_GetForUser",
+                p, commandType: CommandType.StoredProcedure))
+                .ToList().AsReadOnly();
+
+            _cache.Set(cacheKey, list, new MemoryCacheEntryOptions {
+                AbsoluteExpiration = _clock.GetUtcNow().AddMinutes(_opts.Minutes)
+            });
+            return list;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Policy SP failed for {UserKey}", idKey);
+            return Array.Empty<string>(); // fails closed for writes
+        }
+    }
+}
+
+
+
+
+namespace Gef.Portal.Services;
+
+public interface IOrgPolicyResolver
+{
+    /// Returns the exact policy name required for a given OrgId (e.g., "Edit.VCS.All")
+    Task<string?> GetPolicyForOrgAsync(int orgId, CancellationToken ct = default);
+}
+
+
+
+
+using System.Data;
+using Dapper;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
+
+namespace Gef.Portal.Services;
+
+public sealed class DbOrgPolicyResolver(
+    GEF_DbContext db,
+    IMemoryCache cache,
+    TimeProvider clock
+) : IOrgPolicyResolver
+{
+    private readonly GEF_DbContext _db = db;
+    private readonly IMemoryCache _cache = cache;
+    private readonly TimeProvider _clock = clock;
+
+    public async Task<string?> GetPolicyForOrgAsync(int orgId, CancellationToken ct = default)
+    {
+        var map = await _cache.GetOrCreateAsync("orgPolicyMap", async e =>
+        {
+            e.AbsoluteExpiration = _clock.GetUtcNow().AddMinutes(5);
+            await using var conn = _db.Database.GetDbConnection();
+            if (conn.State != ConnectionState.Open) await conn.OpenAsync(ct);
+
+            var rows = await conn.QueryAsync<(int OrgId, string OrgCode)>(
+                "SELECT OrgId, OrgCode FROM dbo.Portal_OrgMap");
+            return rows.ToDictionary(
+                k => k.OrgId,
+                v => $"Edit.{v.OrgCode}.All");
+        });
+
+        return map!.TryGetValue(orgId, out var policy) ? policy : null;
+    }
+}
+
+
+
+
+using System.Reflection;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Filters;
+using Gef.Portal.Authorization;
+using Gef.Portal.Services;
+using Microsoft.Extensions.Logging;
+
+namespace Gef.Portal.Filters;
+
+/// Enforces per-Org POST scoping based on DTO.OrgId
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class OrgScopedAuthorizeAttribute(string orgIdProperty)
+    : Attribute, IAsyncActionFilter
+{
+    private readonly string _orgProp = orgIdProperty;
+
+    public async Task OnActionExecutionAsync(ActionExecutingContext ctx, ActionExecutionDelegate next)
+    {
+        var user = ctx.HttpContext.User;
+
+        // Admins bypass org scoping
+        if (user.HasClaim(PortalClaimTypes.Policy, PortalPolicies.Admin))
+        {
+            await next(); return;
+        }
+
+        // Find DTO
+        var dto = ctx.ActionArguments.Values.FirstOrDefault(v => v is not null && !IsSimple(v.GetType()));
+        if (dto is null) { ctx.Result = new ForbidResult(); return; }
+
+        // Extract OrgId
+        var pi = dto.GetType().GetProperty(_orgProp, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+        var orgObj = pi?.GetValue(dto);
+        if (orgObj is null || !int.TryParse(orgObj.ToString(), out var orgId))
+        { ctx.Result = new ForbidResult(); return; }
+
+        // Resolve required policy
+        var resolver = ctx.HttpContext.RequestServices.GetRequiredService<IOrgPolicyResolver>();
+        var required = await resolver.GetPolicyForOrgAsync(orgId, ctx.HttpContext.RequestAborted);
+        if (string.IsNullOrWhiteSpace(required))
+        { ctx.Result = new ForbidResult(); return; }
+
+        if (user.HasClaim(PortalClaimTypes.Policy, required))
+        { await next(); return; }
+
+        // (optional) log minimal denial
+        var log = ctx.HttpContext.RequestServices.GetRequiredService<ILogger<OrgScopedAuthorizeAttribute>>();
+        var eid = user.FindFirst(PortalClaimTypes.EID)?.Value ?? user.Identity?.Name ?? "unknown";
+        log.LogInformation("FORBID org-scope: eid={EID} route={Route} orgId={OrgId} required={Policy}",
+            eid, ctx.HttpContext.Request.Path, orgId, required);
+
+        ctx.Result = new ForbidResult();
+    }
+
+    private static bool IsSimple(Type t)
+        => t.IsPrimitive || t.IsEnum || t == typeof(string) || t == typeof(DateTime)
+           || t == typeof(Guid) || Nullable.GetUnderlyingType(t) is not null;
+}
+
+
+
+
+using System.Reflection;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Filters;
+using Gef.Portal.Authorization;
+using Gef.Portal.Services;
+using Microsoft.Extensions.Logging;
+
+namespace Gef.Portal.Filters;
+
+/// Enforces per-Org POST scoping based on DTO.OrgId
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class OrgScopedAuthorizeAttribute(string orgIdProperty)
+    : Attribute, IAsyncActionFilter
+{
+    private readonly string _orgProp = orgIdProperty;
+
+    public async Task OnActionExecutionAsync(ActionExecutingContext ctx, ActionExecutionDelegate next)
+    {
+        var user = ctx.HttpContext.User;
+
+        // Admins bypass org scoping
+        if (user.HasClaim(PortalClaimTypes.Policy, PortalPolicies.Admin))
+        {
+            await next(); return;
+        }
+
+        // Find DTO
+        var dto = ctx.ActionArguments.Values.FirstOrDefault(v => v is not null && !IsSimple(v.GetType()));
+        if (dto is null) { ctx.Result = new ForbidResult(); return; }
+
+        // Extract OrgId
+        var pi = dto.GetType().GetProperty(_orgProp, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+        var orgObj = pi?.GetValue(dto);
+        if (orgObj is null || !int.TryParse(orgObj.ToString(), out var orgId))
+        { ctx.Result = new ForbidResult(); return; }
+
+        // Resolve required policy
+        var resolver = ctx.HttpContext.RequestServices.GetRequiredService<IOrgPolicyResolver>();
+        var required = await resolver.GetPolicyForOrgAsync(orgId, ctx.HttpContext.RequestAborted);
+        if (string.IsNullOrWhiteSpace(required))
+        { ctx.Result = new ForbidResult(); return; }
+
+        if (user.HasClaim(PortalClaimTypes.Policy, required))
+        { await next(); return; }
+
+        // (optional) log minimal denial
+        var log = ctx.HttpContext.RequestServices.GetRequiredService<ILogger<OrgScopedAuthorizeAttribute>>();
+        var eid = user.FindFirst(PortalClaimTypes.EID)?.Value ?? user.Identity?.Name ?? "unknown";
+        log.LogInformation("FORBID org-scope: eid={EID} route={Route} orgId={OrgId} required={Policy}",
+            eid, ctx.HttpContext.Request.Path, orgId, required);
+
+        ctx.Result = new ForbidResult();
+    }
+
+    private static bool IsSimple(Type t)
+        => t.IsPrimitive || t.IsEnum || t == typeof(string) || t == typeof(DateTime)
+           || t == typeof(Guid) || Nullable.GetUnderlyingType(t) is not null;
+}
+
+
+
+
+using System.Security.Claims;
+using Microsoft.Extensions.Options;
+using Gef.Portal.Authorization;
+using Gef.Portal.Configurations;
+using Gef.Portal.Services;
+
+namespace Gef.Portal.Middlewares;
+
+public sealed class SsoIdentityMiddleware(
+    RequestDelegate next,
+    IOptions<HeaderIdentityOptions> opt,
+    IWebHostEnvironment env,
+    IPortalPolicyService policyService // resolve per request via DI container
+)
+{
+    private readonly RequestDelegate _next = next;
+    private readonly HeaderIdentityOptions _h = opt.Value;
+    private readonly IWebHostEnvironment _env = env;
+    private readonly IPortalPolicyService _pol = policyService;
+
+    public async Task InvokeAsync(HttpContext ctx)
+    {
+        var principal = ctx.User ?? new ClaimsPrincipal();
+        var id = principal.Identities.FirstOrDefault();
+
+        // Dev-only: headers fallback (no Items)
+        if (_env.IsDevelopment() && _h.AllowHeaderFallbackInDevelopment)
+        {
+            var userName = ctx.Request.Headers[_h.HeaderUserName].FirstOrDefault();
+            var eid      = ctx.Request.Headers[_h.HeaderEid].FirstOrDefault();
+            var email    = ctx.Request.Headers[_h.HeaderEmail].FirstOrDefault();
+            var first    = ctx.Request.Headers[_h.HeaderFirst].FirstOrDefault();
+            var last     = ctx.Request.Headers[_h.HeaderLast].FirstOrDefault();
+
+            if (!string.IsNullOrWhiteSpace(userName) || !string.IsNullOrWhiteSpace(eid))
+            {
+                id ??= new ClaimsIdentity(authenticationType: "DevHeader");
+                if (!string.IsNullOrWhiteSpace(userName)) id.AddClaim(new Claim(PortalClaimTypes.UserName, userName));
+                if (!string.IsNullOrWhiteSpace(eid))      id.AddClaim(new Claim(PortalClaimTypes.EID, eid));
+                if (!string.IsNullOrWhiteSpace(email))    id.AddClaim(new Claim(PortalClaimTypes.Email, email));
+                if (!string.IsNullOrWhiteSpace(first))    id.AddClaim(new Claim(PortalClaimTypes.GivenName, first));
+                if (!string.IsNullOrWhiteSpace(last))     id.AddClaim(new Claim(PortalClaimTypes.Surname, last));
+                if (!principal.Identities.Contains(id)) principal.AddIdentity(id);
+            }
+        }
+
+        var userNameClaim = principal.Identity?.Name; // pzid primary
+        var eidClaim      = principal.FindFirst(PortalClaimTypes.EID)?.Value;
+
+        if (!string.IsNullOrWhiteSpace(userNameClaim) || !string.IsNullOrWhiteSpace(eidClaim))
+        {
+            var policies = await _pol.GetPoliciesAsync(userNameClaim, eidClaim, ctx.RequestAborted);
+            if (policies.Count > 0)
+            {
+                id ??= new ClaimsIdentity(authenticationType: principal.Identity?.AuthenticationType ?? "PortalSso");
+                foreach (var p in policies)
+                    id.AddClaim(new Claim(PortalClaimTypes.Policy, p));
+                if (!principal.Identities.Contains(id)) principal.AddIdentity(id);
+            }
+            ctx.User = principal;
+        }
+
+        await _next(ctx);
+    }
+}
+
+
+
+
+
+namespace Gef.Portal.Configurations;
+
+public sealed class HeaderIdentityOptions
+{
+    public string HeaderUserName { get; init; } = "pzid";
+    public string HeaderEid      { get; init; } = "eid";
+    public string HeaderEmail    { get; init; } = "email";
+    public string HeaderFirst    { get; init; } = "firstName";
+    public string HeaderLast     { get; init; } = "lastName";
+
+    public bool AllowHeaderFallbackInDevelopment { get; init; } = true;
+}
+
+
+
+
+namespace Gef.Portal.Configurations;
+
+public sealed class PolicyCacheOptions
+{
+    public int Minutes { get; init; } = 5;
+}
+
+
+
+using System.Security.Claims;
+using Gef.Portal.Authorization;
+
+namespace Gef.Portal.Extensions;
+
+public static class ClaimsPrincipalExtensions
+{
+    public static string GetDisplayName(this ClaimsPrincipal u)
+    {
+        var first = u.FindFirst(PortalClaimTypes.GivenName)?.Value;
+        var last  = u.FindFirst(PortalClaimTypes.Surname)?.Value;
+        var name  = string.Join(' ', new[] { first, last }.Where(s => !string.IsNullOrWhiteSpace(s))).Trim();
+        if (string.IsNullOrWhiteSpace(name)) name = u.Identity?.Name ?? u.FindFirst(PortalClaimTypes.EID)?.Value ?? "unknown";
+        name = new string(name.Where(ch => !char.IsControl(ch)).ToArray());
+        return name.Length > 256 ? name[..256] : name;
+    }
+}
+
+
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Options;
+using Gef.Portal.Authorization;
+using Gef.Portal.Configurations;
+using Gef.Portal.Services;
+
+namespace Gef.Portal.Extensions;
+
+public static class ServiceCollectionExtensions
+{
+    public static IServiceCollection AddPortalPolicyServices(this IServiceCollection services, IConfiguration config)
+    {
+        services.Configure<HeaderIdentityOptions>(config.GetSection("Auth:Headers"));
+        services.Configure<PolicyCacheOptions>(config.GetSection("Auth:PolicyCache"));
+
+        services.AddMemoryCache();
+        services.AddSingleton<TimeProvider>(TimeProvider.System);
+
+        services.AddScoped<IPortalPolicyService, PortalPolicyService>();
+        services.AddScoped<IOrgPolicyResolver, DbOrgPolicyResolver>(); // DB-backed
+
+        services.AddAuthorization(options =>
+        {
+            options.FallbackPolicy = new AuthorizationPolicyBuilder()
+                .RequireAuthenticatedUser()
+                .Build();
+
+            PortalCompositePolicies.Register(options);
+        });
+
+        services.AddSingleton<IAuthorizationPolicyProvider>(sp =>
+        {
+            var opts = sp.GetRequiredService<IOptions<AuthorizationOptions>>();
+            var fallback = new DefaultAuthorizationPolicyProvider(opts);
+            return new DynamicPolicyProvider(fallback);
+        });
+
+        return services;
+    }
+}
+
+
+
+
 
