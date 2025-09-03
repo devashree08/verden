@@ -1,115 +1,26 @@
 #nullable enable
 using System.Security.Claims;
-using Microsoft.Extensions.Options;
-using Maturity.Portal.Authorization;
-using Maturity.Portal.Configurations;
-using Maturity.Portal.Services;
+using YourApp.Authorization;
 
-namespace Maturity.Portal.Middlewares;
+namespace YourApp.Extensions;
 
-/// <summary>
-/// Builds the authenticated principal from SSO context:
-///  - Prefer SSO headers (pzid/eid/email/first/last), then HttpContext.Items, then existing claims
-///  - Calls dbo.usp_PortalPolicies_GetForUser to fetch policy names
-///  - Stamps a *primary* "PortalSso" identity with:
-///       * Name (pzid), EID, Email, GivenName, Surname
-///       * One claim per policy: portal:policy = <PolicyName>
-///  - Keeps any pre-existing identities (e.g., Negotiate) as secondary
-/// </summary>
-public sealed class SsoIdentityMiddleware(
-    RequestDelegate next,
-    IOptions<HeaderIdentityOptions> opt
-)
+public static class ClaimsPrincipalExtensions
 {
-    private readonly RequestDelegate _next = next;
-    private readonly HeaderIdentityOptions _h = opt.Value;
+    // pzid (stamped as Name by SSO middleware)
+    public static string? GetUserName(this ClaimsPrincipal u)
+        => u.Identity?.Name;
 
-    public async Task InvokeAsync(HttpContext ctx)
+    public static string? GetFirstName(this ClaimsPrincipal u)
+        => u.FindFirst(PortalClaimTypes.GivenName)?.Value;
+
+    public static string? GetLastName(this ClaimsPrincipal u)
+        => u.FindFirst(PortalClaimTypes.Surname)?.Value;
+
+    // No fallbacks: just "First Last" if present, otherwise empty string
+    public static string GetDisplayNameStrict(this ClaimsPrincipal u)
     {
-        // Helpers
-        static string? FirstNonEmpty(params string?[] vals)
-            => vals.FirstOrDefault(s => !string.IsNullOrWhiteSpace(s))?.Trim();
-
-        string? TryHeader(string key) =>
-            string.IsNullOrWhiteSpace(key) ? null : ctx.Request.Headers[key].FirstOrDefault()?.Trim();
-
-        string? TryItem(string key) =>
-            string.IsNullOrWhiteSpace(key) ? null
-            : (ctx.Items.TryGetValue(key, out var v) ? v?.ToString()?.Trim() : null);
-
-        // 1) Prefer SSO headers, then Items, then existing claims
-        var hdrUser = TryHeader(_h.HeaderUserName);
-        var hdrEid  = TryHeader(_h.HeaderEid);
-        var hdrMail = TryHeader(_h.HeaderEmail);
-        var hdrFn   = TryHeader(_h.HeaderFirstName);
-        var hdrLn   = TryHeader(_h.HeaderLastName);
-
-        var itmUser = TryItem(_h.ItemUserNameKey);
-        var itmEid  = TryItem(_h.ItemEidKey);
-        var itmMail = TryItem(_h.ItemEmailKey);
-        var itmFn   = TryItem(_h.ItemFirstNameKey);
-        var itmLn   = TryItem(_h.ItemLastNameKey);
-
-        var clmUser = ctx.User?.Identity?.Name ?? ctx.User?.FindFirst(ClaimTypes.Name)?.Value;
-        var clmEid  = ctx.User?.FindFirst(PortalClaimTypes.EID)?.Value;
-        var clmMail = ctx.User?.FindFirst(PortalClaimTypes.Email)?.Value;
-        var clmFn   = ctx.User?.FindFirst(PortalClaimTypes.GivenName)?.Value;
-        var clmLn   = ctx.User?.FindFirst(PortalClaimTypes.Surname)?.Value;
-
-        var userName = FirstNonEmpty(hdrUser, itmUser, clmUser); // pzid
-        var eid      = FirstNonEmpty(hdrEid,  itmEid,  clmEid);
-        var email    = FirstNonEmpty(hdrMail, itmMail, clmMail);
-        var first    = FirstNonEmpty(hdrFn,   itmFn,   clmFn);
-        var last     = FirstNonEmpty(hdrLn,   itmLn,   clmLn);
-
-        // If we still have neither, skip stamping (anonymous)
-        if (string.IsNullOrWhiteSpace(userName) && string.IsNullOrWhiteSpace(eid))
-        {
-            await _next(ctx);
-            return;
-        }
-
-        // 2) Resolve policies via SP (username primary; eid fallback)
-        var polSvc = ctx.RequestServices.GetRequiredService<IPortalPolicyService>();
-        var policies = await polSvc.GetPoliciesAsync(userName, eid, ctx.RequestAborted);
-
-        // 3) Build a dedicated *primary* PortalSso identity
-        //    Setting nameType => ClaimTypes.Name ensures Identity.Name == pzid
-        var portalIdentity = new ClaimsIdentity(
-            authenticationType: "PortalSso",
-            nameType: ClaimTypes.Name,
-            roleType: ClaimTypes.Role);
-
-        void Add(string type, string? value)
-        {
-            if (!string.IsNullOrWhiteSpace(value))
-                portalIdentity.AddClaim(new Claim(type, value));
-        }
-
-        // Echo identity claims (Name = pzid)
-        Add(PortalClaimTypes.UserName,  userName); // ClaimTypes.Name
-        Add(PortalClaimTypes.EID,       eid);
-        Add(PortalClaimTypes.Email,     email);
-        Add(PortalClaimTypes.GivenName, first);
-        Add(PortalClaimTypes.Surname,   last);
-
-        // Policy claims
-        foreach (var p in policies)
-        {
-            if (!string.IsNullOrWhiteSpace(p))
-                portalIdentity.AddClaim(new Claim(PortalClaimTypes.Policy, p));
-        }
-
-        // 4) Make our identity FIRST; keep existing identities (e.g., Negotiate) after it
-        var identities = new List<ClaimsIdentity>(1 + (ctx.User?.Identities.Count() ?? 0))
-        {
-            portalIdentity
-        };
-        if (ctx.User is { } existing && existing.Identities.Any())
-            identities.AddRange(existing.Identities);
-
-        ctx.User = new ClaimsPrincipal(identities);
-
-        await _next(ctx);
+        var first = u.GetFirstName();
+        var last  = u.GetLastName();
+        return string.Join(' ', new[] { first, last }.Where(s => !string.IsNullOrWhiteSpace(s)));
     }
 }
