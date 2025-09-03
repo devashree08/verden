@@ -1,68 +1,63 @@
 #nullable enable
-using System.Security.Claims;
+using System.Data;
+using System.Data.Common;
+using Dapper;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Maturity.Portal.Authorization;
 using Maturity.Portal.Configurations;
-using Maturity.Portal.Services;
+using Maturity.Portal.Data;
 
-namespace Maturity.Portal.Middlewares;
+namespace Maturity.Portal.Services;
 
-/// Builds principal from SSO (Negotiate) and dev headers; stamps portal:policy claims via SP.
-/// Username (pzid) primary; EID fallback.
-public sealed class SsoIdentityMiddleware(
-    RequestDelegate next,
-    IOptions<HeaderIdentityOptions> opt,
-    IWebHostEnvironment env,
-    IPortalPolicyService policyService
-)
+/// Calls dbo.usp_PortalPolicies_GetForUser (username/pzid primary, EID fallback) and caches briefly.
+public sealed class PortalPolicyService(
+    IDbConnectionFactory dbFactory,
+    IMemoryCache cache,
+    TimeProvider clock,
+    IOptions<PolicyCacheOptions> cacheOptions,
+    ILogger<PortalPolicyService> logger
+) : IPortalPolicyService
 {
-    private readonly RequestDelegate _next = next;
-    private readonly HeaderIdentityOptions _h = opt.Value;
-    private readonly IWebHostEnvironment _env = env;
-    private readonly IPortalPolicyService _pol = policyService;
+    private readonly IDbConnectionFactory _dbFactory = dbFactory;
+    private readonly IMemoryCache _cache = cache;
+    private readonly TimeProvider _clock = clock;
+    private readonly PolicyCacheOptions _opts = cacheOptions.Value;
+    private readonly ILogger<PortalPolicyService> _log = logger;
 
-    public async Task InvokeAsync(HttpContext ctx)
+    public async Task<IReadOnlyList<string>> GetPoliciesAsync(string? userName, string? eid, CancellationToken ct = default)
     {
-        var principal = ctx.User ?? new ClaimsPrincipal();
-        ClaimsIdentity? identity = principal.Identities.FirstOrDefault();
+        var idKey = userName ?? eid ?? "anon";
+        var cacheKey = $"pol::{idKey}";
+        if (_cache.TryGetValue(cacheKey, out IReadOnlyList<string>? cached) && cached is not null)
+            return cached;
 
-        // Dev-only header fallback
-        if (_env.IsDevelopment() && _h.AllowHeaderFallbackInDevelopment)
+        try
         {
-            var userName = ctx.Request.Headers[_h.HeaderUserName].FirstOrDefault();
-            var eid      = ctx.Request.Headers[_h.HeaderEid].FirstOrDefault();
-            var email    = ctx.Request.Headers[_h.HeaderEmail].FirstOrDefault();
-            var first    = ctx.Request.Headers[_h.HeaderFirst].FirstOrDefault();
-            var last     = ctx.Request.Headers[_h.HeaderLast].FirstOrDefault();
+            await using DbConnection conn = await _dbFactory.OpenAsync(ct);
 
-            if (!string.IsNullOrWhiteSpace(userName) || !string.IsNullOrWhiteSpace(eid))
+            var p = new DynamicParameters();
+            p.Add("@UserEID",  eid,      DbType.String);
+            p.Add("@UserName", userName, DbType.String);
+
+            var list = (await conn.QueryAsync<string>(
+                "dbo.usp_PortalPolicies_GetForUser",
+                p, commandType: CommandType.StoredProcedure))
+                .ToList()
+                .AsReadOnly();
+
+            _cache.Set(cacheKey, list, new MemoryCacheEntryOptions
             {
-                identity ??= new ClaimsIdentity(authenticationType: "DevHeader");
-                if (!string.IsNullOrWhiteSpace(userName)) identity.AddClaim(new Claim(PortalClaimTypes.UserName, userName));
-                if (!string.IsNullOrWhiteSpace(eid))      identity.AddClaim(new Claim(PortalClaimTypes.EID, eid));
-                if (!string.IsNullOrWhiteSpace(email))    identity.AddClaim(new Claim(PortalClaimTypes.Email, email));
-                if (!string.IsNullOrWhiteSpace(first))    identity.AddClaim(new Claim(PortalClaimTypes.GivenName, first));
-                if (!string.IsNullOrWhiteSpace(last))     identity.AddClaim(new Claim(PortalClaimTypes.Surname, last));
-                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
-            }
+                AbsoluteExpiration = _clock.GetUtcNow().AddMinutes(_opts.Minutes)
+            });
+
+            return list;
         }
-
-        var userNameClaim = principal.Identity?.Name; // pzid
-        var eidClaim      = principal.FindFirst(PortalClaimTypes.EID)?.Value;
-
-        if (!string.IsNullOrWhiteSpace(userNameClaim) || !string.IsNullOrWhiteSpace(eidClaim))
+        catch (Exception ex)
         {
-            var policies = await _pol.GetPoliciesAsync(userNameClaim, eidClaim, ctx.RequestAborted);
-            if (policies.Count > 0)
-            {
-                identity ??= new ClaimsIdentity(authenticationType: principal.Identity?.AuthenticationType ?? "PortalSso");
-                foreach (var p in policies)
-                    identity.AddClaim(new Claim(PortalClaimTypes.Policy, p));
-                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
-            }
-            ctx.User = principal;
+            _log.LogError(ex, "Policy SP failed for {UserKey}", idKey);
+            // Fail closed for writes: empty policies => no edit allowed
+            return Array.Empty<string>();
         }
-
-        await _next(ctx);
     }
 }
