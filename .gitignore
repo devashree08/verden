@@ -1,129 +1,128 @@
-using System.Security.Claims;
+using System.Reflection;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Filters;
+using Microsoft.Extensions.Logging;
 using Maturity.Portal.Authorization;
+using Maturity.Portal.Services;
 
-namespace Maturity.Portal.Extensions;
+namespace Maturity.Portal.Filters;
 
-public static class ClaimsPrincipalExtensions
+/// Enforces per-Org write scope by reading DTO.<OrgId> and requiring the specific policy.
+/// Admins bypass scope.
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class OrgScopedAuthorizeAttribute(string orgIdProperty)
+    : Attribute, IAsyncActionFilter
 {
-    public static string GetDisplayName(this ClaimsPrincipal u)
+    private readonly string _orgProp = orgIdProperty;
+
+    public async Task OnActionExecutionAsync(ActionExecutingContext ctx, ActionExecutionDelegate next)
     {
-        var first = u.FindFirst(PortalClaimTypes.GivenName)?.Value;
-        var last  = u.FindFirst(PortalClaimTypes.Surname)?.Value;
-        var name  = string.Join(' ', new[] { first, last }.Where(s => !string.IsNullOrWhiteSpace(s))).Trim();
-        if (string.IsNullOrWhiteSpace(name))
-            name = u.Identity?.Name ?? u.FindFirst(PortalClaimTypes.EID)?.Value ?? "unknown";
-        name = new string(name.Where(ch => !char.IsControl(ch)).ToArray());
-        return name.Length > 256 ? name[..256] : name;
+        var user = ctx.HttpContext.User;
+
+        if (user.HasClaim(PortalClaimTypes.Policy, PortalPolicies.Admin))
+        {
+            await next(); return;
+        }
+
+        var dto = ctx.ActionArguments.Values.FirstOrDefault(v => v is not null && !IsSimple(v.GetType()));
+        if (dto is null) { ctx.Result = new ForbidResult(); return; }
+
+        var pi = dto.GetType().GetProperty(_orgProp, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
+        var orgObj = pi?.GetValue(dto);
+        if (orgObj is null || !int.TryParse(orgObj.ToString(), out var orgId))
+        { ctx.Result = new ForbidResult(); return; }
+
+        var resolver = ctx.HttpContext.RequestServices.GetRequiredService<IOrgPolicyResolver>();
+        var required = await resolver.GetPolicyForOrgAsync(orgId, ctx.HttpContext.RequestAborted);
+        if (string.IsNullOrWhiteSpace(required))
+        { ctx.Result = new ForbidResult(); return; }
+
+        if (user.HasClaim(PortalClaimTypes.Policy, required))
+        { await next(); return; }
+
+        var log = ctx.HttpContext.RequestServices.GetRequiredService<ILogger<OrgScopedAuthorizeAttribute>>();
+        var eid = user.FindFirst(PortalClaimTypes.EID)?.Value ?? user.Identity?.Name ?? "unknown";
+        log.LogInformation("FORBID org-scope: eid={eid} route={route} orgId={orgId} required={policy}",
+            eid, ctx.HttpContext.Request.Path, orgId, required);
+
+        ctx.Result = new ForbidResult();
     }
+
+    private static bool IsSimple(Type t)
+        => t.IsPrimitive || t.IsEnum || t == typeof(string) || t == typeof(DateTime)
+           || t == typeof(Guid) || Nullable.GetUnderlyingType(t) is not null;
 }
 
 
 
-using Microsoft.AspNetCore.Authorization;
+
+
+using System.Security.Claims;
 using Microsoft.Extensions.Options;
 using Maturity.Portal.Authorization;
 using Maturity.Portal.Configurations;
 using Maturity.Portal.Services;
 
-namespace Maturity.Portal.Extensions;
+namespace Maturity.Portal.Middlewares;
 
-public static class ServiceCollectionExtensions
+/// Builds an authenticated principal from the host auth (Negotiate) and/or dev headers,
+/// then stamps one portal:policy claim per policy returned by the SP.
+/// Username (pzid) is primary; EID fallback.
+public sealed class SsoIdentityMiddleware(
+    RequestDelegate next,
+    IOptions<HeaderIdentityOptions> opt,
+    IWebHostEnvironment env,
+    IPortalPolicyService policyService
+)
 {
-    public static IServiceCollection AddPortalPolicyServices(this IServiceCollection services, IConfiguration config)
+    private readonly RequestDelegate _next = next;
+    private readonly HeaderIdentityOptions _h = opt.Value;
+    private readonly IWebHostEnvironment _env = env;
+    private readonly IPortalPolicyService _pol = policyService;
+
+    public async Task InvokeAsync(HttpContext ctx)
     {
-        services.Configure<HeaderIdentityOptions>(config.GetSection("Auth:Headers"));
-        services.Configure<PolicyCacheOptions>(config.GetSection("Auth:PolicyCache"));
+        var principal = ctx.User ?? new ClaimsPrincipal();
+        var identity  = principal.Identities.FirstOrDefault();
 
-        services.AddMemoryCache();
-        services.AddSingleton(TimeProvider.System);
-
-        services.AddScoped<IPortalPolicyService, PortalPolicyService>();
-        services.AddScoped<IOrgPolicyResolver, DbOrgPolicyResolver>();
-
-        services.AddAuthorization(options =>
+        // Dev-only: header fallback (no Items usage)
+        if (_env.IsDevelopment() && _h.AllowHeaderFallbackInDevelopment)
         {
-            options.FallbackPolicy = new AuthorizationPolicyBuilder()
-                .RequireAuthenticatedUser()
-                .Build();
+            var userName = ctx.Request.Headers[_h.HeaderUserName].FirstOrDefault();
+            var eid      = ctx.Request.Headers[_h.HeaderEid].FirstOrDefault();
+            var email    = ctx.Request.Headers[_h.HeaderEmail].FirstOrDefault();
+            var first    = ctx.Request.Headers[_h.HeaderFirst].FirstOrDefault();
+            var last     = ctx.Request.Headers[_h.HeaderLast].FirstOrDefault();
 
-            PortalCompositePolicies.Register(options);
-        });
-
-        services.AddSingleton<IAuthorizationPolicyProvider>(sp =>
-        {
-            var opts = sp.GetRequiredService<IOptions<AuthorizationOptions>>();
-            var fallback = new DefaultAuthorizationPolicyProvider(opts);
-            return new DynamicPolicyProvider(fallback);
-        });
-
-        return services;
-    }
-}
-
-
-
-
-
-using Maturity.Portal.Middlewares;
-using Microsoft.AspNetCore.Builder;
-
-namespace Maturity.Portal.Extensions;
-
-public static class ApplicationBuilderExtensions
-{
-    public static IApplicationBuilder UsePortalSsoIdentity(this IApplicationBuilder app)
-        => app.UseMiddleware<SsoIdentityMiddleware>();
-
-    public static IApplicationBuilder UsePortalCorrelationLogging(this IApplicationBuilder app)
-        => app.UseMiddleware<CorrelationLoggingMiddleware>();
-}
-
-
-
-
-
-using Maturity.Portal.Configurations;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.HttpOverrides;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-
-namespace Maturity.Portal.Extensions;
-
-public static class SecureHeaderExtensions
-{
-    public static void AddSecureHeaders(this IServiceCollection services, IConfiguration config)
-    {
-        services.Configure<SecureHeaderOptions>(config.GetSection("Security:Headers"));
-    }
-
-    public static IApplicationBuilder UseSecureHeaders(this IApplicationBuilder app, IWebHostEnvironment env)
-    {
-        // Remove server header
-        app.ApplicationServices.GetRequiredService<IServiceCollection>();
-        // Kestrel's Server header can be disabled in Program via builder.WebHost.ConfigureKestrel(o => o.AddServerHeader = false);
-
-        app.Use(async (ctx, next) =>
-        {
-            var resp = ctx.Response.Headers;
-
-            // Minimal hardening set
-            if (!resp.ContainsKey("X-Content-Type-Options")) resp.Append("X-Content-Type-Options", "nosniff");
-            if (!resp.ContainsKey("X-Frame-Options"))        resp.Append("X-Frame-Options", "SAMEORIGIN");
-            if (!resp.ContainsKey("Referrer-Policy"))        resp.Append("Referrer-Policy", "no-referrer");
-            if (!resp.ContainsKey("X-Permitted-Cross-Domain-Policies")) resp.Append("X-Permitted-Cross-Domain-Policies", "none");
-            if (!resp.ContainsKey("Permissions-Policy"))     resp.Append("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
-
-            await next();
-        });
-
-        // HSTS should be enabled only on HTTPS and non-dev
-        if (!env.IsDevelopment())
-        {
-            app.UseHsts();
+            if (!string.IsNullOrWhiteSpace(userName) || !string.IsNullOrWhiteSpace(eid))
+            {
+                identity ??= new ClaimsIdentity(authenticationType: "DevHeader");
+                if (!string.IsNullOrWhiteSpace(userName)) identity.AddClaim(new Claim(PortalClaimTypes.UserName, userName));
+                if (!string.IsNullOrWhiteSpace(eid))      identity.AddClaim(new Claim(PortalClaimTypes.EID, eid));
+                if (!string.IsNullOrWhiteSpace(email))    identity.AddClaim(new Claim(PortalClaimTypes.Email, email));
+                if (!string.IsNullOrWhiteSpace(first))    identity.AddClaim(new Claim(PortalClaimTypes.GivenName, first));
+                if (!string.IsNullOrWhiteSpace(last))     identity.AddClaim(new Claim(PortalClaimTypes.Surname, last));
+                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
+            }
         }
 
-        return app;
+        var userNameClaim = principal.Identity?.Name; // pzid primary (Negotiate sets Name)
+        var eidClaim      = principal.FindFirst(PortalClaimTypes.EID)?.Value;
+
+        if (!string.IsNullOrWhiteSpace(userNameClaim) || !string.IsNullOrWhiteSpace(eidClaim))
+        {
+            var policies = await _pol.GetPoliciesAsync(userNameClaim, eidClaim, ctx.RequestAborted);
+            if (policies.Count > 0)
+            {
+                identity ??= new ClaimsIdentity(authenticationType: principal.Identity?.AuthenticationType ?? "PortalSso");
+                foreach (var p in policies)
+                    identity.AddClaim(new Claim(PortalClaimTypes.Policy, p));
+                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
+            }
+            ctx.User = principal;
+        }
+
+        await _next(ctx);
     }
 }
 
@@ -131,112 +130,179 @@ public static class SecureHeaderExtensions
 
 
 
-
-
-using System.IO;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Hosting;
-using Serilog;
-using Serilog.Events;
-using Serilog.Formatting.Json;
-using Serilog.Filters;
+using Serilog.Context;
 using Maturity.Portal.Authorization;
 
-namespace Maturity.Portal.Extensions;
+namespace Maturity.Portal.Middlewares;
 
-public static class SerilogExtensions
+/// Enriches logs with correlationId/eid/userName and echoes X-Correlation-ID header.
+public sealed class CorrelationLoggingMiddleware(RequestDelegate next)
 {
-    /// <summary>
-    /// Bootstraps Serilog from configuration, with sensible fallbacks:
-    /// - Reads "Serilog" section if present (preferred).
-    /// - Else reads "PortalLogging:Directory" + "PortalLogging:MinimumLevel".
-    /// - Writes pretty Console + JSON file logs.
-    /// - Enrich: Environment, Application, CorrelationId/EID/UserName via LogContext.
-    /// </summary>
-    public static void UsePortalSerilog(this WebApplicationBuilder builder)
+    private const string CorrelationHeader = "X-Correlation-ID";
+    private const int MaxLen = 100;
+    private readonly RequestDelegate _next = next;
+
+    public async Task InvokeAsync(HttpContext ctx)
     {
-        // Prefer full Serilog section if provided
-        var hasSerilogSection = builder.Configuration.GetSection("Serilog").Exists();
+        var inbound = ctx.Request.Headers[CorrelationHeader].FirstOrDefault()
+                   ?? ctx.Request.Headers["X-Request-ID"].FirstOrDefault();
+        var correlationId = Sanitize(inbound) ?? ctx.TraceIdentifier;
+        ctx.Response.Headers[CorrelationHeader] = correlationId;
 
-        // Fallbacks
-        var dir = builder.Configuration["PortalLogging:Directory"];
-        if (string.IsNullOrWhiteSpace(dir))
-            dir = Path.Combine(AppContext.BaseDirectory, "logs");
+        var eid  = ctx.User?.FindFirst(PortalClaimTypes.EID)?.Value ?? string.Empty;
+        var user = ctx.User?.Identity?.Name ?? string.Empty;
 
-        Directory.CreateDirectory(dir);
-
-        var minLevelStr = builder.Configuration["PortalLogging:MinimumLevel"] ?? "Information";
-        var minLevel = ParseLevel(minLevelStr, LogEventLevel.Information);
-
-        var appName = builder.Environment.ApplicationName ?? "Maturity.Portal";
-        var envName = builder.Environment.EnvironmentName;
-
-        var loggerCfg = new LoggerConfiguration()
-            .Enrich.FromLogContext()
-            .Enrich.WithProperty("application", appName)
-            .Enrich.WithProperty("environment", envName)
-            // If you want machine/IP add here, but avoid PII.
-            .MinimumLevel.Is(minLevel)
-            .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
-            .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
-            .MinimumLevel.Override("System", LogEventLevel.Warning);
-
-        // Console pretty output for local/deploy logs
-        loggerCfg = loggerCfg.WriteTo.Console(
-            outputTemplate:
-                "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj} " +
-                "(corr:{correlationId} eid:{eid} user:{userName}){NewLine}{Exception}");
-
-        // JSON rolling file logs
-        loggerCfg = loggerCfg.WriteTo.File(
-            formatter: new JsonFormatter(renderMessage: true),
-            path: Path.Combine(dir, "portal-log-.json"),
-            rollingInterval: RollingInterval.Day,
-            retainedFileCountLimit: 30,
-            restrictedToMinimumLevel: minLevel,
-            shared: true);
-
-        // Filter out noisy health endpoints (optional)
-        loggerCfg = loggerCfg.Filter.ByExcluding(Matching.WithProperty<string>("RequestPath", p =>
-            p != null && (p.StartsWith("/health", StringComparison.OrdinalIgnoreCase))));
-
-        if (hasSerilogSection)
+        using (LogContext.PushProperty("correlationId", correlationId, false))
+        using (LogContext.PushProperty("eid", eid, false))
+        using (LogContext.PushProperty("userName", user, false))
         {
-            // Allow overriding via Serilog config; our sinks above still apply unless overridden
-            loggerCfg = loggerCfg.ReadFrom.Configuration(builder.Configuration);
+            await _next(ctx);
         }
-
-        Log.Logger = loggerCfg.CreateLogger();
-        builder.Host.UseSerilog();
     }
 
-    /// <summary>
-    /// Adds Serilog request logging middleware with correlation enrichment.
-    /// Place AFTER UsePortalCorrelationLogging() so LogContext has corr/eid/userName.
-    /// </summary>
-    public static void UsePortalRequestLogging(this IApplicationBuilder app)
+    private static string? Sanitize(string? raw)
     {
-        app.UseSerilogRequestLogging(opts =>
-        {
-            opts.MessageTemplate = "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.0000} ms";
-            // Attach a couple of handy values to each request log
-            opts.EnrichDiagnosticContext = (diag, http) =>
-            {
-                var corr = http.Response.Headers["X-Correlation-ID"].ToString();
-                if (string.IsNullOrWhiteSpace(corr)) corr = http.TraceIdentifier;
-                diag.Set("correlationId", corr);
-
-                var eid = http.User?.FindFirst(PortalClaimTypes.EID)?.Value;
-                var user = http.User?.Identity?.Name;
-                if (!string.IsNullOrWhiteSpace(eid))  diag.Set("eid", eid);
-                if (!string.IsNullOrWhiteSpace(user)) diag.Set("userName", user);
-
-                diag.Set("RequestPath", http.Request.Path.Value ?? string.Empty);
-            };
-        });
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var t = raw.Trim();
+        if (t.Length > MaxLen) t = t[..MaxLen];
+        foreach (var ch in t) if (char.IsControl(ch)) return null;
+        return t;
     }
-
-    private static LogEventLevel ParseLevel(string s, LogEventLevel fallback)
-        => Enum.TryParse<LogEventLevel>(s, true, out var lvl) ? lvl : fallback;
 }
+
+
+
+
+
+namespace Maturity.Portal.Services;
+
+public interface IPortalPolicyService
+{
+    Task<IReadOnlyList<string>> GetPoliciesAsync(string? userName, string? eid, CancellationToken ct = default);
+}
+
+
+
+
+
+
+using System.Data;
+using System.Data.Common;
+using Dapper;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Maturity.Portal.Configurations;
+using Maturity.Portal.Data;
+
+namespace Maturity.Portal.Services;
+
+/// Calls dbo.usp_PortalPolicies_GetForUser (username/pzid primary, EID fallback) and caches briefly.
+public sealed class PortalPolicyService(
+    IDbConnectionFactory dbFactory,
+    IMemoryCache cache,
+    TimeProvider clock,
+    IOptions<PolicyCacheOptions> cacheOptions,
+    ILogger<PortalPolicyService> logger
+) : IPortalPolicyService
+{
+    private readonly IDbConnectionFactory _dbFactory = dbFactory;
+    private readonly IMemoryCache _cache = cache;
+    private readonly TimeProvider _clock = clock;
+    private readonly PolicyCacheOptions _opts = cacheOptions.Value;
+    private readonly ILogger<PortalPolicyService> _log = logger;
+
+    public async Task<IReadOnlyList<string>> GetPoliciesAsync(string? userName, string? eid, CancellationToken ct = default)
+    {
+        var idKey = userName ?? eid ?? "anon";
+        var cacheKey = $"pol::{idKey}";
+        if (_cache.TryGetValue(cacheKey, out IReadOnlyList<string>? cached) && cached is not null)
+            return cached;
+
+        try
+        {
+            await using DbConnection conn = await _dbFactory.OpenAsync(ct);
+            var p = new DynamicParameters();
+            p.Add("@UserEID",  eid,      DbType.String);
+            p.Add("@UserName", userName, DbType.String);
+
+            var list = (await conn.QueryAsync<string>(
+                "dbo.usp_PortalPolicies_GetForUser",
+                p, commandType: CommandType.StoredProcedure))
+                .ToList().AsReadOnly();
+
+            _cache.Set(cacheKey, list, new MemoryCacheEntryOptions {
+                AbsoluteExpiration = _clock.GetUtcNow().AddMinutes(_opts.Minutes)
+            });
+
+            return list;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Policy SP failed for {UserKey}", idKey);
+            return Array.Empty<string>(); // fail-closed for writes
+        }
+    }
+}
+
+
+
+
+
+
+namespace Maturity.Portal.Services;
+
+public interface IOrgPolicyResolver
+{
+    /// Returns the exact policy required for an OrgId (e.g., "Edit.VCS.All")
+    Task<string?> GetPolicyForOrgAsync(int orgId, CancellationToken ct = default);
+}
+
+
+
+
+
+
+
+using System.Data.Common;
+using Dapper;
+using Microsoft.Extensions.Caching.Memory;
+using Maturity.Portal.Data;
+
+namespace Maturity.Portal.Services;
+
+/// Reads OrgId → "Edit.<OrgCode>.All" from dbo.Portal_OrgMap (cached a few minutes).
+public sealed class DbOrgPolicyResolver(
+    IDbConnectionFactory dbFactory,
+    IMemoryCache cache,
+    TimeProvider clock
+) : IOrgPolicyResolver
+{
+    private readonly IDbConnectionFactory _dbFactory = dbFactory;
+    private readonly IMemoryCache _cache = cache;
+    private readonly TimeProvider _clock = clock;
+
+    public async Task<string?> GetPolicyForOrgAsync(int orgId, CancellationToken ct = default)
+    {
+        var map = await _cache.GetOrCreateAsync("orgPolicyMap", async e =>
+        {
+            e.AbsoluteExpiration = _clock.GetUtcNow().AddMinutes(5);
+            await using DbConnection conn = await _dbFactory.OpenAsync(ct);
+
+            var rows = await conn.QueryAsync<(int OrgId, string OrgCode)>(
+                "SELECT OrgId, OrgCode FROM dbo.Portal_OrgMap");
+
+            return rows.ToDictionary(k => k.OrgId, v => $"Edit.{v.OrgCode}.All");
+        });
+
+        return map!.TryGetValue(orgId, out var policy) ? policy : null;
+    }
+}
+
+
+
+
+
+
+
+
