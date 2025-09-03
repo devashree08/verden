@@ -1,45 +1,70 @@
 #nullable enable
-using Microsoft.AspNetCore.Builder;
-using Microsoft.Extensions.Hosting;
+using System.Security.Claims;
 using Microsoft.Extensions.Options;
+using Maturity.Portal.Authorization;
+using Maturity.Portal.Configurations;
+using Maturity.Portal.Services;
 
-namespace Maturity.Portal.Extensions;
+namespace Maturity.Portal.Middlewares;
 
-public static class SecureHeaderExtensions
+/// Builds principal from SSO + dev headers; stamps portal:policy claims via SP.
+/// Username (pzid) primary; EID fallback.
+public sealed class SsoIdentityMiddleware(
+    RequestDelegate next,
+    IOptions<HeaderIdentityOptions> opt,
+    IWebHostEnvironment env
+)
 {
-    /// <summary>
-    /// Adds a minimal set of security headers and (optionally) HSTS in non-dev.
-    /// Options are taken from DI (IOptions&lt;SecureHeaderOptions&gt;) unless an explicit
-    /// instance is passed in.
-    /// </summary>
-    public static IApplicationBuilder UseSecureHeaders(
-        this IApplicationBuilder app,
-        IWebHostEnvironment env,
-        SecureHeaderOptions? explicitOptions = null)
+    private readonly RequestDelegate _next = next;
+    private readonly HeaderIdentityOptions _h = opt.Value;
+    private readonly IWebHostEnvironment _env = env;
+
+    public async Task InvokeAsync(HttpContext ctx)
     {
-        // Prefer explicit options; else try DI; else defaults.
-        var resolved = explicitOptions
-            ?? app.ApplicationServices.GetService<IOptions<SecureHeaderOptions>>()?.Value
-            ?? new SecureHeaderOptions();
+        var principal = ctx.User ?? new ClaimsPrincipal();
+        ClaimsIdentity? identity = principal.Identities.FirstOrDefault();
 
-        app.Use(async (ctx, next) =>
+        // Dev-only header fallback
+        if (_env.IsDevelopment() && _h.AllowHeaderFallbackInDevelopment)
         {
-            var h = ctx.Response.Headers;
+            var userName = ctx.Request.Headers[_h.HeaderUserName].FirstOrDefault();
+            var eid      = ctx.Request.Headers[_h.HeaderEid].FirstOrDefault();
+            var email    = ctx.Request.Headers[_h.HeaderEmail].FirstOrDefault();
+            var first    = ctx.Request.Headers[_h.HeaderFirst].FirstOrDefault();
+            var last     = ctx.Request.Headers[_h.HeaderLast].FirstOrDefault();
 
-            if (!h.ContainsKey("X-Content-Type-Options"))             h.Append("X-Content-Type-Options", "nosniff");
-            if (!h.ContainsKey("X-Frame-Options"))                    h.Append("X-Frame-Options", "SAMEORIGIN");
-            if (!h.ContainsKey("Referrer-Policy"))                    h.Append("Referrer-Policy", "no-referrer");
-            if (!h.ContainsKey("X-Permitted-Cross-Domain-Policies"))  h.Append("X-Permitted-Cross-Domain-Policies", "none");
-            if (!h.ContainsKey("Permissions-Policy"))                 h.Append("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
-
-            await next();
-        });
-
-        if (!env.IsDevelopment() && resolved.EnableHsts)
-        {
-            app.UseHsts();
+            if (!string.IsNullOrWhiteSpace(userName) || !string.IsNullOrWhiteSpace(eid))
+            {
+                identity ??= new ClaimsIdentity(authenticationType: "DevHeader");
+                if (!string.IsNullOrWhiteSpace(userName)) identity.AddClaim(new Claim(PortalClaimTypes.UserName, userName));
+                if (!string.IsNullOrWhiteSpace(eid))      identity.AddClaim(new Claim(PortalClaimTypes.EID, eid));
+                if (!string.IsNullOrWhiteSpace(email))    identity.AddClaim(new Claim(PortalClaimTypes.Email, email));
+                if (!string.IsNullOrWhiteSpace(first))    identity.AddClaim(new Claim(PortalClaimTypes.GivenName, first));
+                if (!string.IsNullOrWhiteSpace(last))     identity.AddClaim(new Claim(PortalClaimTypes.Surname, last));
+                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
+            }
         }
 
-        return app;
+        // Pull identity values after Negotiate has run
+        var userNameClaim = principal.Identity?.Name; // pzid
+        var eidClaim      = principal.FindFirst(PortalClaimTypes.EID)?.Value;
+
+        if (!string.IsNullOrWhiteSpace(userNameClaim) || !string.IsNullOrWhiteSpace(eidClaim))
+        {
+            // ⬇️ Resolve the scoped service per request — SAFE
+            var policyService = ctx.RequestServices.GetRequiredService<IPortalPolicyService>();
+
+            var policies = await policyService.GetPoliciesAsync(userNameClaim, eidClaim, ctx.RequestAborted);
+            if (policies.Count > 0)
+            {
+                identity ??= new ClaimsIdentity(authenticationType: principal.Identity?.AuthenticationType ?? "PortalSso");
+                foreach (var p in policies)
+                    identity.AddClaim(new Claim(PortalClaimTypes.Policy, p));
+                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
+            }
+            ctx.User = principal;
+        }
+
+        await _next(ctx);
     }
 }
