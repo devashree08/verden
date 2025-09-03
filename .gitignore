@@ -1,15 +1,131 @@
-public sealed class UserPermissionsDto
+#nullable enable
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Maturity.Portal.Authorization;
+using Maturity.Portal.Extensions;
+using Maturity.Portal.Models;
+using System.Security.Claims;
+
+namespace Maturity.Portal.Controllers;
+
+[ApiController]
+[Route("api/auth")]
+public sealed class AuthController() : ControllerBase
 {
-    public bool   IsAuthenticated { get; init; }
-    public string? UserName       { get; init; }  // pzid
-    public string? EID            { get; init; }
-    public string  DisplayName    { get; init; } = string.Empty;
+    /// <summary>
+    /// Frontend capability snapshot for the signed-in user.
+    /// Uses claims stamped by SsoIdentityMiddleware (no DB calls here).
+    /// </summary>
+    [HttpGet("user-permissions")]
+    [Authorize] // fallback policy already requires authenticated user
+    public ActionResult<UserPermissionsDto> GetUserPermissions()
+    {
+        ClaimsPrincipal u = User;
 
-    public bool IsAdmin          { get; init; }
-    public bool CanEditVCS       { get; init; }
-    public bool CanEditTPD       { get; init; }
-    public bool CanEditNetwork   { get; init; }
-    public bool CanEditVGST      { get; init; }
+        var policies = u.FindAll(PortalClaimTypes.Policy)
+                        .Select(c => c.Value)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
 
-    public IReadOnlyList<string> Policies { get; init; } = Array.Empty<string>();
+        bool has(string p) => policies.Contains(p, StringComparer.OrdinalIgnoreCase);
+
+        var dto = new UserPermissionsDto
+        {
+            IsAuthenticated = u.Identity?.IsAuthenticated ?? false,
+            UserName        = u.Identity?.Name,
+            EID             = u.FindFirst(PortalClaimTypes.EID)?.Value,
+            DisplayName     = u.GetDisplayName(),
+
+            IsAdmin        = has(PortalPolicies.Admin),
+            CanEditVCS     = has(PortalPolicies.Admin) || has(PortalPolicies.Edit_VCS_All),
+            CanEditTPD     = has(PortalPolicies.Admin) || has(PortalPolicies.Edit_TPD_All),
+            CanEditNetwork = has(PortalPolicies.Admin) || has(PortalPolicies.Edit_Network_All),
+            CanEditVGST    = has(PortalPolicies.Admin) || has(PortalPolicies.Edit_VGST_All),
+
+            Policies = policies
+        };
+
+        return Ok(dto);
+    }
 }
+
+
+#nullable enable
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+using Maturity.Portal.Authorization;
+using Maturity.Portal.Configurations;
+using System.Security.Claims;
+
+namespace Maturity.Portal.Controllers;
+
+/// <summary>
+/// Admin-only: shows how identity/claims are coming through (headers vs auth scheme).
+/// Use only for diagnostics; keep behind Admin policy.
+/// </summary>
+[ApiController]
+[Route("api/admin")]
+public sealed class AdminDebugController(IOptions<HeaderIdentityOptions> headerOpts) : ControllerBase
+{
+    private readonly HeaderIdentityOptions _h = headerOpts.Value;
+
+    public sealed record DebugIdentityResult(
+        string AuthenticationScheme,
+        bool   IsAuthenticated,
+        string? UserName,
+        string? EID,
+        string? Email,
+        string? FirstName,
+        string? LastName,
+        IReadOnlyList<KeyValuePair<string,string>> Claims,
+        IReadOnlyDictionary<string,string?> Headers);
+
+    [HttpGet("debug-identity")]
+    [Authorize(Policy = PortalPolicies.Admin)]
+    public ActionResult<DebugIdentityResult> DebugIdentity()
+    {
+        var u = User;
+
+        // Collect selected headers (SSO agent typically injects these)
+        var wanted = new (string key, string name)[]
+        {
+            (_h.HeaderUserName, "userName"),
+            (_h.HeaderEid,      "eid"),
+            (_h.HeaderEmail,    "email"),
+            (_h.HeaderFirst,    "firstName"),
+            (_h.HeaderLast,     "lastName")
+        };
+
+        var headerMap = wanted.ToDictionary(
+            k => k.name,
+            k => (string?)Request.Headers[k.key].FirstOrDefault(),
+            StringComparer.OrdinalIgnoreCase);
+
+        // Claims dump (type/value) – useful to verify portal:policy stamps
+        var claims = u.Claims
+            .Select(c => new KeyValuePair<string,string>(c.Type, c.Value))
+            .ToList();
+
+        var result = new DebugIdentityResult(
+            AuthenticationScheme: u.Identity?.AuthenticationType ?? "(none)",
+            IsAuthenticated:      u.Identity?.IsAuthenticated ?? false,
+            UserName:             u.Identity?.Name,
+            EID:                  u.FindFirst(PortalClaimTypes.EID)?.Value,
+            Email:                u.FindFirst(PortalClaimTypes.Email)?.Value,
+            FirstName:            u.FindFirst(PortalClaimTypes.GivenName)?.Value,
+            LastName:             u.FindFirst(PortalClaimTypes.Surname)?.Value,
+            Claims:               claims,
+            Headers:              headerMap
+        );
+
+        return Ok(result);
+    }
+}
+
+
+
+
+
+
