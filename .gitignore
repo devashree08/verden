@@ -1,78 +1,68 @@
 #nullable enable
-using System.IO;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Hosting;
-using Serilog;
-using Serilog.Events;
-using Serilog.Formatting.Json;
-using Serilog.Filters;
+using System.Security.Claims;
+using Microsoft.Extensions.Options;
 using Maturity.Portal.Authorization;
+using Maturity.Portal.Configurations;
+using Maturity.Portal.Services;
 
-namespace Maturity.Portal.Extensions;
+namespace Maturity.Portal.Middlewares;
 
-public static class SerilogExtensions
+/// Builds principal from SSO (Negotiate) and dev headers; stamps portal:policy claims via SP.
+/// Username (pzid) primary; EID fallback.
+public sealed class SsoIdentityMiddleware(
+    RequestDelegate next,
+    IOptions<HeaderIdentityOptions> opt,
+    IWebHostEnvironment env,
+    IPortalPolicyService policyService
+)
 {
-    public static void UsePortalSerilog(this WebApplicationBuilder builder)
+    private readonly RequestDelegate _next = next;
+    private readonly HeaderIdentityOptions _h = opt.Value;
+    private readonly IWebHostEnvironment _env = env;
+    private readonly IPortalPolicyService _pol = policyService;
+
+    public async Task InvokeAsync(HttpContext ctx)
     {
-        // Directory & level from config (same keys you used in GEF)
-        var dir = builder.Configuration["PortalLogging:Directory"];
-        if (string.IsNullOrWhiteSpace(dir))
-            dir = Path.Combine(AppContext.BaseDirectory, "logs");
-        Directory.CreateDirectory(dir);
+        var principal = ctx.User ?? new ClaimsPrincipal();
+        ClaimsIdentity? identity = principal.Identities.FirstOrDefault();
 
-        var minLevelStr = builder.Configuration["PortalLogging:MinimumLevel"] ?? "Information";
-        var minLevel = Enum.TryParse<LogEventLevel>(minLevelStr, true, out var lvl)
-            ? lvl : LogEventLevel.Information;
-
-        var appName = builder.Environment.ApplicationName ?? "Maturity.Portal";
-        var envName = builder.Environment.EnvironmentName;
-
-        // File-only JSON logging
-        var loggerCfg = new LoggerConfiguration()
-            .Enrich.FromLogContext()
-            .Enrich.WithProperty("application", appName)
-            .Enrich.WithProperty("environment", envName)
-            .MinimumLevel.Is(minLevel)
-            .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
-            .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
-            .MinimumLevel.Override("System", LogEventLevel.Warning)
-            .WriteTo.File(
-                formatter: new JsonFormatter(renderMessage: true),
-                path: Path.Combine(dir, "portal-log-.json"),
-                rollingInterval: RollingInterval.Day,
-                retainedFileCountLimit: 30,
-                restrictedToMinimumLevel: minLevel,
-                shared: true)
-            // reduce noise from health checks
-            .Filter.ByExcluding(Matching.WithProperty<string>("RequestPath", p =>
-                p is not null && p.StartsWith("/health", StringComparison.OrdinalIgnoreCase)));
-
-        // NOTE: We intentionally do NOT call ReadFrom.Configuration here
-        // to ensure file-only behavior regardless of any Serilog section.
-
-        Log.Logger = loggerCfg.CreateLogger();
-        builder.Host.UseSerilog();
-    }
-
-    public static void UsePortalRequestLogging(this IApplicationBuilder app)
-    {
-        app.UseSerilogRequestLogging(opts =>
+        // Dev-only header fallback
+        if (_env.IsDevelopment() && _h.AllowHeaderFallbackInDevelopment)
         {
-            opts.MessageTemplate = "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.0000} ms";
-            opts.EnrichDiagnosticContext = (diag, http) =>
+            var userName = ctx.Request.Headers[_h.HeaderUserName].FirstOrDefault();
+            var eid      = ctx.Request.Headers[_h.HeaderEid].FirstOrDefault();
+            var email    = ctx.Request.Headers[_h.HeaderEmail].FirstOrDefault();
+            var first    = ctx.Request.Headers[_h.HeaderFirst].FirstOrDefault();
+            var last     = ctx.Request.Headers[_h.HeaderLast].FirstOrDefault();
+
+            if (!string.IsNullOrWhiteSpace(userName) || !string.IsNullOrWhiteSpace(eid))
             {
-                var corr = http.Response.Headers["X-Correlation-ID"].ToString();
-                if (string.IsNullOrWhiteSpace(corr)) corr = http.TraceIdentifier;
-                diag.Set("correlationId", corr);
+                identity ??= new ClaimsIdentity(authenticationType: "DevHeader");
+                if (!string.IsNullOrWhiteSpace(userName)) identity.AddClaim(new Claim(PortalClaimTypes.UserName, userName));
+                if (!string.IsNullOrWhiteSpace(eid))      identity.AddClaim(new Claim(PortalClaimTypes.EID, eid));
+                if (!string.IsNullOrWhiteSpace(email))    identity.AddClaim(new Claim(PortalClaimTypes.Email, email));
+                if (!string.IsNullOrWhiteSpace(first))    identity.AddClaim(new Claim(PortalClaimTypes.GivenName, first));
+                if (!string.IsNullOrWhiteSpace(last))     identity.AddClaim(new Claim(PortalClaimTypes.Surname, last));
+                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
+            }
+        }
 
-                var eid  = http.User?.FindFirst(PortalClaimTypes.EID)?.Value;
-                var user = http.User?.Identity?.Name;
-                if (!string.IsNullOrWhiteSpace(eid))  diag.Set("eid", eid);
-                if (!string.IsNullOrWhiteSpace(user)) diag.Set("userName", user);
+        var userNameClaim = principal.Identity?.Name; // pzid
+        var eidClaim      = principal.FindFirst(PortalClaimTypes.EID)?.Value;
 
-                diag.Set("RequestPath", http.Request.Path.Value ?? string.Empty);
-            };
-        });
+        if (!string.IsNullOrWhiteSpace(userNameClaim) || !string.IsNullOrWhiteSpace(eidClaim))
+        {
+            var policies = await _pol.GetPoliciesAsync(userNameClaim, eidClaim, ctx.RequestAborted);
+            if (policies.Count > 0)
+            {
+                identity ??= new ClaimsIdentity(authenticationType: principal.Identity?.AuthenticationType ?? "PortalSso");
+                foreach (var p in policies)
+                    identity.AddClaim(new Claim(PortalClaimTypes.Policy, p));
+                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
+            }
+            ctx.User = principal;
+        }
+
+        await _next(ctx);
     }
 }
