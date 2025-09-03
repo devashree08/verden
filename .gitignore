@@ -15,17 +15,20 @@ public static class SerilogExtensions
 {
     public static void UsePortalSerilog(this WebApplicationBuilder builder)
     {
+        // Directory & level from config (same keys you used in GEF)
         var dir = builder.Configuration["PortalLogging:Directory"];
         if (string.IsNullOrWhiteSpace(dir))
             dir = Path.Combine(AppContext.BaseDirectory, "logs");
         Directory.CreateDirectory(dir);
 
         var minLevelStr = builder.Configuration["PortalLogging:MinimumLevel"] ?? "Information";
-        var minLevel = Enum.TryParse<LogEventLevel>(minLevelStr, true, out var lvl) ? lvl : LogEventLevel.Information;
+        var minLevel = Enum.TryParse<LogEventLevel>(minLevelStr, true, out var lvl)
+            ? lvl : LogEventLevel.Information;
 
         var appName = builder.Environment.ApplicationName ?? "Maturity.Portal";
         var envName = builder.Environment.EnvironmentName;
 
+        // File-only JSON logging
         var loggerCfg = new LoggerConfiguration()
             .Enrich.FromLogContext()
             .Enrich.WithProperty("application", appName)
@@ -34,8 +37,6 @@ public static class SerilogExtensions
             .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
             .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
             .MinimumLevel.Override("System", LogEventLevel.Warning)
-            .WriteTo.Console(outputTemplate:
-                "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj} (corr:{correlationId} eid:{eid} user:{userName}){NewLine}{Exception}")
             .WriteTo.File(
                 formatter: new JsonFormatter(renderMessage: true),
                 path: Path.Combine(dir, "portal-log-.json"),
@@ -43,12 +44,12 @@ public static class SerilogExtensions
                 retainedFileCountLimit: 30,
                 restrictedToMinimumLevel: minLevel,
                 shared: true)
+            // reduce noise from health checks
             .Filter.ByExcluding(Matching.WithProperty<string>("RequestPath", p =>
                 p is not null && p.StartsWith("/health", StringComparison.OrdinalIgnoreCase)));
 
-        // Optional full Serilog section, honored if present.
-        if (builder.Configuration.GetSection("Serilog").Exists())
-            loggerCfg = loggerCfg.ReadFrom.Configuration(builder.Configuration);
+        // NOTE: We intentionally do NOT call ReadFrom.Configuration here
+        // to ensure file-only behavior regardless of any Serilog section.
 
         Log.Logger = loggerCfg.CreateLogger();
         builder.Host.UseSerilog();
@@ -65,7 +66,7 @@ public static class SerilogExtensions
                 if (string.IsNullOrWhiteSpace(corr)) corr = http.TraceIdentifier;
                 diag.Set("correlationId", corr);
 
-                var eid = http.User?.FindFirst(PortalClaimTypes.EID)?.Value;
+                var eid  = http.User?.FindFirst(PortalClaimTypes.EID)?.Value;
                 var user = http.User?.Identity?.Name;
                 if (!string.IsNullOrWhiteSpace(eid))  diag.Set("eid", eid);
                 if (!string.IsNullOrWhiteSpace(user)) diag.Set("userName", user);
