@@ -7,64 +7,216 @@ using Maturity.Portal.Services;
 
 namespace Maturity.Portal.Middlewares;
 
-/// Builds principal from SSO + dev headers; stamps portal:policy claims via SP.
-/// Username (pzid) primary; EID fallback.
+/// Builds principal from SSO headers first (pzid/eid), then Items, then claims.
+/// Stamps portal:policy claims via SP (username primary, eid fallback).
 public sealed class SsoIdentityMiddleware(
     RequestDelegate next,
-    IOptions<HeaderIdentityOptions> opt,
-    IWebHostEnvironment env
+    IOptions<HeaderIdentityOptions> opt
 )
 {
     private readonly RequestDelegate _next = next;
     private readonly HeaderIdentityOptions _h = opt.Value;
-    private readonly IWebHostEnvironment _env = env;
 
     public async Task InvokeAsync(HttpContext ctx)
     {
+        // Helpers
+        string? TryHeader(string key) =>
+            string.IsNullOrWhiteSpace(key) ? null : ctx.Request.Headers[key].FirstOrDefault()?.Trim();
+
+        string? TryItem(string key) =>
+            string.IsNullOrWhiteSpace(key) ? null
+            : (ctx.Items.TryGetValue(key, out var v) ? v?.ToString()?.Trim() : null);
+
+        // 1) Prefer SSO headers (pzid/eid/etc.)
+        var hdrUser = TryHeader(_h.HeaderUserName);
+        var hdrEid  = TryHeader(_h.HeaderEid);
+        var hdrMail = TryHeader(_h.HeaderEmail);
+        var hdrFn   = TryHeader(_h.HeaderFirstName);
+        var hdrLn   = TryHeader(_h.HeaderLastName);
+
+        // 2) Fallback to Items if headers missing
+        var itmUser = TryItem(_h.ItemUserNameKey);
+        var itmEid  = TryItem(_h.ItemEidKey);
+        var itmMail = TryItem(_h.ItemEmailKey);
+        var itmFn   = TryItem(_h.ItemFirstNameKey);
+        var itmLn   = TryItem(_h.ItemLastNameKey);
+
+        // 3) As last resort, use claims from upstream auth (may be DOMAIN\user)
+        var clmUser = ctx.User?.Identity?.Name ?? ctx.User?.FindFirst(ClaimTypes.Name)?.Value;
+        var clmEid  = ctx.User?.FindFirst(PortalClaimTypes.EID)?.Value;
+
+        // Resolve identity values with precedence: headers → items → claims
+        var userName = FirstNonEmpty(hdrUser, itmUser, clmUser);
+        var eid      = FirstNonEmpty(hdrEid,  itmEid,  clmEid);
+        var email    = FirstNonEmpty(hdrMail, itmMail, ctx.User?.FindFirst(PortalClaimTypes.Email)?.Value);
+        var first    = FirstNonEmpty(hdrFn,   itmFn,   ctx.User?.FindFirst(PortalClaimTypes.GivenName)?.Value);
+        var last     = FirstNonEmpty(hdrLn,   itmLn,   ctx.User?.FindFirst(PortalClaimTypes.Surname)?.Value);
+
+        // If we didn’t resolve anything, just continue.
+        if (string.IsNullOrWhiteSpace(userName) && string.IsNullOrWhiteSpace(eid))
+        {
+            await _next(ctx);
+            return;
+        }
+
+        // Build/augment identity
         var principal = ctx.User ?? new ClaimsPrincipal();
-        ClaimsIdentity? identity = principal.Identities.FirstOrDefault();
+        var identity = principal.Identities.FirstOrDefault()
+                       ?? new ClaimsIdentity(authenticationType: "PortalSso");
 
-        // Dev-only header fallback
-        if (_env.IsDevelopment() && _h.AllowHeaderFallbackInDevelopment)
+        // Stamp our echo claims (avoid duplicates)
+        void AddClaimIf(string type, string? val)
         {
-            var userName = ctx.Request.Headers[_h.HeaderUserName].FirstOrDefault();
-            var eid      = ctx.Request.Headers[_h.HeaderEid].FirstOrDefault();
-            var email    = ctx.Request.Headers[_h.HeaderEmail].FirstOrDefault();
-            var first    = ctx.Request.Headers[_h.HeaderFirst].FirstOrDefault();
-            var last     = ctx.Request.Headers[_h.HeaderLast].FirstOrDefault();
-
-            if (!string.IsNullOrWhiteSpace(userName) || !string.IsNullOrWhiteSpace(eid))
-            {
-                identity ??= new ClaimsIdentity(authenticationType: "DevHeader");
-                if (!string.IsNullOrWhiteSpace(userName)) identity.AddClaim(new Claim(PortalClaimTypes.UserName, userName));
-                if (!string.IsNullOrWhiteSpace(eid))      identity.AddClaim(new Claim(PortalClaimTypes.EID, eid));
-                if (!string.IsNullOrWhiteSpace(email))    identity.AddClaim(new Claim(PortalClaimTypes.Email, email));
-                if (!string.IsNullOrWhiteSpace(first))    identity.AddClaim(new Claim(PortalClaimTypes.GivenName, first));
-                if (!string.IsNullOrWhiteSpace(last))     identity.AddClaim(new Claim(PortalClaimTypes.Surname, last));
-                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
-            }
+            if (!string.IsNullOrWhiteSpace(val) && !identity.HasClaim(type, val))
+                identity.AddClaim(new Claim(type, val));
         }
 
-        // Pull identity values after Negotiate has run
-        var userNameClaim = principal.Identity?.Name; // pzid
-        var eidClaim      = principal.FindFirst(PortalClaimTypes.EID)?.Value;
+        AddClaimIf(PortalClaimTypes.UserName,  userName);
+        AddClaimIf(PortalClaimTypes.EID,       eid);
+        AddClaimIf(PortalClaimTypes.Email,     email);
+        AddClaimIf(PortalClaimTypes.GivenName, first);
+        AddClaimIf(PortalClaimTypes.Surname,   last);
 
-        if (!string.IsNullOrWhiteSpace(userNameClaim) || !string.IsNullOrWhiteSpace(eidClaim))
+        if (!principal.Identities.Contains(identity))
+            principal.AddIdentity(identity);
+
+        // Resolve policies via SP (username/pzid primary, eid fallback)
+        var polSvc = ctx.RequestServices.GetRequiredService<IPortalPolicyService>();
+        var policies = await polSvc.GetPoliciesAsync(userName, eid, ctx.RequestAborted);
+
+        foreach (var p in policies)
         {
-            // ⬇️ Resolve the scoped service per request — SAFE
-            var policyService = ctx.RequestServices.GetRequiredService<IPortalPolicyService>();
-
-            var policies = await policyService.GetPoliciesAsync(userNameClaim, eidClaim, ctx.RequestAborted);
-            if (policies.Count > 0)
-            {
-                identity ??= new ClaimsIdentity(authenticationType: principal.Identity?.AuthenticationType ?? "PortalSso");
-                foreach (var p in policies)
-                    identity.AddClaim(new Claim(PortalClaimTypes.Policy, p));
-                if (!principal.Identities.Contains(identity)) principal.AddIdentity(identity);
-            }
-            ctx.User = principal;
+            if (!string.IsNullOrWhiteSpace(p) && !identity.HasClaim(PortalClaimTypes.Policy, p))
+                identity.AddClaim(new Claim(PortalClaimTypes.Policy, p));
         }
 
+        ctx.User = principal;
         await _next(ctx);
+    }
+
+    private static string? FirstNonEmpty(params string?[] values)
+        => values.FirstOrDefault(s => !string.IsNullOrWhiteSpace(s))?.Trim();
+}
+
+
+
+#nullable enable
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+using Maturity.Portal.Authorization;
+using Maturity.Portal.Configurations;
+using System.Security.Claims;
+
+namespace Maturity.Portal.Controllers;
+
+[ApiController]
+[Route("api/admin")]
+public sealed class AdminDebugController(
+    IOptions<HeaderIdentityOptions> headerOpts,
+    IWebHostEnvironment env
+) : ControllerBase
+{
+    private readonly HeaderIdentityOptions _h = headerOpts.Value;
+    private readonly IWebHostEnvironment _env = env;
+
+    [HttpGet("debug-identity")]
+    [Authorize(Policy = PortalPolicies.Admin)]
+    public IActionResult DebugIdentity()
+    {
+        string? TryHeader(string k) =>
+            string.IsNullOrWhiteSpace(k) ? null : Request.Headers[k].FirstOrDefault();
+
+        string? TryItem(string k) =>
+            string.IsNullOrWhiteSpace(k) ? null
+            : (HttpContext.Items.TryGetValue(k, out var v) ? v?.ToString() : null);
+
+        // Headers
+        var hdrUser = TryHeader(_h.HeaderUserName);
+        var hdrEid  = TryHeader(_h.HeaderEid);
+        var hdrMail = TryHeader(_h.HeaderEmail);
+        var hdrFn   = TryHeader(_h.HeaderFirstName);
+        var hdrLn   = TryHeader(_h.HeaderLastName);
+
+        // Items
+        var itmUser = TryItem(_h.ItemUserNameKey);
+        var itmEid  = TryItem(_h.ItemEidKey);
+        var itmMail = TryItem(_h.ItemEmailKey);
+        var itmFn   = TryItem(_h.ItemFirstNameKey);
+        var itmLn   = TryItem(_h.ItemLastNameKey);
+
+        // Claims
+        var claims = User?.Claims?.Select(c => new { type = c.Type, value = c.Value })?.ToList() ?? new();
+        var clmEid  = User?.FindFirst(PortalClaimTypes.EID)?.Value;
+        var clmUser = User?.Identity?.Name ?? User?.FindFirst(ClaimTypes.Name)?.Value;
+
+        var isAuth   = User?.Identity?.IsAuthenticated ?? false;
+        var authType = User?.Identity?.AuthenticationType;
+
+        var correlationId = Request.Headers["X-Correlation-ID"].FirstOrDefault()
+                         ?? HttpContext.TraceIdentifier;
+
+        var hasHdrIdentity  = !string.IsNullOrWhiteSpace(hdrUser) || !string.IsNullOrWhiteSpace(hdrEid);
+        var hasItemIdentity = !string.IsNullOrWhiteSpace(itmUser) || !string.IsNullOrWhiteSpace(itmEid);
+
+        string sourceGuess =
+            hasItemIdentity ? "HttpContext.Items (SSO agent populated)"
+          : hasHdrIdentity  ? "Request Headers (SSO proxy)"
+          : !string.IsNullOrEmpty(authType) ? $"Authentication Scheme: {authType}"
+          : "Unknown";
+
+        var result = new
+        {
+            environment = _env.EnvironmentName,
+            isAuthenticated = isAuth,
+            authenticationType = authType,
+            correlationId,
+
+            headers = new
+            {
+                userNameKey = _h.HeaderUserName,
+                eidKey      = _h.HeaderEid,
+                emailKey    = _h.HeaderEmail,
+                firstKey    = _h.HeaderFirstName,
+                lastKey     = _h.HeaderLastName,
+
+                userName = hdrUser,
+                eid      = hdrEid,
+                email    = hdrMail,
+                first    = hdrFn,
+                last     = hdrLn
+            },
+
+            items = new
+            {
+                userNameKey = _h.ItemUserNameKey,
+                eidKey      = _h.ItemEidKey,
+                emailKey    = _h.ItemEmailKey,
+                firstKey    = _h.ItemFirstNameKey,
+                lastKey     = _h.ItemLastNameKey,
+
+                userName = itmUser,
+                eid      = itmEid,
+                email    = itmMail,
+                first    = itmFn,
+                last     = itmLn
+            },
+
+            claimsSummary = new
+            {
+                eid   = clmEid,
+                name  = clmUser,
+                policyClaims = claims
+                    .Where(c => c.type == PortalClaimTypes.Policy)
+                    .Select(c => c.value)
+                    .OrderBy(v => v)
+                    .ToArray()
+            },
+
+            sourceGuess,
+            rawClaims = claims
+        };
+
+        return Ok(result);
     }
 }
