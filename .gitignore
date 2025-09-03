@@ -1,74 +1,15 @@
-#nullable enable
-using Microsoft.AspNetCore.Diagnostics;
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Data.SqlClient;
-using System.Net;
-
-namespace Maturity.Portal.Errors;
-
-/// Global exception handler for API. No PII in responses.
-/// Maps known SQL authz/data errors to 403/404; everything else -> 500.
-public sealed class GlobalExceptionHandler(ILogger<GlobalExceptionHandler> logger) : IExceptionHandler
+public sealed class UserPermissionsDto
 {
-    private readonly ILogger<GlobalExceptionHandler> _log = logger;
+    public bool   IsAuthenticated { get; init; }
+    public string? UserName       { get; init; }  // pzid
+    public string? EID            { get; init; }
+    public string  DisplayName    { get; init; } = string.Empty;
 
-    // Keep aligned with your stored procs:
-    private const int SqlErr_Unauthorized = 51013; // org-scope/permission denied
-    private const int SqlErr_CustUpdateOnly = 51002; // e.g., field restricted (legacy)
-    private const int SqlErr_NotFound = 51003; // row not found
+    public bool IsAdmin          { get; init; }
+    public bool CanEditVCS       { get; init; }
+    public bool CanEditTPD       { get; init; }
+    public bool CanEditNetwork   { get; init; }
+    public bool CanEditVGST      { get; init; }
 
-    public async ValueTask<bool> TryHandleAsync(
-        HttpContext httpContext,
-        Exception exception,
-        CancellationToken cancellationToken)
-    {
-        var (status, title) = Map(exception);
-
-        // Correlation id from response header (set by CorrelationLoggingMiddleware) or TraceIdentifier
-        var correlationId = httpContext.Response.Headers.TryGetValue("X-Correlation-ID", out var hdr)
-            ? hdr.ToString()
-            : httpContext.TraceIdentifier;
-
-        _log.LogError(exception, "Unhandled error. Status={Status} CorrelationId={CorrelationId}",
-            status, correlationId);
-
-        var problem = new ProblemDetails
-        {
-            Title  = title,
-            Status = status,
-            Type   = "about:blank",
-            Detail = status == (int)HttpStatusCode.InternalServerError
-                        ? "An unexpected error occurred." // generic; no PII
-                        : null,
-            Instance = httpContext.Request.Path
-        };
-        problem.Extensions["correlationId"] = correlationId;
-
-        httpContext.Response.StatusCode = status;
-        httpContext.Response.ContentType = "application/problem+json";
-
-        await httpContext.Response.WriteAsJsonAsync(problem, cancellationToken);
-        return true;
-    }
-
-    private static (int status, string title) Map(Exception ex)
-    {
-        // SQL authorization / not found cases from SPs
-        if (ex is SqlException sqlEx)
-        {
-            return sqlEx.Number switch
-            {
-                SqlErr_Unauthorized or SqlErr_CustUpdateOnly => ((int)HttpStatusCode.Forbidden,  "Forbidden"),
-                SqlErr_NotFound                              => ((int)HttpStatusCode.NotFound,    "Not Found"),
-                _                                            => ((int)HttpStatusCode.InternalServerError, "Server Error")
-            };
-        }
-
-        // TaskCanceled from client disconnects/timeouts -> 499-ish; use 408
-        if (ex is OperationCanceledException)
-            return ((int)HttpStatusCode.RequestTimeout, "Request Timeout");
-
-        // Default
-        return ((int)HttpStatusCode.InternalServerError, "Server Error");
-    }
+    public IReadOnlyList<string> Policies { get; init; } = Array.Empty<string>();
 }
