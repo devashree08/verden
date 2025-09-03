@@ -12,30 +12,23 @@ BEGIN
         SELECT *
         FROM dbo.AdGroupFeed
         WHERE
-            (@UserEID  IS NOT NULL AND UserEID = @UserEID)
-         OR (@UserEID  IS NULL     AND @UserName IS NOT NULL
-             AND UPPER(LTRIM(RTRIM(UserName))) = UPPER(LTRIM(RTRIM(@UserName))))
+            (@UserEID IS NOT NULL AND UserEID = @UserEID)
+            OR (
+                @UserEID IS NULL AND @UserName IS NOT NULL
+                AND UPPER(LTRIM(RTRIM(UserName))) = UPPER(LTRIM(RTRIM(@UserName)))
+            )
     ),
     admin_flag AS (
         SELECT CASE WHEN EXISTS (
-                   SELECT 1
-                   FROM m
+                   SELECT 1 FROM m
                    WHERE UPPER(GroupName) = 'CYBER_PORTAL_ADMINS'
                ) THEN 1 ELSE 0 END AS IsAdmin
     ),
     org_memberships AS (
-        -- match exact name first
-        SELECT om.OrgId, om.OrgCode
+        SELECT DISTINCT om.OrgId, om.OrgCode
         FROM m
         JOIN dbo.Portal_OrgMap om
-          ON UPPER(m.GroupName) = UPPER(om.GroupNameExact)
-        UNION
-        -- optional pattern fallback
-        SELECT om.OrgId, om.OrgCode
-        FROM m
-        JOIN dbo.Portal_OrgMap om
-          ON om.GroupNameExact IS NULL
-         AND om.GroupNameLike IS NOT NULL
+          ON om.GroupNameLike IS NOT NULL
          AND UPPER(m.GroupName) LIKE UPPER(om.GroupNameLike)
     ),
     any_membership AS (
@@ -43,7 +36,7 @@ BEGIN
     )
     SELECT PolicyName
     FROM (
-        -- baseline "PortalUser" if they are in ANY mapped org or an admin
+        -- Baseline: PortalUser if in any mapped org or an admin
         SELECT 'PortalUser' AS PolicyName, 1 AS keep
         FROM any_membership a
         CROSS JOIN admin_flag f
@@ -56,17 +49,20 @@ BEGIN
         WHERE IsAdmin = 1
 
         UNION ALL
-        -- One Edit.<OrgCode>.All per matched org (admin implies all — we’ll add all rows)
+        -- Admins get all org Edit policies
         SELECT 'Edit.' + om.OrgCode + '.All', 1
         FROM admin_flag f
         JOIN dbo.Portal_OrgMap om
-          ON f.IsAdmin = 1                 -- admins: include every org policy
+          ON f.IsAdmin = 1
+
         UNION ALL
+        -- Members get their own org Edit policies
         SELECT 'Edit.' + om.OrgCode + '.All', 1
-        FROM org_memberships om            -- members: include only their orgs
+        FROM org_memberships om
     ) x
     WHERE keep = 1
-    GROUP BY PolicyName            -- de-dup if admin path overlaps member path
+    GROUP BY PolicyName
     ORDER BY PolicyName;
 END
 GO
+
