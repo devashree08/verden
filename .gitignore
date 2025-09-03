@@ -1,40 +1,77 @@
 #nullable enable
-using Microsoft.AspNetCore.Authorization;
-using Microsoft.Extensions.Options;
+using System.IO;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
+using Serilog;
+using Serilog.Events;
+using Serilog.Formatting.Json;
+using Serilog.Filters;
 using Maturity.Portal.Authorization;
-using Maturity.Portal.Configurations;
-using Maturity.Portal.Services;
 
 namespace Maturity.Portal.Extensions;
 
-public static class ServiceCollectionExtensions
+public static class SerilogExtensions
 {
-    public static IServiceCollection AddPortalPolicyServices(this IServiceCollection services, IConfiguration config)
+    public static void UsePortalSerilog(this WebApplicationBuilder builder)
     {
-        services.Configure<HeaderIdentityOptions>(config.GetSection("Auth:Headers"));
-        services.Configure<PolicyCacheOptions>(config.GetSection("Auth:PolicyCache"));
+        var dir = builder.Configuration["PortalLogging:Directory"];
+        if (string.IsNullOrWhiteSpace(dir))
+            dir = Path.Combine(AppContext.BaseDirectory, "logs");
+        Directory.CreateDirectory(dir);
 
-        services.AddMemoryCache();
-        services.AddSingleton(TimeProvider.System);
+        var minLevelStr = builder.Configuration["PortalLogging:MinimumLevel"] ?? "Information";
+        var minLevel = Enum.TryParse<LogEventLevel>(minLevelStr, true, out var lvl) ? lvl : LogEventLevel.Information;
 
-        services.AddScoped<IPortalPolicyService, PortalPolicyService>();
+        var appName = builder.Environment.ApplicationName ?? "Maturity.Portal";
+        var envName = builder.Environment.EnvironmentName;
 
-        services.AddAuthorization(options =>
+        var loggerCfg = new LoggerConfiguration()
+            .Enrich.FromLogContext()
+            .Enrich.WithProperty("application", appName)
+            .Enrich.WithProperty("environment", envName)
+            .MinimumLevel.Is(minLevel)
+            .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+            .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
+            .MinimumLevel.Override("System", LogEventLevel.Warning)
+            .WriteTo.Console(outputTemplate:
+                "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj} (corr:{correlationId} eid:{eid} user:{userName}){NewLine}{Exception}")
+            .WriteTo.File(
+                formatter: new JsonFormatter(renderMessage: true),
+                path: Path.Combine(dir, "portal-log-.json"),
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: 30,
+                restrictedToMinimumLevel: minLevel,
+                shared: true)
+            .Filter.ByExcluding(Matching.WithProperty<string>("RequestPath", p =>
+                p is not null && p.StartsWith("/health", StringComparison.OrdinalIgnoreCase)));
+
+        // Optional full Serilog section, honored if present.
+        if (builder.Configuration.GetSection("Serilog").Exists())
+            loggerCfg = loggerCfg.ReadFrom.Configuration(builder.Configuration);
+
+        Log.Logger = loggerCfg.CreateLogger();
+        builder.Host.UseSerilog();
+    }
+
+    public static void UsePortalRequestLogging(this IApplicationBuilder app)
+    {
+        app.UseSerilogRequestLogging(opts =>
         {
-            options.FallbackPolicy = new AuthorizationPolicyBuilder()
-                .RequireAuthenticatedUser()
-                .Build();
+            opts.MessageTemplate = "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.0000} ms";
+            opts.EnrichDiagnosticContext = (diag, http) =>
+            {
+                var corr = http.Response.Headers["X-Correlation-ID"].ToString();
+                if (string.IsNullOrWhiteSpace(corr)) corr = http.TraceIdentifier;
+                diag.Set("correlationId", corr);
 
-            PortalCompositePolicies.Register(options);
+                var eid = http.User?.FindFirst(PortalClaimTypes.EID)?.Value;
+                var user = http.User?.Identity?.Name;
+                if (!string.IsNullOrWhiteSpace(eid))  diag.Set("eid", eid);
+                if (!string.IsNullOrWhiteSpace(user)) diag.Set("userName", user);
+
+                diag.Set("RequestPath", http.Request.Path.Value ?? string.Empty);
+            };
         });
-
-        services.AddSingleton<IAuthorizationPolicyProvider>(sp =>
-        {
-            var opts = sp.GetRequiredService<IOptions<AuthorizationOptions>>();
-            var fallback = new DefaultAuthorizationPolicyProvider(opts);
-            return new DynamicPolicyProvider(fallback);
-        });
-
-        return services;
     }
 }
