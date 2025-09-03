@@ -1,131 +1,45 @@
 #nullable enable
-using Microsoft.AspNetCore.Authorization;
-using Microsoft.AspNetCore.Mvc;
-using Maturity.Portal.Authorization;
-using Maturity.Portal.Extensions;
-using Maturity.Portal.Models;
-using System.Security.Claims;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
-namespace Maturity.Portal.Controllers;
+namespace Maturity.Portal.Extensions;
 
-[ApiController]
-[Route("api/auth")]
-public sealed class AuthController() : ControllerBase
+public static class SecureHeaderExtensions
 {
     /// <summary>
-    /// Frontend capability snapshot for the signed-in user.
-    /// Uses claims stamped by SsoIdentityMiddleware (no DB calls here).
+    /// Adds a minimal set of security headers and (optionally) HSTS in non-dev.
+    /// Options are taken from DI (IOptions&lt;SecureHeaderOptions&gt;) unless an explicit
+    /// instance is passed in.
     /// </summary>
-    [HttpGet("user-permissions")]
-    [Authorize] // fallback policy already requires authenticated user
-    public ActionResult<UserPermissionsDto> GetUserPermissions()
+    public static IApplicationBuilder UseSecureHeaders(
+        this IApplicationBuilder app,
+        IWebHostEnvironment env,
+        SecureHeaderOptions? explicitOptions = null)
     {
-        ClaimsPrincipal u = User;
+        // Prefer explicit options; else try DI; else defaults.
+        var resolved = explicitOptions
+            ?? app.ApplicationServices.GetService<IOptions<SecureHeaderOptions>>()?.Value
+            ?? new SecureHeaderOptions();
 
-        var policies = u.FindAll(PortalClaimTypes.Policy)
-                        .Select(c => c.Value)
-                        .Distinct(StringComparer.OrdinalIgnoreCase)
-                        .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
-                        .ToList();
-
-        bool has(string p) => policies.Contains(p, StringComparer.OrdinalIgnoreCase);
-
-        var dto = new UserPermissionsDto
+        app.Use(async (ctx, next) =>
         {
-            IsAuthenticated = u.Identity?.IsAuthenticated ?? false,
-            UserName        = u.Identity?.Name,
-            EID             = u.FindFirst(PortalClaimTypes.EID)?.Value,
-            DisplayName     = u.GetDisplayName(),
+            var h = ctx.Response.Headers;
 
-            IsAdmin        = has(PortalPolicies.Admin),
-            CanEditVCS     = has(PortalPolicies.Admin) || has(PortalPolicies.Edit_VCS_All),
-            CanEditTPD     = has(PortalPolicies.Admin) || has(PortalPolicies.Edit_TPD_All),
-            CanEditNetwork = has(PortalPolicies.Admin) || has(PortalPolicies.Edit_Network_All),
-            CanEditVGST    = has(PortalPolicies.Admin) || has(PortalPolicies.Edit_VGST_All),
+            if (!h.ContainsKey("X-Content-Type-Options"))             h.Append("X-Content-Type-Options", "nosniff");
+            if (!h.ContainsKey("X-Frame-Options"))                    h.Append("X-Frame-Options", "SAMEORIGIN");
+            if (!h.ContainsKey("Referrer-Policy"))                    h.Append("Referrer-Policy", "no-referrer");
+            if (!h.ContainsKey("X-Permitted-Cross-Domain-Policies"))  h.Append("X-Permitted-Cross-Domain-Policies", "none");
+            if (!h.ContainsKey("Permissions-Policy"))                 h.Append("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
 
-            Policies = policies
-        };
+            await next();
+        });
 
-        return Ok(dto);
+        if (!env.IsDevelopment() && resolved.EnableHsts)
+        {
+            app.UseHsts();
+        }
+
+        return app;
     }
 }
-
-
-#nullable enable
-using Microsoft.AspNetCore.Authorization;
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Options;
-using Maturity.Portal.Authorization;
-using Maturity.Portal.Configurations;
-using System.Security.Claims;
-
-namespace Maturity.Portal.Controllers;
-
-/// <summary>
-/// Admin-only: shows how identity/claims are coming through (headers vs auth scheme).
-/// Use only for diagnostics; keep behind Admin policy.
-/// </summary>
-[ApiController]
-[Route("api/admin")]
-public sealed class AdminDebugController(IOptions<HeaderIdentityOptions> headerOpts) : ControllerBase
-{
-    private readonly HeaderIdentityOptions _h = headerOpts.Value;
-
-    public sealed record DebugIdentityResult(
-        string AuthenticationScheme,
-        bool   IsAuthenticated,
-        string? UserName,
-        string? EID,
-        string? Email,
-        string? FirstName,
-        string? LastName,
-        IReadOnlyList<KeyValuePair<string,string>> Claims,
-        IReadOnlyDictionary<string,string?> Headers);
-
-    [HttpGet("debug-identity")]
-    [Authorize(Policy = PortalPolicies.Admin)]
-    public ActionResult<DebugIdentityResult> DebugIdentity()
-    {
-        var u = User;
-
-        // Collect selected headers (SSO agent typically injects these)
-        var wanted = new (string key, string name)[]
-        {
-            (_h.HeaderUserName, "userName"),
-            (_h.HeaderEid,      "eid"),
-            (_h.HeaderEmail,    "email"),
-            (_h.HeaderFirst,    "firstName"),
-            (_h.HeaderLast,     "lastName")
-        };
-
-        var headerMap = wanted.ToDictionary(
-            k => k.name,
-            k => (string?)Request.Headers[k.key].FirstOrDefault(),
-            StringComparer.OrdinalIgnoreCase);
-
-        // Claims dump (type/value) – useful to verify portal:policy stamps
-        var claims = u.Claims
-            .Select(c => new KeyValuePair<string,string>(c.Type, c.Value))
-            .ToList();
-
-        var result = new DebugIdentityResult(
-            AuthenticationScheme: u.Identity?.AuthenticationType ?? "(none)",
-            IsAuthenticated:      u.Identity?.IsAuthenticated ?? false,
-            UserName:             u.Identity?.Name,
-            EID:                  u.FindFirst(PortalClaimTypes.EID)?.Value,
-            Email:                u.FindFirst(PortalClaimTypes.Email)?.Value,
-            FirstName:            u.FindFirst(PortalClaimTypes.GivenName)?.Value,
-            LastName:             u.FindFirst(PortalClaimTypes.Surname)?.Value,
-            Claims:               claims,
-            Headers:              headerMap
-        );
-
-        return Ok(result);
-    }
-}
-
-
-
-
-
-
