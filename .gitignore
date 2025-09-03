@@ -1,179 +1,72 @@
-CREATE OR ALTER PROCEDURE dbo.SyncOwnerMappingFromReadiness
-    @AsOfDate      date = CAST(GETDATE() AS date),
-    @ActiveThrough date = '9999-12-31'   -- change to '2028-12-01' if you must cap active rows
+CREATE OR ALTER PROC dbo.usp_PortalPolicies_GetForUser
+    @UserEID    NVARCHAR(64)  = NULL,
+    @UserName   NVARCHAR(256) = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
-    SET XACT_ABORT ON;
 
-    BEGIN TRAN;
+    IF @UserEID IS NULL AND @UserName IS NULL
+        THROW 50071, 'Either @UserEID or @UserName is required.', 1;
 
-    /* 1) Build normalized source from readiness (one row per person/role) */
-    IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
-    CREATE TABLE #src
-    (
-        OrgID                int           NOT NULL,
-        CSF_2_0_SubacatID    int           NOT NULL,
-        FullName             nvarchar(400) NOT NULL,
-        ContactRole          varchar(50)   NOT NULL,
-        PZID                 varchar(100)  NULL,
-        ContactEmail         varchar(254)  NULL
-    );
-
-    WITH Raw AS (
-        SELECT
-            r.OrgID,
-            r.SubcatID,
-            v.RoleName,
-            v.NameCSV
-        FROM dbo.readiness r
-        CROSS APPLY (VALUES
-            ('Owner',     r.SubcatOwner),
-            ('Custodian', r.SubcatCustodian)
-        ) v(RoleName, NameCSV)
-        WHERE r.OrgID IS NOT NULL
-          AND r.SubcatID IS NOT NULL
-          AND v.NameCSV IS NOT NULL
-          AND LTRIM(RTRIM(CONVERT(varchar(max), v.NameCSV))) <> ''
+    ;WITH m AS (
+        SELECT *
+        FROM dbo.AdGroupFeed
+        WHERE
+            (@UserEID  IS NOT NULL AND UserEID = @UserEID)
+         OR (@UserEID  IS NULL     AND @UserName IS NOT NULL
+             AND UPPER(LTRIM(RTRIM(UserName))) = UPPER(LTRIM(RTRIM(@UserName))))
     ),
-    Split AS (
-        SELECT
-            OrgID,
-            SubcatID,
-            RoleName AS ContactRole,
-            LTRIM(RTRIM(s.value)) AS FullName
-        FROM Raw
-        CROSS APPLY STRING_SPLIT(CONVERT(varchar(max), Raw.NameCSV), ',') AS s
-        WHERE LTRIM(RTRIM(s.value)) <> ''
+    admin_flag AS (
+        SELECT CASE WHEN EXISTS (
+                   SELECT 1
+                   FROM m
+                   WHERE UPPER(GroupName) = 'CYBER_PORTAL_ADMINS'
+               ) THEN 1 ELSE 0 END AS IsAdmin
     ),
-    Clean AS (
-        SELECT DISTINCT
-            OrgID,
-            SubcatID,
-            ContactRole,
-            FullName,
-            -- cleaned variations for name matching
-            UPPER(LTRIM(RTRIM(
-                REPLACE(REPLACE(REPLACE(REPLACE(FullName, ',', ' '), '.', ' '), '''', ''), '  ', ' ')
-            ))) AS CleanName,
-            UPPER(
-                REPLACE(REPLACE(REPLACE(REPLACE(FullName, ' ', ''), ',', ''), '.', ''), '''', '')
-            ) AS CompactName
-        FROM Split
+    org_memberships AS (
+        -- match exact name first
+        SELECT om.OrgId, om.OrgCode
+        FROM m
+        JOIN dbo.Portal_OrgMap om
+          ON UPPER(m.GroupName) = UPPER(om.GroupNameExact)
+        UNION
+        -- optional pattern fallback
+        SELECT om.OrgId, om.OrgCode
+        FROM m
+        JOIN dbo.Portal_OrgMap om
+          ON om.GroupNameExact IS NULL
+         AND om.GroupNameLike IS NOT NULL
+         AND UPPER(m.GroupName) LIKE UPPER(om.GroupNameLike)
     ),
-    Enriched AS (
-        SELECT
-            c.OrgID,
-            c.SubcatID         AS CSF_2_0_SubacatID,
-            c.FullName,
-            c.ContactRole,
-            af_match.PZID,
-            af_match.ContactEmail
-        FROM Clean c
-        OUTER APPLY (
-            -- prefer exact compact match; fallback to first/last token LIKE
-            SELECT TOP (1)
-                af.PZID,
-                af.ContactEmail
-            FROM dbo.adomfeed af
-            CROSS APPLY (
-                SELECT
-                    UPPER(LTRIM(RTRIM(
-                        REPLACE(REPLACE(REPLACE(REPLACE(af.FullName, ',', ' '), '.', ' '), '''', ''), '  ', ' ')
-                    ))) AS CleanAF,
-                    UPPER(REPLACE(REPLACE(REPLACE(REPLACE(af.FullName, ' ', ''), ',', ''), '.', ''), '''', '')) AS CompactAF
-            ) afx
-            CROSS APPLY (
-                SELECT
-                    CASE WHEN CHARINDEX(' ', c.CleanName) > 0
-                         THEN LEFT(c.CleanName, CHARINDEX(' ', c.CleanName) - 1)
-                         ELSE c.CleanName END AS FirstTok,
-                    CASE WHEN CHARINDEX(' ', REVERSE(c.CleanName)) > 0
-                         THEN RIGHT(c.CleanName, CHARINDEX(' ', REVERSE(c.CleanName)) - 1)
-                         ELSE c.CleanName END AS LastTok
-            ) t
-            WHERE afx.CompactAF = c.CompactName
-               OR (
-                    LEN(t.FirstTok) >= 3 AND LEN(t.LastTok) >= 3
-                    AND afx.CleanAF LIKE '%' + t.FirstTok + '%'
-                    AND afx.CleanAF LIKE '%' + t.LastTok  + '%'
-                  )
-            ORDER BY
-                CASE WHEN afx.CompactAF = c.CompactName THEN 0 ELSE 1 END,
-                LEN(af.FullName),
-                af.PZID
-        ) af_match
+    any_membership AS (
+        SELECT CASE WHEN EXISTS (SELECT 1 FROM org_memberships) THEN 1 ELSE 0 END AS HasAny
     )
-    INSERT INTO #src (OrgID, CSF_2_0_SubacatID, FullName, ContactRole, PZID, ContactEmail)
-    SELECT OrgID, CSF_2_0_SubacatID, FullName, ContactRole, PZID, ContactEmail
-    FROM Enriched;
+    SELECT PolicyName
+    FROM (
+        -- baseline "PortalUser" if they are in ANY mapped org or an admin
+        SELECT 'PortalUser' AS PolicyName, 1 AS keep
+        FROM any_membership a
+        CROSS JOIN admin_flag f
+        WHERE a.HasAny = 1 OR f.IsAdmin = 1
 
-    /* 2) Expire active rows that are no longer present in readiness */
-    UPDATE tgt
-        SET tgt.Status = 'I',
-            tgt.Exp_Dt = DATEADD(DAY, -1, @AsOfDate)
-    FROM dbo.owner_mapping AS tgt
-    WHERE tgt.Status = 'A'
-      AND (tgt.Exp_Dt IS NULL OR tgt.Exp_Dt >= @AsOfDate)
-      AND NOT EXISTS (
-            SELECT 1
-            FROM #src s
-            WHERE s.OrgID              = tgt.OrgID
-              AND s.CSF_2_0_SubacatID  = tgt.CSF_2_0_SubacatID
-              AND s.FullName           = tgt.FullName
-              AND s.ContactRole        = tgt.ContactRole
-      );
+        UNION ALL
+        -- Admin
+        SELECT 'Admin', 1
+        FROM admin_flag
+        WHERE IsAdmin = 1
 
-    /* 3) Insert new active rows that are in readiness but not yet active in owner_mapping */
-    INSERT INTO dbo.owner_mapping
-    (
-        OrgID,
-        CSF_2_0_SubacatID,
-        PZID,
-        FullName,
-        ContactEmail,
-        ContactRole,
-        Eff_Dt,
-        Exp_Dt,
-        Status
-    )
-    SELECT
-        s.OrgID,
-        s.CSF_2_0_SubacatID,
-        s.PZID,
-        s.FullName,
-        s.ContactEmail,
-        s.ContactRole,
-        @AsOfDate        AS Eff_Dt,
-        @ActiveThrough   AS Exp_Dt,
-        'A'              AS Status
-    FROM #src s
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM dbo.owner_mapping t
-        WHERE t.OrgID             = s.OrgID
-          AND t.CSF_2_0_SubacatID = s.CSF_2_0_SubacatID
-          AND t.FullName          = s.FullName
-          AND t.ContactRole       = s.ContactRole
-          AND t.Status            = 'A'
-          AND (t.Exp_Dt IS NULL OR t.Exp_Dt >= @AsOfDate)
-    );
-
-    /* 4) (Optional) Refresh contact info for active rows that match on keys but have different PZID/Email */
-    UPDATE t
-        SET t.PZID         = s.PZID,
-            t.ContactEmail = s.ContactEmail
-    FROM dbo.owner_mapping t
-    JOIN #src s
-      ON s.OrgID             = t.OrgID
-     AND s.CSF_2_0_SubacatID = t.CSF_2_0_SubacatID
-     AND s.FullName          = t.FullName
-     AND s.ContactRole       = t.ContactRole
-    WHERE t.Status = 'A'
-      AND (t.Exp_Dt IS NULL OR t.Exp_Dt >= @AsOfDate)
-      AND (ISNULL(t.PZID,'') <> ISNULL(s.PZID,'')
-        OR ISNULL(t.ContactEmail,'') <> ISNULL(s.ContactEmail,''));
-
-    COMMIT;
+        UNION ALL
+        -- One Edit.<OrgCode>.All per matched org (admin implies all — we’ll add all rows)
+        SELECT 'Edit.' + om.OrgCode + '.All', 1
+        FROM admin_flag f
+        JOIN dbo.Portal_OrgMap om
+          ON f.IsAdmin = 1                 -- admins: include every org policy
+        UNION ALL
+        SELECT 'Edit.' + om.OrgCode + '.All', 1
+        FROM org_memberships om            -- members: include only their orgs
+    ) x
+    WHERE keep = 1
+    GROUP BY PolicyName            -- de-dup if admin path overlaps member path
+    ORDER BY PolicyName;
 END
 GO
