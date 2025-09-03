@@ -1,63 +1,32 @@
-#nullable enable
-using System.Data;
-using System.Data.Common;
-using Dapper;
-using Microsoft.Extensions.Caching.Memory;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-using Maturity.Portal.Configurations;
-using Maturity.Portal.Data;
-
-namespace Maturity.Portal.Services;
-
-/// Calls dbo.usp_PortalPolicies_GetForUser (username/pzid primary, EID fallback) and caches briefly.
-public sealed class PortalPolicyService(
-    IDbConnectionFactory dbFactory,
-    IMemoryCache cache,
-    TimeProvider clock,
-    IOptions<PolicyCacheOptions> cacheOptions,
-    ILogger<PortalPolicyService> logger
-) : IPortalPolicyService
 {
-    private readonly IDbConnectionFactory _dbFactory = dbFactory;
-    private readonly IMemoryCache _cache = cache;
-    private readonly TimeProvider _clock = clock;
-    private readonly PolicyCacheOptions _opts = cacheOptions.Value;
-    private readonly ILogger<PortalPolicyService> _log = logger;
-
-    public async Task<IReadOnlyList<string>> GetPoliciesAsync(string? userName, string? eid, CancellationToken ct = default)
-    {
-        var idKey = userName ?? eid ?? "anon";
-        var cacheKey = $"pol::{idKey}";
-        if (_cache.TryGetValue(cacheKey, out IReadOnlyList<string>? cached) && cached is not null)
-            return cached;
-
-        try
-        {
-            await using DbConnection conn = await _dbFactory.OpenAsync(ct);
-
-            var p = new DynamicParameters();
-            p.Add("@UserEID",  eid,      DbType.String);
-            p.Add("@UserName", userName, DbType.String);
-
-            var list = (await conn.QueryAsync<string>(
-                "dbo.usp_PortalPolicies_GetForUser",
-                p, commandType: CommandType.StoredProcedure))
-                .ToList()
-                .AsReadOnly();
-
-            _cache.Set(cacheKey, list, new MemoryCacheEntryOptions
-            {
-                AbsoluteExpiration = _clock.GetUtcNow().AddMinutes(_opts.Minutes)
-            });
-
-            return list;
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "Policy SP failed for {UserKey}", idKey);
-            // Fail closed for writes: empty policies => no edit allowed
-            return Array.Empty<string>();
-        }
+  "PortalLogging": {
+    "Directory": "D:\\ProjectName\\Logs",
+    "MinimumLevel": "Information"
+  },
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Information",
+      "Override": {
+        "Microsoft": "Warning",
+        "Microsoft.AspNetCore": "Warning",
+        "System": "Warning"
+      }
     }
+  },
+  "ConnectionStrings": {
+    "AppDb": "Server=...;Database=...;User Id=...;Password=...;"
+  },
+  "Auth": {
+    "Headers": {
+      "HeaderUserName": "pzid",
+      "HeaderEid": "eid",
+      "HeaderEmail": "email",
+      "HeaderFirst": "firstName",
+      "HeaderLast": "lastName",
+      "AllowHeaderFallbackInDevelopment": true
+    },
+    "PolicyCache": {
+      "Minutes": 5
+    }
+  }
 }
