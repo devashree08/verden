@@ -1,26 +1,21 @@
-#nullable enable
-using System.Security.Claims;
-using YourApp.Authorization;
+[User] → [Apigee] → [Agent A: Coordinator]
+                    │             ▲
+                    │ MCP         │ A2A response
+                    ▼             │ (signed, short-lived delegation)
+             [MCP BigQuery Tool]──┘
+                    │
+                    ▼
+               [BigQuery]
 
-namespace YourApp.Extensions;
+[Agent A] --A2A (intent: triage_vulns, delegation)--> [Agent B: Triage]
+                                                        │       ▲
+                                                        │ MCP   │ results
+                                                        ▼       │
+                                          [MCP JIRA Tool or JIRA API via Apigee]──►[JIRA]
 
-public static class ClaimsPrincipalExtensions
-{
-    // pzid (stamped as Name by SSO middleware)
-    public static string? GetUserName(this ClaimsPrincipal u)
-        => u.Identity?.Name;
-
-    public static string? GetFirstName(this ClaimsPrincipal u)
-        => u.FindFirst(PortalClaimTypes.GivenName)?.Value;
-
-    public static string? GetLastName(this ClaimsPrincipal u)
-        => u.FindFirst(PortalClaimTypes.Surname)?.Value;
-
-    // No fallbacks: just "First Last" if present, otherwise empty string
-    public static string GetDisplayNameStrict(this ClaimsPrincipal u)
-    {
-        var first = u.GetFirstName();
-        var last  = u.GetLastName();
-        return string.Join(' ', new[] { first, last }.Where(s => !string.IsNullOrWhiteSpace(s)));
-    }
-}
+[JIRA Webhook] → [Apigee] → [Agent C: Validation]
+                                  │ MCP
+                                  ▼
+                         [MCP BigQuery Tool]──►[BigQuery]
+                                  │
+                                  └──► Update JIRA (close/reopen)
