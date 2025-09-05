@@ -12,3 +12,392 @@ POOL_SIZE=8
 API_KEY=super-secret-key
 REGISTRY_PATH=./procs.registry.json
 LOG_LEVEL=INFO
+
+
+{
+  "project": "apps-service",
+  "endpoints": [
+    {
+      "schema": "dbo",
+      "proc": "spGetAppsByUser",
+      "path": "/apps/latest",
+      "method": "GET",
+      "summary": "Get apps visible to a user (latest reportmonth)",
+      "description": "Calls dbo.spGetAppsByUser(@UserId, @AppIds). Use GET for read-only procs."
+    }
+  ]
+}
+
+
+
+import os
+import queue
+import logging
+from typing import Any, Dict, List
+
+import pyodbc
+from dotenv import load_dotenv
+
+load_dotenv()
+logger = logging.getLogger("db")
+
+def build_conn_str() -> str:
+    driver   = os.getenv("SQLSERVER_DRIVER", "ODBC Driver 18 for SQL Server")
+    server   = os.getenv("SQLSERVER_SERVER")
+    database = os.getenv("SQLSERVER_DATABASE")
+    encrypt  = os.getenv("SQLSERVER_ENCRYPT", "yes")
+    tsc      = os.getenv("SQLSERVER_TRUSTCERT", "no")
+    if not (server and database):
+        raise RuntimeError("Missing SQL Server env vars; check .env")
+    return f"Driver={{{driver}}};Server={server};Database={database};Encrypt={encrypt};TrustServerCertificate={tsc};".format(driver=driver)
+
+CONN_STR = build_conn_str()
+UID = os.getenv("SQLSERVER_UID")
+PWD = os.getenv("SQLSERVER_PWD")
+POOL_SIZE = int(os.getenv("POOL_SIZE", "8"))
+
+class ODBCConnectionPool:
+    """Very small synchronous ODBC pool for FastAPI workers."""
+    def __init__(self, size: int):
+        self._q: "queue.Queue[pyodbc.Connection]" = queue.Queue(maxsize=size)
+        for _ in range(size):
+            cnxn = pyodbc.connect(CONN_STR, user=UID, password=PWD, autocommit=True, timeout=30)
+            self._q.put(cnxn)
+    def get(self) -> pyodbc.Connection:
+        return self._q.get()
+    def put(self, cnxn: pyodbc.Connection):
+        self._q.put(cnxn)
+
+def get_proc_parameters(pool: ODBCConnectionPool, schema: str, proc: str) -> List[Dict[str, Any]]:
+    """
+    Return parameter metadata for a stored proc (input + output).
+    Fields: ordinal, name, is_output, sql_type, max_length, precision, scale, has_default
+    """
+    cnxn = pool.get()
+    try:
+        cur = cnxn.cursor()
+        cur.execute("""
+            SELECT p.parameter_id AS ordinal,
+                   REPLACE(p.name,'@','') AS name,
+                   p.is_output,
+                   t.name AS sql_type,
+                   p.max_length, p.precision, p.scale,
+                   p.has_default_value
+            FROM sys.parameters p
+            JOIN sys.types t ON p.user_type_id = t.user_type_id
+            WHERE p.object_id = OBJECT_ID(?)
+            ORDER BY p.parameter_id;
+        """, (f"[{schema}].[{proc}]",))
+        return [{
+            "ordinal": r[0],
+            "name": r[1],
+            "is_output": bool(r[2]),
+            "sql_type": r[3].lower(),
+            "max_length": r[4],
+            "precision": r[5],
+            "scale": r[6],
+            "has_default": bool(r[7]),
+        } for r in cur.fetchall()]
+    finally:
+        pool.put(cnxn)
+
+def _coerce(sql_type: str, value: Any) -> Any:
+    """Best-effort coercion from JSON → SQL type; ODBC will validate further."""
+    if value is None:
+        return None
+    t = sql_type.lower()
+    try:
+        if t in ("int", "smallint", "tinyint", "bigint"):
+            return int(value)
+        if t in ("bit",):
+            return str(value).strip().lower() in ("1", "true", "yes")
+        if t in ("decimal", "numeric", "money", "smallmoney", "float", "real"):
+            return float(value)
+        # Let ODBC parse ISO-8601 strings for date/time/uniqueidentifier etc.
+        return str(value)
+    except Exception:
+        return value  # db will error; API layer will wrap
+
+def exec_proc(pool: ODBCConnectionPool, schema: str, proc: str, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Execute a stored procedure with named-args dict (input params only).
+    Returns rows from SELECT as list[dict]. Missing required param -> raises KeyError(name).
+    """
+    cnxn = pool.get()
+    try:
+        cur = cnxn.cursor()
+        meta = get_proc_parameters(pool, schema, proc)
+        in_params = [p for p in meta if not p["is_output"]]
+        # Bind inputs by ordinal order
+        bound = []
+        for p in sorted(in_params, key=lambda x: x["ordinal"]):
+            name = p["name"]
+            if name not in args or args[name] is None:
+                if not p["has_default"]:
+                    raise KeyError(name)
+                val = None
+            else:
+                val = _coerce(p["sql_type"], args[name])
+            bound.append(val)
+
+        placeholders = ", ".join("?" for _ in bound)
+        call = f"{{CALL [{schema}].[{proc}] ({placeholders})}}" if bound else f"{{CALL [{schema}].[{proc}]}}"
+        cur.execute(call, tuple(bound))
+        cols = [c[0] for c in cur.description] if cur.description else []
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()] if cur.description else []
+        return rows
+    finally:
+        pool.put(cnxn)
+
+
+
+
+
+
+import os
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, APIRouter, Request, Depends, Body, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.openapi.utils import get_openapi
+
+from db import ODBCConnectionPool, get_proc_parameters, exec_proc, POOL_SIZE
+
+# ------------------------------------------------------------------------------
+# Startup/config
+# ------------------------------------------------------------------------------
+load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("api")
+
+API_KEY = os.getenv("API_KEY", "super-secret-key")
+REGISTRY_PATH = os.getenv("REGISTRY_PATH", "./procs.registry.json")
+
+def require_api_key(request: Request):
+    if request.headers.get("X-API-Key") != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail={"fault": {"faultstring": "Unauthorized", "detail": {"errorcode": "E_UNAUTHORIZED"}}},
+        )
+
+def error_response(status_code: int, faultstring: str, codes: str | List[str]) -> JSONResponse:
+    detail = [{"errorcode": c} for c in codes] if isinstance(codes, list) else {"errorcode": codes}
+    return JSONResponse(status_code=status_code, content={"fault": {"faultstring": faultstring, "detail": detail}})
+
+def load_registry() -> Dict[str, Any]:
+    if not os.path.exists(REGISTRY_PATH):
+        raise FileNotFoundError(f"Registry not found: {REGISTRY_PATH}")
+    with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+registry = load_registry()
+
+app = FastAPI(
+    title=os.getenv("API_TITLE", "ProcBridge API"),
+    version=os.getenv("API_VERSION", "1.0.0"),
+    description="Expose only the stored procedures explicitly listed in procs.registry.json.",
+)
+router = APIRouter()
+pool: Optional[ODBCConnectionPool] = None
+
+@app.on_event("startup")
+def _startup():
+    global pool
+    pool = ODBCConnectionPool(size=POOL_SIZE)
+    _register_from_registry()
+
+# ------------------------------------------------------------------------------
+# Route registration (only what YOU listed)
+# ------------------------------------------------------------------------------
+def _register_from_registry():
+    for ep in registry.get("endpoints", []):
+        _register_endpoint(ep)
+    app.include_router(router)
+
+def _register_endpoint(ep: Dict[str, Any]):
+    """
+    Create a route for one stored proc:
+      - GET => query string params (read-only)
+      - POST => JSON body (upserts)
+    """
+    required_keys = {"schema", "proc", "path", "method"}
+    missing = required_keys - set(ep)
+    if missing:
+        raise RuntimeError(f"Registry entry missing keys: {missing}")
+
+    schema = ep["schema"]
+    proc   = ep["proc"]
+    path   = ep["path"]
+    method = ep["method"].upper()
+    summary = ep.get("summary", f"Execute {schema}.{proc}")
+    description = ep.get("description", "")
+
+    if method == "GET":
+        async def handler(request: Request, _auth=Depends(require_api_key)):
+            try:
+                meta = get_proc_parameters(pool, schema, proc)
+                query = dict(request.query_params)
+                args: Dict[str, Any] = {}
+                missing: List[str] = []
+                for p in meta:
+                    if p["is_output"]:
+                        continue
+                    name = p["name"]
+                    if name in query:
+                        args[name] = query[name]
+                    elif not p["has_default"]:
+                        missing.append(name)
+                if missing:
+                    # Return 400 with your 42C error schema listing missing params
+                    return error_response(400, "Bad Request", [f"E_MISSING_{m.upper()}" for m in missing])
+                rows = exec_proc(pool, schema, proc, args)
+                return {"rows": rows}
+            except KeyError as k:
+                return error_response(400, "Bad Request", f"E_MISSING_{str(k).strip('\"').upper()}")
+            except Exception:
+                logger.exception("GET exec failed for %s.%s", schema, proc)
+                return error_response(500, "Server error", "E_SERVER")
+
+        router.add_api_route(
+            path,
+            handler,
+            methods=["GET"],
+            name=f"{schema}.{proc}",
+            summary=summary,
+            description=description,
+            responses={
+                400: {"description": "Bad Request"},
+                401: {"description": "Unauthorized"},
+                500: {"description": "Server Error"}
+            },
+        )
+
+    elif method == "POST":
+        async def handler(payload: Dict[str, Any] = Body(...), _auth=Depends(require_api_key)):
+            try:
+                if not isinstance(payload, dict):
+                    return error_response(400, "Bad Request", "E_BODY_NOT_OBJECT")
+                rows = exec_proc(pool, schema, proc, payload)
+                return {"rows": rows}
+            except KeyError as k:
+                return error_response(400, "Bad Request", f"E_MISSING_{str(k).strip('\"').upper()}")
+            except Exception:
+                logger.exception("POST exec failed for %s.%s", schema, proc)
+                return error_response(500, "Server error", "E_SERVER")
+
+        router.add_api_route(
+            path,
+            handler,
+            methods=["POST"],
+            name=f"{schema}.{proc}",
+            summary=summary,
+            description=description,
+            responses={
+                400: {"description": "Bad Request"},
+                401: {"description": "Unauthorized"},
+                500: {"description": "Server Error"}
+            },
+        )
+    else:
+        raise RuntimeError(f"Unsupported method '{method}'. Use GET or POST.")
+
+# ------------------------------------------------------------------------------
+# OpenAPI 3.1 + your 42C error schema + query param enrichment for GET
+# ------------------------------------------------------------------------------
+def custom_openapi():
+    schema = get_openapi(
+        title=app.title, version=app.version, description=app.description, routes=app.routes
+    )
+    schema["openapi"] = "3.1.0"
+
+    comps = schema.setdefault("components", {}).setdefault("schemas", {})
+    comps["ErrorResponse"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "fault": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "faultstring": {"type": "string"},
+                    "detail": {
+                        "oneOf": [
+                            {"type": "object", "properties": {"errorcode": {"type": "string"}}, "additionalProperties": False},
+                            {"type": "array", "maxItems": 10, "items": {
+                                "type": "object", "properties": {"errorcode": {"type": "string"}}, "additionalProperties": False
+                            }}
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    # Document security
+    schema["components"].setdefault("securitySchemes", {})
+    schema["components"]["securitySchemes"]["apiKeyAuth"] = {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+    schema["security"] = [{"apiKeyAuth": []}]
+
+    # For GET procs: inject strict query parameter schemas based on sys.parameters
+    paths = schema.get("paths", {})
+    for ep in registry.get("endpoints", []):
+        if ep.get("method", "GET").upper() != "GET":
+            continue
+        s, p, path = ep["schema"], ep["proc"], ep["path"]
+        try:
+            meta = get_proc_parameters(pool, s, p)
+        except Exception:
+            continue
+
+        # map SQL types → OpenAPI types
+        def oa_type(sql: str) -> Dict[str, Any]:
+            sql = sql.lower()
+            if sql in ("int", "smallint", "tinyint", "bigint"):
+                return {"type": "integer"}
+            if sql in ("decimal", "numeric", "money", "smallmoney", "float", "real"):
+                return {"type": "number"}
+            if sql == "bit":
+                return {"type": "boolean"}
+            return {"type": "string"}
+
+        params = []
+        for prm in meta:
+            if prm["is_output"]:
+                continue
+            params.append({
+                "name": prm["name"],
+                "in": "query",
+                "required": (not prm["has_default"]),
+                "schema": oa_type(prm["sql_type"]),
+                "description": prm["sql_type"].upper()
+            })
+
+        try:
+            op = paths[path]["get"]
+            op["parameters"] = params
+            # attach error schema to responses
+            for sc in ("400", "401", "500"):
+                op.setdefault("responses", {}).setdefault(
+                    sc,
+                    {"description": "", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+                )
+        except KeyError:
+            pass
+
+    return schema
+
+app.openapi = custom_openapi
+
+# ------------------------------------------------------------------------------
+# Local run helper
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+
+
+
+
+
