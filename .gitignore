@@ -1,125 +1,135 @@
-def enrich_openapi(spec: Dict[str, Any], endpoints: List[Dict[str, Any]], pool: ODBCConnectionPool) -> Dict[str, Any]:
-    spec["openapi"] = "3.1.0"
+import os
+import logging
+from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager
 
-    # servers (optional but useful for scans)
-    spec.setdefault("servers", [{"url": "/"}])
+from dotenv import load_dotenv
+from fastapi import FastAPI, APIRouter, Request, Depends, Body, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.openapi.utils import get_openapi
 
-    comps = spec.setdefault("components", {}).setdefault("schemas", {})
-    comps["ErrorResponse"] = {
-        "type":"object","additionalProperties":False,
-        "properties":{
-            "fault":{
-                "type":"object","additionalProperties":False,
-                "properties":{
-                    "faultstring":{"type":"string"},
-                    "detail":{
-                        "oneOf":[
-                            {"type":"object","properties":{"errorcode":{"type":"string"}},"additionalProperties":False},
-                            {"type":"array","maxItems":10,"items":{"type":"object","properties":{"errorcode":{"type":"string"}},"additionalProperties":False}}
-                        ]
-                    }
-                }
-            }
-        }
-    }
+from db import ODBCConnectionPool, exec_proc, POOL_SIZE
+from contract import load_registry, build_param_contract, required_overrides_from_specs, validate_params, enrich_openapi
 
-    # Security
-    spec["components"].setdefault("securitySchemes", {})
-    spec["components"]["securitySchemes"]["apiKeyAuth"] = {"type":"apiKey","in":"header","name":"X-API-Key"}
-    spec["security"] = [{"apiKeyAuth": []}]
+# ------------------------------------------------------------------------------
+# Setup
+# ------------------------------------------------------------------------------
+load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("api")
 
-    def attach_common_errors(op: Dict[str, Any], method: str):
-        # Always include 400 (client input), 401/403 (since security is applied), 404 (not found), 415 (bad media for POST), 500
-        errors = ["400", "401", "403", "404", "500"]
-        if method == "POST":
-            errors.append("415")
-        for sc in errors:
-            op.setdefault("responses", {}).setdefault(
-                sc,
-                {"description":"", "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},
-            )
+API_KEY = os.getenv("API_KEY", "super-secret-key")
+REGISTRY_PATH = os.getenv("REGISTRY_PATH", "./procs.registry.json")
 
-    for ep in endpoints:
-        schema, proc, path, method = ep["schema"], ep["proc"], ep["path"], ep["method"].upper()
-        reg_params = ep.get("params", None)
-        specs_list = build_param_contract(pool, schema, proc, method, reg_params)
-        response_model = ep.get("response")
+def require_api_key(request: Request):
+    if request.headers.get("X-API-Key") != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail={"fault": {"faultstring": "Unauthorized", "detail": {"errorcode": "E_UNAUTHORIZED"}}},
+        )
 
-        if method == "GET":
-            try:
-                getop = spec["paths"][path]["get"]
-            except KeyError:
-                continue
-            # Query parameters from auto-contract
-            params = []
-            for s in specs_list:
-                if s["in"] != "query": 
-                    continue
-                sch: Dict[str, Any] = {"type": s["type"]}
-                for k in ("maxLength","minLength","pattern","format","enum","example"):
-                    if k in s: sch[k] = s[k]
-                params.append({
-                    "name": s["name"],
-                    "in": "query",
-                    "required": bool(s.get("required", False)),
-                    "schema": sch,
-                    "description": s.get("description","")
-                })
-            getop["parameters"] = params
+def error_response(status_code: int, faultstring: str, codes: str | List[str]) -> JSONResponse:
+    detail = [{"errorcode": c} for c in codes] if isinstance(codes, list) else {"errorcode": codes}
+    return JSONResponse(status_code=status_code, content={"fault": {"faultstring": faultstring, "detail": detail}})
 
-            # 200 response
-            if response_model and isinstance(response_model, dict):
-                getop.setdefault("responses", {}).setdefault(
-                    "200", {"description":"OK","content":{"application/json":{"schema": response_model}}}
-                )
-            else:
-                # fallback: generic rows array (dev can tighten later in registry)
-                getop.setdefault("responses", {}).setdefault(
-                    "200", {"description":"OK","content":{"application/json":{"schema":{
-                        "type":"object","additionalProperties":False,
-                        "properties":{"rows":{"type":"array","items":{"type":"object","additionalProperties":True}}}
-                    }}}}
-                )
+# ------------------------------------------------------------------------------
+# Lifespan (no deprecated on_event)
+# ------------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = ODBCConnectionPool(size=POOL_SIZE)
+    app.state.registry = load_registry(REGISTRY_PATH)
+    register_from_registry(app)
+    yield
 
-            attach_common_errors(getop, "GET")
+app = FastAPI(
+    title=os.getenv("API_TITLE", "ProcBridge API"),
+    version=os.getenv("API_VERSION", "1.0.0"),
+    description="Expose selected stored procedures as APIs. Contracts auto-generated from SQL metadata with tiny overrides.",
+    lifespan=lifespan,
+)
 
-        elif method == "POST":
-            try:
-                postop = spec["paths"][path]["post"]
-            except KeyError:
-                continue
-            # requestBody from body params
-            props: Dict[str, Any] = {}
-            required_props: List[str] = []
-            for s in specs_list:
-                if s["in"] != "body": 
-                    continue
-                sch: Dict[str, Any] = {"type": s["type"]}
-                for k in ("maxLength","minLength","pattern","format","enum","example"):
-                    if k in s: sch[k] = s[k]
-                props[s["name"]] = sch
-                if s.get("required", False):
-                    required_props.append(s["name"])
-            postop["requestBody"] = {
-                "required": True,
-                "content": {"application/json": {"schema":{
-                    "type":"object","properties":props,"required":required_props,"additionalProperties":False
-                }}}
-            }
+router = APIRouter()
 
-            # 200 response
-            if response_model and isinstance(response_model, dict):
-                postop.setdefault("responses", {}).setdefault(
-                    "200", {"description":"OK","content":{"application/json":{"schema": response_model}}}
-                )
-            else:
-                postop.setdefault("responses", {}).setdefault(
-                    "200", {"description":"OK","content":{"application/json":{"schema":{
-                        "type":"object","additionalProperties":False,
-                        "properties":{"rows":{"type":"array","items":{"type":"object","additionalProperties":True}}}
-                    }}}}
-                )
+# ------------------------------------------------------------------------------
+# Dynamic routes
+# ------------------------------------------------------------------------------
+def register_from_registry(app: FastAPI):
+    for ep in app.state.registry.get("endpoints", []):
+        register_endpoint(app, ep)
+    app.include_router(router)
 
-            attach_common_errors(postop, "POST")
+def register_endpoint(app: FastAPI, ep: Dict[str, Any]):
+    schema = ep["schema"]; proc = ep["proc"]; path = ep["path"]; method = ep["method"].upper()
+    summary = ep.get("summary", f"Execute {schema}.{proc}")
+    description = ep.get("description", "")
 
-    return spec
+    async def handle_get(request: Request, _auth=Depends(require_api_key)):
+        try:
+            pool: ODBCConnectionPool = request.app.state.pool
+            specs = build_param_contract(pool, schema, proc, "GET", ep.get("params"))
+            # pull & validate query
+            query = dict(request.query_params)
+            errcodes = validate_params(specs, query, source="query")
+            if errcodes:
+                return error_response(400, "Bad Request", errcodes[:10])
+            # build args dict only from declared query params
+            args = {s["name"]: query.get(s["name"]) for s in specs if s["in"] == "query" and s["name"] in query}
+            rows = exec_proc(pool, schema, proc, args, required_overrides=required_overrides_from_specs(specs))
+            return {"rows": rows}
+        except KeyError as k:
+            return error_response(400, "Bad Request", f"E_MISSING_{str(k).strip('\"').upper()}")
+        except Exception:
+            logger.exception("GET exec failed for %s.%s", schema, proc)
+            return error_response(500, "Server error", "E_SERVER")
+
+    async def handle_post(payload: Dict[str, Any] = Body(...), request: Request = None, _auth=Depends(require_api_key)):
+        try:
+            if not isinstance(payload, dict):
+                return error_response(400, "Bad Request", "E_BODY_NOT_OBJECT")
+            pool: ODBCConnectionPool = request.app.state.pool
+            specs = build_param_contract(pool, schema, proc, "POST", ep.get("params"))
+            errcodes = validate_params(specs, payload, source="body")
+            if errcodes:
+                return error_response(400, "Bad Request", errcodes[:10])
+            rows = exec_proc(pool, schema, proc, payload, required_overrides=required_overrides_from_specs(specs))
+            return {"rows": rows}
+        except KeyError as k:
+            return error_response(400, "Bad Request", f"E_MISSING_{str(k).strip('\"').upper()}")
+        except Exception:
+            logger.exception("POST exec failed for %s.%s", schema, proc)
+            return error_response(500, "Server error", "E_SERVER")
+
+    if method == "GET":
+        router.add_api_route(
+            path, handle_get, methods=["GET"], name=f"{schema}.{proc}",
+            summary=summary, description=description,
+            responses={200: {"description":"OK"}, 400: {"description":"Bad Request"}, 401: {"description":"Unauthorized"}, 500: {"description":"Server Error"}},
+        )
+    elif method == "POST":
+        router.add_api_route(
+            path, handle_post, methods=["POST"], name=f"{schema}.{proc}",
+            summary=summary, description=description,
+            responses={200: {"description":"OK"}, 400: {"description":"Bad Request"}, 401: {"description":"Unauthorized"}, 500: {"description":"Server Error"}},
+        )
+    else:
+        raise RuntimeError(f"Unsupported method '{method}'. Use GET or POST.")
+
+# ------------------------------------------------------------------------------
+# OpenAPI 3.1 with 42C error schema + auto params/requestBody + security
+# ------------------------------------------------------------------------------
+def custom_openapi():
+    spec = get_openapi(
+        title=app.title, version=app.version, description=app.description, routes=app.routes
+    )
+    # let contract builder enrich the spec based on SQL metadata + tiny overrides
+    return enrich_openapi(spec, app.state.registry.get("endpoints", []), app.state.pool)
+
+app.openapi = custom_openapi
+
+# ------------------------------------------------------------------------------
+# Local run helper
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
