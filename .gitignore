@@ -1,3 +1,56 @@
+import os, logging
+from typing import Any
+
+from dotenv import load_dotenv
+from fastmcp import FastMCP, ToolParam, ToolReturn
+
+from db import ODBCConnectionPool, get_proc_parameters, exec_proc
+from registry import load_registry
+
+load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+logger = logging.getLogger("mcp")
+
+mcp = FastMCP("ProcBridge-MCP")
+pool = ODBCConnectionPool(size=int(os.getenv("POOL_SIZE","8")))
+reg = load_registry()
+
+def register_tool(schema: str, proc: str, tool_name: str):
+    params = get_proc_parameters(pool, schema, proc)
+    tool_params = []
+    for p in params:
+        if p["is_output"]: 
+            continue
+        sql = p["sql_type"].lower()
+        pt = "string"
+        if sql in ("int","smallint","tinyint","bigint","decimal","numeric","float","real"): pt = "number"
+        elif sql == "bit": pt = "boolean"
+        tool_params.append(ToolParam(name=p["name"], type=pt, required=not p["has_default"]))
+
+    @mcp.tool(name=tool_name, desc=f"Execute {schema}.{proc}", params=tool_params)
+    def _tool(**kwargs) -> ToolReturn:
+        try:
+            rows = exec_proc(pool, schema, proc, kwargs)
+            return ToolReturn.ok({"rows": rows})
+        except Exception:
+            return ToolReturn.error({"fault":{"faultstring":"MCP proc error","detail":{"errorcode":"E_MCP_PROC"}}})
+
+# Register tools only for endpoints in the registry
+for ep in reg.get("endpoints", []):
+    schema, proc = ep["schema"], ep["proc"]
+    # Use the endpoint path (without leading slash) as tool name for readability
+    tool_name = (ep.get("path","/proc").lstrip("/") or f"{schema}.{proc}").replace("/", ".")
+    try:
+        register_tool(schema, proc, tool_name)
+    except Exception:
+        logger.exception("Failed to register MCP tool for %s.%s", schema, proc)
+
+if __name__ == "__main__":
+    mcp.run()  # stdio transport by default
+
+
+
+
 import os
 import queue
 import logging
