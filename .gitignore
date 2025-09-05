@@ -1,163 +1,8 @@
-SQLSERVER_DRIVER=ODBC Driver 18 for SQL Server
-SQLSERVER_SERVER=tcp:myserver.database.windows.net,1433
-SQLSERVER_DATABASE=mydb
-SQLSERVER_UID=myuser
-SQLSERVER_PWD=mypassword
-SQLSERVER_ENCRYPT=yes
-SQLSERVER_TRUSTCERT=no
-
-API_TITLE=ProcBridge API
-API_VERSION=1.0.0
-POOL_SIZE=8
-API_KEY=super-secret-key
-REGISTRY_PATH=./procs.registry.json
-LOG_LEVEL=INFO
-
-
-{
-  "project": "apps-service",
-  "endpoints": [
-    {
-      "schema": "dbo",
-      "proc": "spGetAppsByUser",
-      "path": "/apps/latest",
-      "method": "GET",
-      "summary": "Get apps visible to a user (latest reportmonth)",
-      "description": "Calls dbo.spGetAppsByUser(@UserId, @AppIds). Use GET for read-only procs."
-    }
-  ]
-}
-
-
-
-import os
-import queue
-import logging
-from typing import Any, Dict, List
-
-import pyodbc
-from dotenv import load_dotenv
-
-load_dotenv()
-logger = logging.getLogger("db")
-
-def build_conn_str() -> str:
-    driver   = os.getenv("SQLSERVER_DRIVER", "ODBC Driver 18 for SQL Server")
-    server   = os.getenv("SQLSERVER_SERVER")
-    database = os.getenv("SQLSERVER_DATABASE")
-    encrypt  = os.getenv("SQLSERVER_ENCRYPT", "yes")
-    tsc      = os.getenv("SQLSERVER_TRUSTCERT", "no")
-    if not (server and database):
-        raise RuntimeError("Missing SQL Server env vars; check .env")
-    return f"Driver={{{driver}}};Server={server};Database={database};Encrypt={encrypt};TrustServerCertificate={tsc};".format(driver=driver)
-
-CONN_STR = build_conn_str()
-UID = os.getenv("SQLSERVER_UID")
-PWD = os.getenv("SQLSERVER_PWD")
-POOL_SIZE = int(os.getenv("POOL_SIZE", "8"))
-
-class ODBCConnectionPool:
-    """Very small synchronous ODBC pool for FastAPI workers."""
-    def __init__(self, size: int):
-        self._q: "queue.Queue[pyodbc.Connection]" = queue.Queue(maxsize=size)
-        for _ in range(size):
-            cnxn = pyodbc.connect(CONN_STR, user=UID, password=PWD, autocommit=True, timeout=30)
-            self._q.put(cnxn)
-    def get(self) -> pyodbc.Connection:
-        return self._q.get()
-    def put(self, cnxn: pyodbc.Connection):
-        self._q.put(cnxn)
-
-def get_proc_parameters(pool: ODBCConnectionPool, schema: str, proc: str) -> List[Dict[str, Any]]:
-    """
-    Return parameter metadata for a stored proc (input + output).
-    Fields: ordinal, name, is_output, sql_type, max_length, precision, scale, has_default
-    """
-    cnxn = pool.get()
-    try:
-        cur = cnxn.cursor()
-        cur.execute("""
-            SELECT p.parameter_id AS ordinal,
-                   REPLACE(p.name,'@','') AS name,
-                   p.is_output,
-                   t.name AS sql_type,
-                   p.max_length, p.precision, p.scale,
-                   p.has_default_value
-            FROM sys.parameters p
-            JOIN sys.types t ON p.user_type_id = t.user_type_id
-            WHERE p.object_id = OBJECT_ID(?)
-            ORDER BY p.parameter_id;
-        """, (f"[{schema}].[{proc}]",))
-        return [{
-            "ordinal": r[0],
-            "name": r[1],
-            "is_output": bool(r[2]),
-            "sql_type": r[3].lower(),
-            "max_length": r[4],
-            "precision": r[5],
-            "scale": r[6],
-            "has_default": bool(r[7]),
-        } for r in cur.fetchall()]
-    finally:
-        pool.put(cnxn)
-
-def _coerce(sql_type: str, value: Any) -> Any:
-    """Best-effort coercion from JSON → SQL type; ODBC will validate further."""
-    if value is None:
-        return None
-    t = sql_type.lower()
-    try:
-        if t in ("int", "smallint", "tinyint", "bigint"):
-            return int(value)
-        if t in ("bit",):
-            return str(value).strip().lower() in ("1", "true", "yes")
-        if t in ("decimal", "numeric", "money", "smallmoney", "float", "real"):
-            return float(value)
-        # Let ODBC parse ISO-8601 strings for date/time/uniqueidentifier etc.
-        return str(value)
-    except Exception:
-        return value  # db will error; API layer will wrap
-
-def exec_proc(pool: ODBCConnectionPool, schema: str, proc: str, args: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Execute a stored procedure with named-args dict (input params only).
-    Returns rows from SELECT as list[dict]. Missing required param -> raises KeyError(name).
-    """
-    cnxn = pool.get()
-    try:
-        cur = cnxn.cursor()
-        meta = get_proc_parameters(pool, schema, proc)
-        in_params = [p for p in meta if not p["is_output"]]
-        # Bind inputs by ordinal order
-        bound = []
-        for p in sorted(in_params, key=lambda x: x["ordinal"]):
-            name = p["name"]
-            if name not in args or args[name] is None:
-                if not p["has_default"]:
-                    raise KeyError(name)
-                val = None
-            else:
-                val = _coerce(p["sql_type"], args[name])
-            bound.append(val)
-
-        placeholders = ", ".join("?" for _ in bound)
-        call = f"{{CALL [{schema}].[{proc}] ({placeholders})}}" if bound else f"{{CALL [{schema}].[{proc}]}}"
-        cur.execute(call, tuple(bound))
-        cols = [c[0] for c in cur.description] if cur.description else []
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()] if cur.description else []
-        return rows
-    finally:
-        pool.put(cnxn)
-
-
-
-
-
-
 import os
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter, Request, Depends, Body, HTTPException
@@ -167,7 +12,7 @@ from fastapi.openapi.utils import get_openapi
 from db import ODBCConnectionPool, get_proc_parameters, exec_proc, POOL_SIZE
 
 # ------------------------------------------------------------------------------
-# Startup/config
+# Setup
 # ------------------------------------------------------------------------------
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -175,17 +20,6 @@ logger = logging.getLogger("api")
 
 API_KEY = os.getenv("API_KEY", "super-secret-key")
 REGISTRY_PATH = os.getenv("REGISTRY_PATH", "./procs.registry.json")
-
-def require_api_key(request: Request):
-    if request.headers.get("X-API-Key") != API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail={"fault": {"faultstring": "Unauthorized", "detail": {"errorcode": "E_UNAUTHORIZED"}}},
-        )
-
-def error_response(status_code: int, faultstring: str, codes: str | List[str]) -> JSONResponse:
-    detail = [{"errorcode": c} for c in codes] if isinstance(codes, list) else {"errorcode": codes}
-    return JSONResponse(status_code=status_code, content={"fault": {"faultstring": faultstring, "detail": detail}})
 
 def load_registry() -> Dict[str, Any]:
     if not os.path.exists(REGISTRY_PATH):
@@ -195,36 +29,49 @@ def load_registry() -> Dict[str, Any]:
 
 registry = load_registry()
 
+def require_api_key(request: Request):
+    if request.headers.get("X-API-Key") != API_KEY:
+        # 42C error schema for 401
+        raise HTTPException(
+            status_code=401,
+            detail={"fault": {"faultstring": "Unauthorized", "detail": {"errorcode": "E_UNAUTHORIZED"}}},
+        )
+
+def error_response(status_code: int, faultstring: str, codes: str | List[str]) -> JSONResponse:
+    detail = [{"errorcode": c} for c in codes] if isinstance(codes, list) else {"errorcode": codes}
+    return JSONResponse(status_code=status_code, content={"fault": {"faultstring": faultstring, "detail": detail}})
+
+# ------------------------------------------------------------------------------
+# Lifespan (no deprecated on_event)
+# ------------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = ODBCConnectionPool(size=POOL_SIZE)
+    # register endpoints before serving
+    register_from_registry(app)
+    yield
+    # optional: close connections on shutdown (pyodbc closes on process exit)
+
 app = FastAPI(
     title=os.getenv("API_TITLE", "ProcBridge API"),
     version=os.getenv("API_VERSION", "1.0.0"),
-    description="Expose only the stored procedures explicitly listed in procs.registry.json.",
+    description="Create APIs from selected stored procedures. GET for read-only procs; POST for upserts.",
+    lifespan=lifespan,
 )
+
 router = APIRouter()
-pool: Optional[ODBCConnectionPool] = None
-
-@app.on_event("startup")
-def _startup():
-    global pool
-    pool = ODBCConnectionPool(size=POOL_SIZE)
-    _register_from_registry()
 
 # ------------------------------------------------------------------------------
-# Route registration (only what YOU listed)
+# Dynamic routes for ONLY the procs you specify
 # ------------------------------------------------------------------------------
-def _register_from_registry():
+def register_from_registry(app: FastAPI):
     for ep in registry.get("endpoints", []):
-        _register_endpoint(ep)
+        register_endpoint(app, ep)
     app.include_router(router)
 
-def _register_endpoint(ep: Dict[str, Any]):
-    """
-    Create a route for one stored proc:
-      - GET => query string params (read-only)
-      - POST => JSON body (upserts)
-    """
-    required_keys = {"schema", "proc", "path", "method"}
-    missing = required_keys - set(ep)
+def register_endpoint(app: FastAPI, ep: Dict[str, Any]):
+    required = {"schema", "proc", "path", "method"}
+    missing = required - set(ep)
     if missing:
         raise RuntimeError(f"Registry entry missing keys: {missing}")
 
@@ -238,6 +85,7 @@ def _register_endpoint(ep: Dict[str, Any]):
     if method == "GET":
         async def handler(request: Request, _auth=Depends(require_api_key)):
             try:
+                pool: ODBCConnectionPool = request.app.state.pool
                 meta = get_proc_parameters(pool, schema, proc)
                 query = dict(request.query_params)
                 args: Dict[str, Any] = {}
@@ -251,7 +99,6 @@ def _register_endpoint(ep: Dict[str, Any]):
                     elif not p["has_default"]:
                         missing.append(name)
                 if missing:
-                    # Return 400 with your 42C error schema listing missing params
                     return error_response(400, "Bad Request", [f"E_MISSING_{m.upper()}" for m in missing])
                 rows = exec_proc(pool, schema, proc, args)
                 return {"rows": rows}
@@ -276,10 +123,11 @@ def _register_endpoint(ep: Dict[str, Any]):
         )
 
     elif method == "POST":
-        async def handler(payload: Dict[str, Any] = Body(...), _auth=Depends(require_api_key)):
+        async def handler(payload: Dict[str, Any] = Body(...), request: Request = None, _auth=Depends(require_api_key)):
             try:
                 if not isinstance(payload, dict):
                     return error_response(400, "Bad Request", "E_BODY_NOT_OBJECT")
+                pool: ODBCConnectionPool = request.app.state.pool
                 rows = exec_proc(pool, schema, proc, payload)
                 return {"rows": rows}
             except KeyError as k:
@@ -305,15 +153,15 @@ def _register_endpoint(ep: Dict[str, Any]):
         raise RuntimeError(f"Unsupported method '{method}'. Use GET or POST.")
 
 # ------------------------------------------------------------------------------
-# OpenAPI 3.1 + your 42C error schema + query param enrichment for GET
+# OpenAPI 3.1 + 42C error schema + query param enrichment for GET endpoints
 # ------------------------------------------------------------------------------
 def custom_openapi():
-    schema = get_openapi(
+    spec = get_openapi(
         title=app.title, version=app.version, description=app.description, routes=app.routes
     )
-    schema["openapi"] = "3.1.0"
+    spec["openapi"] = "3.1.0"
 
-    comps = schema.setdefault("components", {}).setdefault("schemas", {})
+    comps = spec.setdefault("components", {}).setdefault("schemas", {})
     comps["ErrorResponse"] = {
         "type": "object",
         "additionalProperties": False,
@@ -335,69 +183,62 @@ def custom_openapi():
             }
         }
     }
-    # Document security
-    schema["components"].setdefault("securitySchemes", {})
-    schema["components"]["securitySchemes"]["apiKeyAuth"] = {"type": "apiKey", "in": "header", "name": "X-API-Key"}
-    schema["security"] = [{"apiKeyAuth": []}]
+    # Security: API key header
+    spec["components"].setdefault("securitySchemes", {})
+    spec["components"]["securitySchemes"]["apiKeyAuth"] = {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+    spec["security"] = [{"apiKeyAuth": []}]
 
-    # For GET procs: inject strict query parameter schemas based on sys.parameters
-    paths = schema.get("paths", {})
-    for ep in registry.get("endpoints", []):
-        if ep.get("method", "GET").upper() != "GET":
-            continue
-        s, p, path = ep["schema"], ep["proc"], ep["path"]
-        try:
-            meta = get_proc_parameters(pool, s, p)
-        except Exception:
-            continue
-
-        # map SQL types → OpenAPI types
-        def oa_type(sql: str) -> Dict[str, Any]:
-            sql = sql.lower()
-            if sql in ("int", "smallint", "tinyint", "bigint"):
-                return {"type": "integer"}
-            if sql in ("decimal", "numeric", "money", "smallmoney", "float", "real"):
-                return {"type": "number"}
-            if sql == "bit":
-                return {"type": "boolean"}
-            return {"type": "string"}
-
-        params = []
-        for prm in meta:
-            if prm["is_output"]:
+    # Enrich GET endpoints with strict query params from sys.parameters
+    paths = spec.get("paths", {})
+    pool: Optional[ODBCConnectionPool] = getattr(app.state, "pool", None)
+    if pool is not None:
+        for ep in registry.get("endpoints", []):
+            if ep.get("method", "GET").upper() != "GET":
                 continue
-            params.append({
-                "name": prm["name"],
-                "in": "query",
-                "required": (not prm["has_default"]),
-                "schema": oa_type(prm["sql_type"]),
-                "description": prm["sql_type"].upper()
-            })
+            s, p, path = ep["schema"], ep["proc"], ep["path"]
+            try:
+                meta = get_proc_parameters(pool, s, p)
+            except Exception:
+                continue
 
-        try:
-            op = paths[path]["get"]
-            op["parameters"] = params
-            # attach error schema to responses
-            for sc in ("400", "401", "500"):
-                op.setdefault("responses", {}).setdefault(
-                    sc,
-                    {"description": "", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
-                )
-        except KeyError:
-            pass
+            def oa_type(sql: str) -> Dict[str, Any]:
+                sql = sql.lower()
+                if sql in ("int", "smallint", "tinyint", "bigint"): return {"type": "integer"}
+                if sql in ("decimal", "numeric", "money", "smallmoney", "float", "real"): return {"type": "number"}
+                if sql == "bit": return {"type": "boolean"}
+                return {"type": "string"}
 
-    return schema
+            params = []
+            for prm in meta:
+                if prm["is_output"]:
+                    continue
+                params.append({
+                    "name": prm["name"],
+                    "in": "query",
+                    "required": (not prm["has_default"]),
+                    "schema": oa_type(prm["sql_type"]),
+                    "description": prm["sql_type"].upper()
+                })
+
+            try:
+                op = paths[path]["get"]
+                op["parameters"] = params
+                # attach error schema to responses
+                for sc in ("400", "401", "500"):
+                    op.setdefault("responses", {}).setdefault(
+                        sc,
+                        {"description": "", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+                    )
+            except KeyError:
+                pass
+
+    return spec
 
 app.openapi = custom_openapi
 
 # ------------------------------------------------------------------------------
-# Local run helper
+# Local run helper (Swagger at /docs)
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
-
-
-
-
-
