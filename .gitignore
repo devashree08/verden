@@ -1,52 +1,38 @@
-import os, logging
-from typing import Any
+SQLSERVER_DRIVER=ODBC Driver 18 for SQL Server
+SQLSERVER_SERVER=tcp:myserver.database.windows.net,1433
+SQLSERVER_DATABASE=mydb
+SQLSERVER_UID=myuser
+SQLSERVER_PWD=mypassword
+SQLSERVER_ENCRYPT=yes
+SQLSERVER_TRUSTCERT=no
 
-from dotenv import load_dotenv
-from fastmcp import FastMCP, ToolParam, ToolReturn
+API_TITLE=ProcBridge API
+API_VERSION=1.0.0
+POOL_SIZE=8
+API_KEY=super-secret-key
+REGISTRY_PATH=./procs.registry.json
+LOG_LEVEL=INFO
 
-from db import ODBCConnectionPool, get_proc_parameters, exec_proc
-from registry import load_registry
 
-load_dotenv()
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
-logger = logging.getLogger("mcp")
 
-mcp = FastMCP("ProcBridge-MCP")
-pool = ODBCConnectionPool(size=int(os.getenv("POOL_SIZE","8")))
-reg = load_registry()
+{
+  "project": "apps-service",
+  "endpoints": [
+    {
+      "schema": "dbo",
+      "proc": "spGetAppsByUser",
+      "path": "/apps/latest",
+      "method": "GET",
+      "summary": "Get apps visible to a user (latest reportmonth)",
+      "description": "Calls dbo.spGetAppsByUser(@UserId, @AppIds).",
+      "params": [
+        { "name": "UserId", "required": true },   // override: required
+        { "name": "AppIds", "required": false }   // optional; auto type & constraints
+      ]
+    }
+  ]
+}
 
-def register_tool(schema: str, proc: str, tool_name: str):
-    params = get_proc_parameters(pool, schema, proc)
-    tool_params = []
-    for p in params:
-        if p["is_output"]: 
-            continue
-        sql = p["sql_type"].lower()
-        pt = "string"
-        if sql in ("int","smallint","tinyint","bigint","decimal","numeric","float","real"): pt = "number"
-        elif sql == "bit": pt = "boolean"
-        tool_params.append(ToolParam(name=p["name"], type=pt, required=not p["has_default"]))
-
-    @mcp.tool(name=tool_name, desc=f"Execute {schema}.{proc}", params=tool_params)
-    def _tool(**kwargs) -> ToolReturn:
-        try:
-            rows = exec_proc(pool, schema, proc, kwargs)
-            return ToolReturn.ok({"rows": rows})
-        except Exception:
-            return ToolReturn.error({"fault":{"faultstring":"MCP proc error","detail":{"errorcode":"E_MCP_PROC"}}})
-
-# Register tools only for endpoints in the registry
-for ep in reg.get("endpoints", []):
-    schema, proc = ep["schema"], ep["proc"]
-    # Use the endpoint path (without leading slash) as tool name for readability
-    tool_name = (ep.get("path","/proc").lstrip("/") or f"{schema}.{proc}").replace("/", ".")
-    try:
-        register_tool(schema, proc, tool_name)
-    except Exception:
-        logger.exception("Failed to register MCP tool for %s.%s", schema, proc)
-
-if __name__ == "__main__":
-    mcp.run()  # stdio transport by default
 
 
 
@@ -148,10 +134,7 @@ def exec_proc(
 ) -> List[Dict[str, Any]]:
     """
     Execute a stored procedure with named-args dict (input params only).
-    'required_overrides' lets API layer force required/optional per param:
-      True  => required
-      False => optional
-      None/absent => use DB has_default
+    'required_overrides' lets API layer force required/optional per param.
     Returns rows from SELECT as list[dict]. Missing required param -> raises KeyError(name).
     """
     cnxn = pool.get()
@@ -163,7 +146,6 @@ def exec_proc(
         bound = []
         for p in sorted(in_params, key=lambda x: x["ordinal"]):
             name = p["name"]
-            # decide required using override first, else DB has_default
             is_required = True
             if required_overrides is not None and name in required_overrides:
                 is_required = required_overrides[name]
@@ -189,10 +171,345 @@ def exec_proc(
 
 
 
+import os
+import re
+import json
+from typing import Any, Dict, List, Optional
+
+from db import ODBCConnectionPool, get_proc_parameters
+
+# ---------------- Registry ----------------
+
+def load_registry(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Registry not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+# ---------------- Inference helpers ----------------
+
+_SQL_TO_OA = {
+    "int": "integer",
+    "smallint": "integer",
+    "tinyint": "integer",
+    "bigint": "integer",
+    "bit": "boolean",
+    "decimal": "number",
+    "numeric": "number",
+    "money": "number",
+    "smallmoney": "number",
+    "float": "number",
+    "real": "number",
+}
+
+def _is_string_type(sql: str) -> bool:
+    return sql in ("varchar","nvarchar","char","nchar","text","ntext","uniqueidentifier","sysname")
+
+def _infer_oa_type(sql_type: str) -> str:
+    return _SQL_TO_OA.get(sql_type.lower(), "string")
+
+def _infer_maxlen(sql_type: str, max_length: int) -> Optional[int]:
+    """
+    Infer string maxLength from SQL metadata:
+      - NVARCHAR: max_length is bytes; chars = max_length/2
+      - VARCHAR/CHAR: max_length is chars directly
+      - MAX types (-1): pick conservative default 4000
+    """
+    t = sql_type.lower()
+    if not _is_string_type(t):
+        return None
+    if max_length is None:
+        return None
+    if max_length < 0:  # MAX
+        return 4000
+    if t in ("nvarchar","nchar"):
+        return max_length // 2
+    return max_length
+
+def _infer_pattern(name: str, sql_type: str) -> Optional[str]:
+    """
+    Provide reasonable default regexes to please strict scanners without bloating the registry.
+    Keep conservative and safe:
+      - integer types: digits with optional leading '-'
+      - boolean: '0|1|true|false' (case-insensitive validated at runtime, but OA is case-insensitive by convention)
+      - likely CSV IDs param (name endswith 'ids' or contains 'list'): digits separated by commas
+      - GUIDs: basic UUID v4 pattern
+    """
+    t = sql_type.lower()
+    n = name.lower()
+    if t in ("int","smallint","tinyint","bigint"):
+        return r"^-?\d+$"
+    if t == "bit":
+        return r"^(?:0|1|true|false)$"
+    if t in ("uniqueidentifier",):
+        return r"^[0-9a-fA-F-]{36}$"
+    if _is_string_type(t):
+        if n.endswith("ids") or "id_list" in n or "ids_list" in n or "appids" in n:
+            return r"^\s*\d+(?:\s*,\s*\d+)*\s*$"
+    return None
+
+# ---------------- Contract builder ----------------
+
+def build_param_contract(
+    pool: ODBCConnectionPool,
+    schema: str,
+    proc: str,
+    method: str,
+    registry_params: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return a list of param specs:
+      [{ name, in, type, required, description?, pattern?, maxLength?, minLength?, enum? }, ...]
+    Sources:
+      - SQL metadata for discovery (names, sql types, lengths)
+      - Registry for minimal overrides (required or custom type/pattern/length if provided)
+    """
+    meta = get_proc_parameters(pool, schema, proc)
+    inputs = [m for m in meta if not m["is_output"]]
+    # Map registry overrides (by name)
+    reg_by_name = {p["name"]: p for p in (registry_params or []) if p.get("name")}
+
+    specs: List[Dict[str, Any]] = []
+    for m in inputs:
+        name = m["name"]
+        sql = m["sql_type"]
+        maxlen = _infer_maxlen(sql, m.get("max_length", None))
+        oa_type = _infer_oa_type(sql)
+        pattern = _infer_pattern(name, sql)
+
+        # default requiredness from DB; registry can override
+        required = not m["has_default"]
+        if name in reg_by_name and "required" in reg_by_name[name]:
+            required = bool(reg_by_name[name]["required"])
+
+        # source: GET=>query, POST=>body; registry can override "in"
+        param_in = "query" if method.upper() == "GET" else "body"
+        if name in reg_by_name and reg_by_name[name].get("in") in ("query","body"):
+            param_in = reg_by_name[name]["in"]
+
+        # allow user to specify type/pattern/maxLength explicitly if desired
+        if name in reg_by_name and "type" in reg_by_name[name]:
+            oa_type = reg_by_name[name]["type"]
+        if name in reg_by_name and "pattern" in reg_by_name[name]:
+            pattern = reg_by_name[name]["pattern"]
+        if name in reg_by_name and "maxLength" in reg_by_name[name]:
+            maxlen = reg_by_name[name]["maxLength"]
+
+        spec: Dict[str, Any] = {
+            "name": name,
+            "in": param_in,
+            "type": oa_type,
+            "required": required,
+            "description": reg_by_name.get(name, {}).get("description", sql.upper()),
+        }
+        if pattern:
+            spec["pattern"] = pattern
+        if isinstance(maxlen, int) and oa_type == "string":
+            # put a reasonable upper bound; scanners like to see limits
+            spec["maxLength"] = maxlen
+        # pass-through extras from registry if present
+        for k in ("minLength","enum","example","format"):
+            if name in reg_by_name and k in reg_by_name[name]:
+                spec[k] = reg_by_name[name][k]
+
+        specs.append(spec)
+
+    # If registry lists a param not found in SQL, include it (dev knows what they’re doing)
+    for name, r in reg_by_name.items():
+        if name not in {m["name"] for m in inputs}:
+            param_in = r.get("in") or ("query" if method.upper() == "GET" else "body")
+            spec = {
+                "name": name,
+                "in": param_in,
+                "type": r.get("type", "string"),
+                "required": bool(r.get("required", False)),
+                "description": r.get("description",""),
+            }
+            for k in ("pattern","maxLength","minLength","enum","example","format"):
+                if k in r: spec[k] = r[k]
+            specs.append(spec)
+
+    return specs
+
+def required_overrides_from_specs(specs: List[Dict[str, Any]]) -> Dict[str, bool]:
+    return {s["name"]: bool(s.get("required", False)) for s in specs}
+
+# ---------------- Runtime validation ----------------
+
+def validate_params(specs: List[Dict[str, Any]], carrier: Dict[str, Any], source: str) -> List[str]:
+    """
+    Validate param values in 'carrier' (query dict or body dict) according to specs with matching 'in' (query/body).
+    Returns list of error codes.
+    """
+    errors: List[str] = []
+    for s in specs:
+        if s["in"] != source:
+            continue
+        name = s["name"]
+        required = bool(s.get("required", False))
+        val = carrier.get(name)
+        if val is None:
+            if required:
+                errors.append(f"E_MISSING_{name.upper()}")
+            continue
+
+        # stringify for checks (OpenAPI recognizes types; at runtime we’re conservative)
+        v = str(val)
+        # length checks
+        if "maxLength" in s:
+            try:
+                if len(v) > int(s["maxLength"]):
+                    errors.append(f"E_PARAM_MAXLEN_{name.upper()}")
+            except Exception:
+                errors.append(f"E_PARAM_MAXLEN_{name.upper()}")
+        if "minLength" in s:
+            try:
+                if len(v) < int(s["minLength"]):
+                    errors.append(f"E_PARAM_MINLEN_{name.upper()}")
+            except Exception:
+                errors.append(f"E_PARAM_MINLEN_{name.upper()}")
+
+        # regex pattern
+        if "pattern" in s and s["pattern"]:
+            try:
+                if not re.fullmatch(s["pattern"], v):
+                    errors.append(f"E_PARAM_PATTERN_{name.upper()}")
+            except re.error:
+                errors.append(f"E_PARAM_PATTERN_{name.upper()}")
+
+        # enum
+        if "enum" in s and isinstance(s["enum"], list):
+            if v not in [str(x) for x in s["enum"]]:
+                errors.append(f"E_PARAM_ENUM_{name.upper()}")
+
+    return errors
+
+# ---------------- OpenAPI enrichment ----------------
+
+def enrich_openapi(spec: Dict[str, Any], endpoints: List[Dict[str, Any]], pool: ODBCConnectionPool) -> Dict[str, Any]:
+    """
+    Update OpenAPI spec to add:
+      - Global security scheme (apiKey)
+      - 42C ErrorResponse schema
+      - For GET: query parameters (with required/constraints) derived from auto-contract
+      - For POST: strict requestBody (additionalProperties: false)
+      - Generic 200 response (rows array) unless 'response' provided in registry
+    """
+    spec["openapi"] = "3.1.0"
+    comps = spec.setdefault("components", {}).setdefault("schemas", {})
+    comps["ErrorResponse"] = {
+        "type":"object","additionalProperties":False,
+        "properties":{
+            "fault":{
+                "type":"object","additionalProperties":False,
+                "properties":{
+                    "faultstring":{"type":"string"},
+                    "detail":{
+                        "oneOf":[
+                            {"type":"object","properties":{"errorcode":{"type":"string"}},"additionalProperties":False},
+                            {"type":"array","maxItems":10,"items":{"type":"object","properties":{"errorcode":{"type":"string"}},"additionalProperties":False}}
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    spec["components"].setdefault("securitySchemes", {})
+    spec["components"]["securitySchemes"]["apiKeyAuth"] = {"type":"apiKey","in":"header","name":"X-API-Key"}
+    spec["security"] = [{"apiKeyAuth": []}]
+
+    paths = spec.get("paths", {})
+    for ep in endpoints:
+        schema, proc, path, method = ep["schema"], ep["proc"], ep["path"], ep["method"].upper()
+        reg_params = ep.get("params", None)
+        specs = build_param_contract(pool, schema, proc, method, reg_params)
+        response_model = ep.get("response")
+
+        if method == "GET":
+            try:
+                getop = paths[path]["get"]
+            except KeyError:
+                continue
+            params = []
+            for s in specs:
+                if s["in"] != "query":
+                    continue
+                sch: Dict[str, Any] = {"type": s["type"]}
+                for k in ("maxLength","minLength","pattern","format","enum","example"):
+                    if k in s: sch[k] = s[k]
+                params.append({
+                    "name": s["name"],
+                    "in": "query",
+                    "required": bool(s.get("required", False)),
+                    "schema": sch,
+                    "description": s.get("description","")
+                })
+            getop["parameters"] = params
+            # Error responses
+            for sc in ("400","401","500"):
+                getop.setdefault("responses", {}).setdefault(
+                    sc,
+                    {"description":"", "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},
+                )
+            # 200 response
+            if response_model and isinstance(response_model, dict):
+                getop.setdefault("responses", {}).setdefault(
+                    "200", {"description":"OK","content":{"application/json":{"schema": response_model}}}
+                )
+            else:
+                getop.setdefault("responses", {}).setdefault(
+                    "200", {"description":"OK","content":{"application/json":{"schema":{
+                        "type":"object","additionalProperties":False,
+                        "properties":{"rows":{"type":"array","items":{"type":"object","additionalProperties":True}}}
+                    }}}}
+                )
+
+        elif method == "POST":
+            try:
+                postop = paths[path]["post"]
+            except KeyError:
+                continue
+            # requestBody – only body params
+            props: Dict[str, Any] = {}
+            required_props: List[str] = []
+            for s in specs:
+                if s["in"] != "body":
+                    continue
+                sch: Dict[str, Any] = {"type": s["type"]}
+                for k in ("maxLength","minLength","pattern","format","enum","example"):
+                    if k in s: sch[k] = s[k]
+                props[s["name"]] = sch
+                if s.get("required", False):
+                    required_props.append(s["name"])
+            postop["requestBody"] = {
+                "required": True,
+                "content": {"application/json": {"schema":{
+                    "type":"object","properties":props,"required":required_props,"additionalProperties":False
+                }}}
+            }
+            for sc in ("400","401","500"):
+                postop.setdefault("responses", {}).setdefault(
+                    sc,
+                    {"description":"", "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},
+                )
+            if response_model and isinstance(response_model, dict):
+                postop.setdefault("responses", {}).setdefault(
+                    "200", {"description":"OK","content":{"application/json":{"schema": response_model}}}
+                )
+            else:
+                postop.setdefault("responses", {}).setdefault(
+                    "200", {"description":"OK","content":{"application/json":{"schema":{
+                        "type":"object","additionalProperties":False,
+                        "properties":{"rows":{"type":"array","items":{"type":"object","additionalProperties":True}}}
+                    }}}}
+                )
+    return spec
+
+
+
 
 
 import os
-import json
 import logging
 from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
@@ -202,7 +519,8 @@ from fastapi import FastAPI, APIRouter, Request, Depends, Body, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
 
-from db import ODBCConnectionPool, get_proc_parameters, exec_proc, POOL_SIZE
+from db import ODBCConnectionPool, exec_proc, POOL_SIZE
+from contract import load_registry, build_param_contract, required_overrides_from_specs, validate_params, enrich_openapi
 
 # ------------------------------------------------------------------------------
 # Setup
@@ -213,14 +531,6 @@ logger = logging.getLogger("api")
 
 API_KEY = os.getenv("API_KEY", "super-secret-key")
 REGISTRY_PATH = os.getenv("REGISTRY_PATH", "./procs.registry.json")
-
-def load_registry() -> Dict[str, Any]:
-    if not os.path.exists(REGISTRY_PATH):
-        raise FileNotFoundError(f"Registry not found: {REGISTRY_PATH}")
-    with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-registry = load_registry()
 
 def require_api_key(request: Request):
     if request.headers.get("X-API-Key") != API_KEY:
@@ -234,271 +544,237 @@ def error_response(status_code: int, faultstring: str, codes: str | List[str]) -
     return JSONResponse(status_code=status_code, content={"fault": {"faultstring": faultstring, "detail": detail}})
 
 # ------------------------------------------------------------------------------
-# Lifespan
+# Lifespan (no deprecated on_event)
 # ------------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = ODBCConnectionPool(size=POOL_SIZE)
+    app.state.registry = load_registry(REGISTRY_PATH)
     register_from_registry(app)
     yield
 
 app = FastAPI(
     title=os.getenv("API_TITLE", "ProcBridge API"),
     version=os.getenv("API_VERSION", "1.0.0"),
-    description="Create APIs from selected stored procedures. GET for read-only procs; POST for upserts.",
+    description="Expose selected stored procedures as APIs. Contracts auto-generated from SQL metadata with tiny overrides.",
     lifespan=lifespan,
 )
 
 router = APIRouter()
 
 # ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-def params_required_map(ep_params: List[Dict[str, Any]]) -> Dict[str, bool]:
-    """
-    Build a {param_name: required_bool} map from registry params list.
-    If ep_params is missing or a param isn't listed, we'll fall back to DB defaults later.
-    """
-    m: Dict[str, bool] = {}
-    for p in ep_params or []:
-        name = p.get("name")
-        if not name:
-            continue
-        m[name] = bool(p.get("required", False))
-    return m
-
-def normalize_param_sources(ep_params: List[Dict[str, Any]], method: str) -> Dict[str, str]:
-    """
-    Returns {param_name: 'query'|'body'} based on registry (or default by method).
-    """
-    src: Dict[str, str] = {}
-    for p in ep_params or []:
-        name = p.get("name")
-        if not name:
-            continue
-        where = p.get("in")
-        if where in ("query", "body"):
-            src[name] = where
-        else:
-            src[name] = "query" if method == "GET" else "body"
-    return src
-
-def oa_type_from_registry_or_db(reg_type: Optional[str], db_sql_type: Optional[str]) -> Dict[str, Any]:
-    """
-    Map to OpenAPI schema type. Registry wins; DB type is fallback.
-    """
-    if reg_type in ("string", "integer", "number", "boolean"):
-        return {"type": reg_type}
-    if db_sql_type:
-        t = db_sql_type.lower()
-        if t in ("int","smallint","tinyint","bigint"): return {"type":"integer"}
-        if t in ("decimal","numeric","money","smallmoney","float","real"): return {"type":"number"}
-        if t == "bit": return {"type":"boolean"}
-    return {"type":"string"}
-
-# ------------------------------------------------------------------------------
-# Dynamic routes for ONLY the procs you specify
+# Dynamic routes
 # ------------------------------------------------------------------------------
 def register_from_registry(app: FastAPI):
-    for ep in registry.get("endpoints", []):
+    for ep in app.state.registry.get("endpoints", []):
         register_endpoint(app, ep)
     app.include_router(router)
 
 def register_endpoint(app: FastAPI, ep: Dict[str, Any]):
-    required = {"schema", "proc", "path", "method"}
-    missing = required - set(ep)
-    if missing:
-        raise RuntimeError(f"Registry entry missing keys: {missing}")
-
-    schema = ep["schema"]
-    proc   = ep["proc"]
-    path   = ep["path"]
-    method = ep["method"].upper()
+    schema = ep["schema"]; proc = ep["proc"]; path = ep["path"]; method = ep["method"].upper()
     summary = ep.get("summary", f"Execute {schema}.{proc}")
     description = ep.get("description", "")
-    ep_params = ep.get("params", [])  # ← your explicit params definition
-    req_map = params_required_map(ep_params)
-    src_map = normalize_param_sources(ep_params, method)
+
+    async def handle_get(request: Request, _auth=Depends(require_api_key)):
+        try:
+            pool: ODBCConnectionPool = request.app.state.pool
+            specs = build_param_contract(pool, schema, proc, "GET", ep.get("params"))
+            # pull & validate query
+            query = dict(request.query_params)
+            errcodes = validate_params(specs, query, source="query")
+            if errcodes:
+                return error_response(400, "Bad Request", errcodes[:10])
+            # build args dict only from declared query params
+            args = {s["name"]: query.get(s["name"]) for s in specs if s["in"] == "query" and s["name"] in query}
+            rows = exec_proc(pool, schema, proc, args, required_overrides=required_overrides_from_specs(specs))
+            return {"rows": rows}
+        except KeyError as k:
+            return error_response(400, "Bad Request", f"E_MISSING_{str(k).strip('\"').upper()}")
+        except Exception:
+            logger.exception("GET exec failed for %s.%s", schema, proc)
+            return error_response(500, "Server error", "E_SERVER")
+
+    async def handle_post(payload: Dict[str, Any] = Body(...), request: Request = None, _auth=Depends(require_api_key)):
+        try:
+            if not isinstance(payload, dict):
+                return error_response(400, "Bad Request", "E_BODY_NOT_OBJECT")
+            pool: ODBCConnectionPool = request.app.state.pool
+            specs = build_param_contract(pool, schema, proc, "POST", ep.get("params"))
+            errcodes = validate_params(specs, payload, source="body")
+            if errcodes:
+                return error_response(400, "Bad Request", errcodes[:10])
+            rows = exec_proc(pool, schema, proc, payload, required_overrides=required_overrides_from_specs(specs))
+            return {"rows": rows}
+        except KeyError as k:
+            return error_response(400, "Bad Request", f"E_MISSING_{str(k).strip('\"').upper()}")
+        except Exception:
+            logger.exception("POST exec failed for %s.%s", schema, proc)
+            return error_response(500, "Server error", "E_SERVER")
 
     if method == "GET":
-        async def handler(request: Request, _auth=Depends(require_api_key)):
-            try:
-                pool: ODBCConnectionPool = request.app.state.pool
-                meta = get_proc_parameters(pool, schema, proc)
-                query = dict(request.query_params)
-                args: Dict[str, Any] = {}
-                missing: List[str] = []
-
-                # Build arguments from query using registry as the contract
-                db_params_by_name = {p["name"]: p for p in meta if not p["is_output"]}
-                for p in ep_params:
-                    name = p["name"]
-                    if src_map.get(name, "query") != "query":
-                        continue  # ignore body-only on GET
-                    if name in query:
-                        args[name] = query[name]
-                    elif req_map.get(name, False):  # required per registry
-                        missing.append(name)
-
-                # Allow extra DB params not listed in registry only if DB says they have defaults
-                for name, p in db_params_by_name.items():
-                    if name in args or name in req_map:
-                        continue
-                    if not p["has_default"]:
-                        # not in registry and no default → treat as required and missing
-                        missing.append(name)
-
-                if missing:
-                    return error_response(400, "Bad Request", [f"E_MISSING_{m.upper()}" for m in missing])
-
-                rows = exec_proc(pool, schema, proc, args, required_overrides=req_map)
-                return {"rows": rows}
-            except KeyError as k:
-                return error_response(400, "Bad Request", f"E_MISSING_{str(k).strip('\"').upper()}")
-            except Exception:
-                logger.exception("GET exec failed for %s.%s", schema, proc)
-                return error_response(500, "Server error", "E_SERVER")
-
         router.add_api_route(
-            path,
-            handler,
-            methods=["GET"],
-            name=f"{schema}.{proc}",
-            summary=summary,
-            description=description,
-            responses={
-                400: {"description": "Bad Request"},
-                401: {"description": "Unauthorized"},
-                500: {"description": "Server Error"}
-            },
+            path, handle_get, methods=["GET"], name=f"{schema}.{proc}",
+            summary=summary, description=description,
+            responses={200: {"description":"OK"}, 400: {"description":"Bad Request"}, 401: {"description":"Unauthorized"}, 500: {"description":"Server Error"}},
         )
-
     elif method == "POST":
-        async def handler(payload: Dict[str, Any] = Body(...), request: Request = None, _auth=Depends(require_api_key)):
-            try:
-                if not isinstance(payload, dict):
-                    return error_response(400, "Bad Request", "E_BODY_NOT_OBJECT")
-                pool: ODBCConnectionPool = request.app.state.pool
-                # Registry drives required/optional
-                missing = [p["name"] for p in ep_params if src_map.get(p["name"], "body") == "body" and p.get("required", False) and payload.get(p["name"]) is None]
-                if missing:
-                    return error_response(400, "Bad Request", [f"E_MISSING_{m.upper()}" for m in missing])
-
-                rows = exec_proc(pool, schema, proc, payload, required_overrides=req_map)
-                return {"rows": rows}
-            except KeyError as k:
-                return error_response(400, "Bad Request", f"E_MISSING_{str(k).strip('\"').upper()}")
-            except Exception:
-                logger.exception("POST exec failed for %s.%s", schema, proc)
-                return error_response(500, "Server error", "E_SERVER")
-
         router.add_api_route(
-            path,
-            handler,
-            methods=["POST"],
-            name=f"{schema}.{proc}",
-            summary=summary,
-            description=description,
-            responses={
-                400: {"description": "Bad Request"},
-                401: {"description": "Unauthorized"},
-                500: {"description": "Server Error"}
-            },
+            path, handle_post, methods=["POST"], name=f"{schema}.{proc}",
+            summary=summary, description=description,
+            responses={200: {"description":"OK"}, 400: {"description":"Bad Request"}, 401: {"description":"Unauthorized"}, 500: {"description":"Server Error"}},
         )
     else:
         raise RuntimeError(f"Unsupported method '{method}'. Use GET or POST.")
 
 # ------------------------------------------------------------------------------
-# OpenAPI 3.1 + 42C error schema + use **registry** to declare param schemas
+# OpenAPI 3.1 with 42C error schema + auto params/requestBody + security
 # ------------------------------------------------------------------------------
 def custom_openapi():
     spec = get_openapi(
         title=app.title, version=app.version, description=app.description, routes=app.routes
     )
+    # let contract builder enrich the spec based on SQL metadata + tiny overrides
+    return enrich_openapi(spec, app.state.registry.get("endpoints", []), app.state.pool)
+
+app.openapi = custom_openapi
+
+# ------------------------------------------------------------------------------
+# Local run helper
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+
+
+
+
+
+def enrich_openapi(spec: Dict[str, Any], endpoints: List[Dict[str, Any]], pool: ODBCConnectionPool) -> Dict[str, Any]:
     spec["openapi"] = "3.1.0"
 
-    # 42C error schema
+    # servers (optional but useful for scans)
+    spec.setdefault("servers", [{"url": "/"}])
+
     comps = spec.setdefault("components", {}).setdefault("schemas", {})
     comps["ErrorResponse"] = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "fault": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "faultstring": {"type": "string"},
-                    "detail": {
-                        "oneOf": [
-                            {"type": "object", "properties": {"errorcode": {"type": "string"}}, "additionalProperties": False},
-                            {"type": "array", "maxItems": 10, "items": {
-                                "type": "object", "properties": {"errorcode": {"type": "string"}}, "additionalProperties": False
-                            }}
+        "type":"object","additionalProperties":False,
+        "properties":{
+            "fault":{
+                "type":"object","additionalProperties":False,
+                "properties":{
+                    "faultstring":{"type":"string"},
+                    "detail":{
+                        "oneOf":[
+                            {"type":"object","properties":{"errorcode":{"type":"string"}},"additionalProperties":False},
+                            {"type":"array","maxItems":10,"items":{"type":"object","properties":{"errorcode":{"type":"string"}},"additionalProperties":False}}
                         ]
                     }
                 }
             }
         }
     }
-    # API key security
+
+    # Security
     spec["components"].setdefault("securitySchemes", {})
     spec["components"]["securitySchemes"]["apiKeyAuth"] = {"type":"apiKey","in":"header","name":"X-API-Key"}
     spec["security"] = [{"apiKeyAuth": []}]
 
-    # Enrich GET endpoints using registry param definitions
-    paths = spec.get("paths", {})
-    pool: Optional[ODBCConnectionPool] = getattr(app.state, "pool", None)
-    for ep in registry.get("endpoints", []):
-        if ep.get("method","GET").upper() != "GET":
-            continue
-        s, p, path = ep["schema"], ep["proc"], ep["path"]
-        reg_params = ep.get("params", [])
-        db_meta = None
-        if pool is not None:
+    def attach_common_errors(op: Dict[str, Any], method: str):
+        # Always include 400 (client input), 401/403 (since security is applied), 404 (not found), 415 (bad media for POST), 500
+        errors = ["400", "401", "403", "404", "500"]
+        if method == "POST":
+            errors.append("415")
+        for sc in errors:
+            op.setdefault("responses", {}).setdefault(
+                sc,
+                {"description":"", "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},
+            )
+
+    for ep in endpoints:
+        schema, proc, path, method = ep["schema"], ep["proc"], ep["path"], ep["method"].upper()
+        reg_params = ep.get("params", None)
+        specs_list = build_param_contract(pool, schema, proc, method, reg_params)
+        response_model = ep.get("response")
+
+        if method == "GET":
             try:
-                db_meta = {m["name"]: m for m in get_proc_parameters(pool, s, p)}
-            except Exception:
-                db_meta = {}
-
-        # Build parameter list for OpenAPI from registry (fallback to DB types)
-        params = []
-        for prm in reg_params:
-            if prm.get("in", "query") != "query":
+                getop = spec["paths"][path]["get"]
+            except KeyError:
                 continue
-            name = prm["name"]
-            reg_type = prm.get("type")
-            db_type = db_meta.get(name, {}).get("sql_type") if db_meta else None
-            params.append({
-                "name": name,
-                "in": "query",
-                "required": bool(prm.get("required", False)),
-                "schema": oa_type_from_registry_or_db(reg_type, db_type),
-                "description": prm.get("description", db_type.upper() if db_type else "")
-            })
+            # Query parameters from auto-contract
+            params = []
+            for s in specs_list:
+                if s["in"] != "query": 
+                    continue
+                sch: Dict[str, Any] = {"type": s["type"]}
+                for k in ("maxLength","minLength","pattern","format","enum","example"):
+                    if k in s: sch[k] = s[k]
+                params.append({
+                    "name": s["name"],
+                    "in": "query",
+                    "required": bool(s.get("required", False)),
+                    "schema": sch,
+                    "description": s.get("description","")
+                })
+            getop["parameters"] = params
 
-        # Attach or replace in spec
-        try:
-            op = paths[path]["get"]
-            op["parameters"] = params
-            # 42C error schemas
-            for sc in ("400","401","500"):
-                op.setdefault("responses", {}).setdefault(
-                    sc,
-                    {"description":"", "content":{"application/json":{"schema":{"$ref":"#/components/schemas/ErrorResponse"}}}},
+            # 200 response
+            if response_model and isinstance(response_model, dict):
+                getop.setdefault("responses", {}).setdefault(
+                    "200", {"description":"OK","content":{"application/json":{"schema": response_model}}}
                 )
-        except KeyError:
-            pass
+            else:
+                # fallback: generic rows array (dev can tighten later in registry)
+                getop.setdefault("responses", {}).setdefault(
+                    "200", {"description":"OK","content":{"application/json":{"schema":{
+                        "type":"object","additionalProperties":False,
+                        "properties":{"rows":{"type":"array","items":{"type":"object","additionalProperties":True}}}
+                    }}}}
+                )
+
+            attach_common_errors(getop, "GET")
+
+        elif method == "POST":
+            try:
+                postop = spec["paths"][path]["post"]
+            except KeyError:
+                continue
+            # requestBody from body params
+            props: Dict[str, Any] = {}
+            required_props: List[str] = []
+            for s in specs_list:
+                if s["in"] != "body": 
+                    continue
+                sch: Dict[str, Any] = {"type": s["type"]}
+                for k in ("maxLength","minLength","pattern","format","enum","example"):
+                    if k in s: sch[k] = s[k]
+                props[s["name"]] = sch
+                if s.get("required", False):
+                    required_props.append(s["name"])
+            postop["requestBody"] = {
+                "required": True,
+                "content": {"application/json": {"schema":{
+                    "type":"object","properties":props,"required":required_props,"additionalProperties":False
+                }}}
+            }
+
+            # 200 response
+            if response_model and isinstance(response_model, dict):
+                postop.setdefault("responses", {}).setdefault(
+                    "200", {"description":"OK","content":{"application/json":{"schema": response_model}}}
+                )
+            else:
+                postop.setdefault("responses", {}).setdefault(
+                    "200", {"description":"OK","content":{"application/json":{"schema":{
+                        "type":"object","additionalProperties":False,
+                        "properties":{"rows":{"type":"array","items":{"type":"object","additionalProperties":True}}}
+                    }}}}
+                )
+
+            attach_common_errors(postop, "POST")
 
     return spec
 
-app.openapi = custom_openapi
-
-# ------------------------------------------------------------------------------
-# Local run helper (Swagger at /docs)
-# ------------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
 
 
 
