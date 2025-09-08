@@ -4,3 +4,121 @@
 [Agent MCP client] -> [MCP server tools] -> [Validator] --------------+
                                    |
                            [Logs / Correlation IDs / Metrics]
+
+
+
+# tools_cli.py
+# See your MCP tools "for real": list the tool catalog and call a tool.
+# Uses the same registry, validation, and exec_proc path as mcp_server.py.
+
+import os, sys, json, argparse
+from typing import Any, Dict, List
+from dotenv import load_dotenv
+
+# Reuse your existing modules
+from db import ODBCConnectionPool, POOL_SIZE, exec_proc
+from contract import load_registry, build_param_contract, required_overrides_from_specs, validate_params
+
+load_dotenv()
+
+def build_tool_catalog(registry: Dict[str, Any], pool: ODBCConnectionPool) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for ep in registry.get("endpoints", []):
+        method = ep["method"].upper()
+        specs = build_param_contract(pool, ep["schema"], ep["proc"], method, ep.get("params"))
+        props: Dict[str, Any] = {}
+        req: List[str] = []
+        for s in specs:
+            sch: Dict[str, Any] = {"type": s["type"]}
+            if "format" in s: sch["format"] = s["format"]
+            for k in ("maxLength","minLength","pattern","enum","description"):
+                if k in s: sch[k] = s[k]
+            props[s["name"]] = sch
+            if s.get("required", False):
+                req.append(s["name"])
+
+        tool_name = ep.get("toolName") or ep.get("proc") or ep["path"].strip("/").replace("/", "_")
+        out.append({
+            "name": tool_name,
+            "description": ep.get("summary") or f"Execute {ep['schema']}.{ep['proc']}",
+            "input_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": props,
+                **({"required": req} if req else {})
+            }
+        })
+    return out
+
+def select_endpoint(registry: Dict[str, Any], selector: str) -> Dict[str, Any]:
+    for e in registry.get("endpoints", []):
+        if selector in (e.get("toolName"), e.get("proc"), e.get("path"), e.get("modelName")):
+            return e
+    raise SystemExit(f"No endpoint matches selector: {selector}")
+
+def parse_args_kv(pairs: List[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for p in pairs or []:
+        if "=" not in p:
+            raise SystemExit(f"Bad --arg '{p}'. Use Name=Value.")
+        k, v = p.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="MCP tools CLI (list catalog, call a tool).")
+    ap.add_argument("--catalog", action="store_true", help="Print the tool catalog JSON (like listTools).")
+    ap.add_argument("--endpoint", help="Select tool by toolName OR proc OR path OR modelName.")
+    ap.add_argument("--args-json", help="Arguments as JSON string.")
+    ap.add_argument("--arg", action="append", help="Name=Value (repeatable).")
+    ap.add_argument("--limit", type=int, default=5, help="Preview N rows from the result.")
+    ap.add_argument("--save", help="Save full result JSON to this path.")
+    args = ap.parse_args()
+
+    registry_path = os.getenv("REGISTRY_PATH", "./procs.registry.json")
+    registry = load_registry(registry_path)
+    pool = ODBCConnectionPool(size=int(os.getenv("POOL_SIZE", str(POOL_SIZE))))
+
+    if args.catalog or not args.endpoint:
+        catalog = build_tool_catalog(registry, pool)
+        print(json.dumps(catalog, ensure_ascii=False, indent=2))
+        if not args.endpoint:
+            return
+
+    ep = select_endpoint(registry, args.endpoint)
+    method = ep["method"].upper()
+
+    # Build arg object
+    arg_obj: Dict[str, Any] = {}
+    if args.args_json:
+        try:
+            arg_obj.update(json.loads(args.args_json))
+        except json.JSONDecodeError as ex:
+            raise SystemExit(f"--args-json invalid: {ex}")
+    if args.arg:
+        arg_obj.update(parse_args_kv(args.arg))
+
+    # Validate like MCP server would
+    specs = build_param_contract(pool, ep["schema"], ep["proc"], method, ep.get("params"))
+    source = "query" if method == "GET" else "body"
+    errors = validate_params(specs, arg_obj, source)
+    if errors:
+        print(json.dumps({"fault": {"faultstring": "Bad Request",
+                                    "detail": [{"errorcode": e} for e in errors]}},
+                         ensure_ascii=False, indent=2))
+        sys.exit(1)
+
+    # Execute the proc (same as MCP)
+    rows = exec_proc(pool, ep["schema"], ep["proc"], arg_obj,
+                     required_overrides=required_overrides_from_specs(specs))
+    result = {"rows": rows}
+    preview = rows[: max(0, args.limit)]
+    print(json.dumps({"rows": preview, "preview_count": len(preview), "total_rows": len(rows)},
+                     ensure_ascii=False, indent=2))
+    if args.save:
+        with open(args.save, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        print(f"Saved full result to: {args.save}")
+
+if __name__ == "__main__":
+    main()
