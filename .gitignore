@@ -1,116 +1,39 @@
-import asyncio
-import json
-import os
-from typing import Any, Dict, List
+flowchart LR
+  subgraph Dev[".env + procs.registry.json"]
+    REG[Registry\n(endpoints, params, modelName)]
+    ENV[.env\n(DB creds, API key)]
+  end
 
-from dotenv import load_dotenv
+  subgraph API["FastAPI service"]
+    MAIN[main.py\n(routes + auth + OpenAPI)]
+    CONTRACT[contract.py\n(param & response schemas)]
+    DBAPI[db.py\n(ODBC pool + exec_proc + describe columns)]
+  end
 
-# Reuse your existing code
-from db import ODBCConnectionPool, exec_proc, POOL_SIZE
-from contract import load_registry, build_param_contract, required_overrides_from_specs, validate_params
+  subgraph MCP["MCP Server (stdio)"]
+    MCPS[ mcp_server.py\n(list_tools / call_tool) ]
+  end
 
-# Official MCP server primitives
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+  SWG[Swagger UI\n(/docs)]
+  C42[42Crunch\n(API audit)]
+  AGENT[AI Agent / IDE\n(MCP client)]
+  APP[Callers of REST API]
 
-load_dotenv()
+  SQL[(SQL Server)]
 
-REGISTRY_PATH = os.getenv("REGISTRY_PATH", "./procs.registry.json")
+  REG --load--> MAIN
+  ENV --load--> MAIN
+  ENV --load--> MCPS
 
-# Create the MCP server
-server = Server("proc-bridge-mcp")
+  MAIN --calls--> CONTRACT
+  CONTRACT --uses--> DBAPI
+  DBAPI <--ODBC--> SQL
 
-# Global state: DB pool + registry
-_pool: ODBCConnectionPool | None = None
-_registry: Dict[str, Any] | None = None
+  MCPS --uses--> CONTRACT
+  MCPS --uses--> DBAPI
 
-def _tool_name(ep: Dict[str, Any]) -> str:
-    # Prefer explicit name; else proc; else path segment
-    return ep.get("toolName") or ep.get("proc") or ep["path"].strip("/").replace("/", "_")
+  APP --HTTP/JSON--> MAIN
+  SWG --- MAIN
+  C42 --- MAIN
 
-def _json_schema_for_tool(ep: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert our param spec (query/body) into a strict JSON Schema for MCP tool args.
-    MCP 'tools' take a single JSON object as 'arguments' — we model that here.
-    """
-    method = ep["method"].upper()
-    specs = build_param_contract(_pool, ep["schema"], ep["proc"], method, ep.get("params"))
-    props: Dict[str, Any] = {}
-    required: List[str] = []
-    # For MCP we don't care about in=query/body; we accept one JSON object of args
-    for s in specs:
-        sch: Dict[str, Any] = {"type": s["type"]}
-        if "format" in s: sch["format"] = s["format"]
-        for k in ("maxLength", "minLength", "pattern", "enum"):
-            if k in s: sch[k] = s[k]
-        props[s["name"]] = sch
-        if s.get("required", False):
-            required.append(s["name"])
-    return {
-        "type": "object",
-        "additionalProperties": False,  # strict arg object for agents
-        "properties": props,
-        **({"required": required} if required else {}),
-    }
-
-async def _call_proc(ep: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Execute the stored proc behind the tool. We validate params the same way
-    as in the HTTP layer (regex/length/enum), then call exec_proc.
-    """
-    method = ep["method"].upper()
-    specs = build_param_contract(_pool, ep["schema"], ep["proc"], method, ep.get("params"))
-
-    # Validate using our existing validator. We treat all params as in the single args object.
-    errors = validate_params(specs, args, source=("query" if method == "GET" else "body"))
-    if errors:
-        # MCP error payloads are simple; return a structured error
-        # The client (agent) will surface this to the model
-        raise ValueError(json.dumps({"fault": {"faultstring": "Bad Request", "detail": [{"errorcode": e} for e in errors]}}))
-
-    rows = exec_proc(
-        _pool, ep["schema"], ep["proc"], args,
-        required_overrides=required_overrides_from_specs(specs)
-    )
-    return {"rows": rows}
-
-# --------- MCP lifecycle ---------
-
-@server.list_tools()
-async def list_tools_handler() -> list[dict]:
-    """
-    Advertise one tool per endpoint in the registry.
-    Each tool has a stable name and a JSON Schema for 'input_schema'.
-    """
-    tools = []
-    for ep in _registry.get("endpoints", []):
-        tools.append({
-            "name": _tool_name(ep),
-            "description": ep.get("summary") or f"Execute {ep['schema']}.{ep['proc']}",
-            "input_schema": _json_schema_for_tool(ep)
-        })
-    return tools
-
-@server.call_tool()
-async def call_tool_handler(name: str, arguments: dict | None) -> Any:
-    """
-    Route tool calls by name to the right proc. Arguments is a JSON object.
-    """
-    if arguments is None:
-        arguments = {}
-    for ep in _registry.get("endpoints", []):
-        if _tool_name(ep) == name:
-            return await _call_proc(ep, arguments)
-    raise ValueError(f"Unknown tool: {name}")
-
-async def main() -> None:
-    global _pool, _registry
-    _pool = ODBCConnectionPool(size=POOL_SIZE)
-    _registry = load_registry(REGISTRY_PATH)
-
-    # Run the server on stdio (best for editors/agents)
-    async with stdio_server() as (read, write):
-        await server.run(read, write)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+  AGENT --MCP--> MCPS
