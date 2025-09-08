@@ -7,3 +7,20 @@ def register_endpoint(app: FastAPI, ep: Dict[str, Any]) -> None:
     group = ep.get("group")         # e.g., "Allapps"
     derived = path.strip("/").split("/", 1)[0] or "default"
     tags = explicit_tags or [group] if group else [derived]
+
+
+
+
+    if method == "GET":
+        router.add_api_route(
+            path, handle_get, methods=["GET"], name=f"{schema}.{proc}",
+            summary=summary, description=description, tags=tags
+        xq
+    elif method == "POST":
+        router.add_api_route(
+            path, handle_post, methods=["POST"], name=f"{schema}.{proc}",
+            summary=summary, description=description, tags=tags
+        )
+
+
+
