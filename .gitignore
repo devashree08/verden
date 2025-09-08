@@ -1,44 +1,9 @@
-{
-  "project": "apps-service",
-  "endpoints": [
-    {
-      "schema": "dbo",
-      "proc": "spGetAppsByUser",
-      "path": "/AllApps/GetAppsByUID",
-      "method": "GET",
-      "summary": "List apps visible to a user (latest reportmonth)",
-      "description": "Executes dbo.spGetAppsByUser(@UserId, @AppIds).",
-      "modelName": "GetAppsByUserModel",
-      "params": [
-        { "name": "UserId", "required": true },
-        { "name": "AppIds", "required": false }
-      ]
-    },
-    {
-      "schema": "dbo",
-      "proc": "spGetAppsByBU",
-      "path": "/AllApps/GetAppsByBU",
-      "method": "GET",
-      "summary": "List apps by BU",
-      "description": "Executes dbo.spGetAppsByBU(@BusinessUnitId, @Region).",
-      "modelName": "GetAppsByBUModel",
-      "params": [
-        { "name": "BusinessUnitId", "required": true },
-        { "name": "Region", "required": false }
-      ]
-    },
-    {
-      "schema": "dbo",
-      "proc": "spGetAppsSummaryByUser",
-      "path": "/Summary/GetAppsSummaryByUID",
-      "method": "GET",
-      "summary": "Summary metrics by user",
-      "description": "Executes dbo.spGetAppsSummaryByUser(@UserId, @SinceMonth).",
-      "modelName": "GetAppsSummaryByUserModel",
-      "params": [
-        { "name": "UserId", "required": true },
-        { "name": "SinceMonth", "required": false } 
-      ]
-    }
-  ]
-}
+def register_endpoint(app: FastAPI, ep: Dict[str, Any]) -> None:
+    schema, proc, path, method = ep["schema"], ep["proc"], ep["path"], ep["method"].upper()
+    summary, description = ep.get("summary", f"Execute {schema}.{proc}"), ep.get("description", "")
+
+    # NEW: derive a tag from the first path segment, unless user sets tags/group explicitly
+    explicit_tags = ep.get("tags")  # e.g., ["Allapps"]
+    group = ep.get("group")         # e.g., "Allapps"
+    derived = path.strip("/").split("/", 1)[0] or "default"
+    tags = explicit_tags or [group] if group else [derived]
