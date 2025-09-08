@@ -1,21 +1,11 @@
-[Clients] -> [API Gateway] -> [FastAPI routes] -> [Validator] -> [Proc Executor] -> (SQL Procs)
-                                 |                                   ^
-[Swagger /docs] ------------------+                                   |
-[Agent MCP client] -> [MCP server tools] -> [Validator] --------------+
-                                   |
-                           [Logs / Correlation IDs / Metrics]
-
-
-
-# tools_cli.py
-# List your MCP tools (like listTools) and call one (like callTool).
-# Uses orjson for output so datetime/date serialize cleanly.
+# agent_sim.py
+# Simulate how an MCP client (your chatbot) would use your tools:
+# NL prompt -> pick tool -> build args -> validate -> exec proc -> reply.
 
 import os
+import re
 import sys
-import argparse
-import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import orjson
 from dotenv import load_dotenv
@@ -30,133 +20,202 @@ from contract import (
 
 load_dotenv()
 
-# -------- JSON output (orjson) --------
+def jprint(obj: Any) -> None:
+    sys.stdout.write(orjson.dumps(obj, option=orjson.OPT_INDENT_2).decode("utf-8") + "\n")
 
-def _orjson_default(obj: Any) -> Any:
-    """
-    Optional: if your procs ever return Decimal or raw bytes.
-    orjson already handles datetime/date/uuid.
-    """
-    from decimal import Decimal
-    if isinstance(obj, Decimal):
-        return str(obj)
-    if isinstance(obj, (bytes, bytearray, memoryview)):
-        # represent raw bytes safely; adjust if you prefer base64
-        return obj.decode("utf-8", errors="replace")
-    raise TypeError
-
-def _print_json(obj: Any) -> None:
-    sys.stdout.write(orjson.dumps(obj, default=_orjson_default, option=orjson.OPT_INDENT_2).decode("utf-8") + "\n")
-
-def _save_json(path: str, obj: Any) -> None:
-    with open(path, "wb") as f:
-        f.write(orjson.dumps(obj, default=_orjson_default, option=orjson.OPT_INDENT_2))
-
-# -------- Tool catalog --------
-
-def build_tool_catalog(registry: Dict[str, Any], pool: ODBCConnectionPool) -> List[Dict[str, Any]]:
+def load_catalog(pool: ODBCConnectionPool, registry_path: str) -> List[Dict[str, Any]]:
+    reg = load_registry(registry_path)
     catalog: List[Dict[str, Any]] = []
-    for ep in registry.get("endpoints", []):
-        method = ep["method"].upper()
-        specs = build_param_contract(pool, ep["schema"], ep["proc"], method, ep.get("params"))
-
+    for ep in reg.get("endpoints", []):
+        specs = build_param_contract(pool, ep["schema"], ep["proc"], ep["method"].upper(), ep.get("params"))
         props: Dict[str, Any] = {}
-        required: List[str] = []
+        req: List[str] = []
         for s in specs:
-            sch: Dict[str, Any] = {"type": s["type"]}
+            p: Dict[str, Any] = {"type": s["type"]}
             if "format" in s:
-                sch["format"] = s["format"]
-            for k in ("maxLength", "minLength", "pattern", "enum", "description"):
+                p["format"] = s["format"]
+            for k in ("maxLength", "pattern", "description", "enum"):
                 if k in s:
-                    sch[k] = s[k]
-            props[s["name"]] = sch
+                    p[k] = s[k]
+            props[s["name"]] = p
             if s.get("required", False):
-                required.append(s["name"])
-
-        tool_name = ep.get("toolName") or ep.get("proc") or ep["path"].strip("/").replace("/", "_")
+                req.append(s["name"])
         catalog.append({
-            "name": tool_name,
+            "toolName": ep.get("toolName") or ep.get("proc") or ep["path"].strip("/").replace("/", "_"),
             "description": ep.get("summary") or f"Execute {ep['schema']}.{ep['proc']}",
-            "input_schema": {
+            "schema": ep["schema"],
+            "proc": ep["proc"],
+            "method": ep["method"].upper(),
+            "inputSchema": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": props,
-                **({"required": required} if required else {})
+                **({"required": req} if req else {})
             }
         })
     return catalog
 
-# -------- Selection & args --------
+# --- rudimentary NL routing (just enough to demo) ---
 
-def select_endpoint(registry: Dict[str, Any], selector: str) -> Dict[str, Any]:
-    for e in registry.get("endpoints", []):
-        if selector in (e.get("toolName"), e.get("proc"), e.get("path"), e.get("modelName")):
-            return e
-    raise SystemExit(f"No endpoint matches selector: {selector}")
+USERID_PAT = re.compile(r"\b(user(?:\s*id)?|uid)\s*[:=]?\s*(\d{1,64})\b", re.I)
+APPID_PAT  = re.compile(r"\bapp(?:\s*id)?\s*[:=]?\s*(\d+)\b", re.I)
+CSV_PAT    = re.compile(r"\bapps?\s*[:=]?\s*([0-9]+(?:\s*,\s*[0-9]+)*)\b", re.I)
+BU_PAT     = re.compile(r"\bbu\s*[:=]?\s*(\d+)\b", re.I)
+REG_PAT    = re.compile(r"\bregion\s*[:=]?\s*([A-Za-z0-9_-]{1,64})\b", re.I)
+SINCE_PAT  = re.compile(r"\b(20\d{2})[-/\.](0[1-9]|1[0-2])\b")
 
-def parse_args_kv(pairs: List[str]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for p in pairs or []:
-        if "=" not in p:
-            raise SystemExit(f"Bad --arg '{p}'. Use Name=Value.")
-        k, v = p.split("=", 1)
-        out[k.strip()] = v.strip()
-    return out
+def route_prompt_to_tool(prompt: str, catalog: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Very simple heuristic router just to demo the flow.
+    For real use, your agent picks based on tool catalog + reasoning.
+    """
+    p = prompt.strip()
 
-# -------- CLI --------
+    # Try "GetAppsByUser"
+    uid = None
+    uid_m = USERID_PAT.search(p)
+    if uid_m:
+        uid = uid_m.group(2)
+    apcsv = None
+    csv_m = CSV_PAT.search(p)
+    if csv_m:
+        apcsv = csv_m.group(1)
+    appid = None
+    app_m = APPID_PAT.search(p)
+    if app_m:
+        appid = app_m.group(1)
+
+    tool = None
+    args: Dict[str, Any] = {}
+
+    # Prefer exact by-user queries
+    if uid:
+        # choose the catalog entry whose toolName/proc indicates "GetAppsByUser"
+        for t in catalog:
+            name = (t["toolName"] or "").lower()
+            proc = t["proc"].lower()
+            if "getappsbyuser" in name or "getappsbyuser" in proc:
+                tool = t
+                args["UserId"] = uid
+                if apcsv:
+                    args["AppIds"] = apcsv
+                elif appid:
+                    args["AppIds"] = appid
+                break
+
+    # Try BU route if the prompt looks BU-ish
+    if tool is None:
+        bu_m = BU_PAT.search(p)
+        if bu_m:
+            bu = bu_m.group(1)
+            region = None
+            rm = REG_PAT.search(p)
+            if rm:
+                region = rm.group(1)
+            for t in catalog:
+                name = (t["toolName"] or "").lower()
+                proc = t["proc"].lower()
+                if "getappsbybu" in name or "getappsbybu" in proc:
+                    tool = t
+                    args["BusinessUnitId"] = int(bu)
+                    if region:
+                        args["Region"] = region
+                    break
+
+    # Try summary by user
+    if tool is None and uid:
+        sm = SINCE_PAT.search(p)
+        for t in catalog:
+            name = (t["toolName"] or "").lower()
+            proc = t["proc"].lower()
+            if "getappssummarybyuser" in name or "getappssummarybyuser" in proc:
+                tool = t
+                args["UserId"] = uid
+                if sm:
+                    args["SinceMonth"] = f"{sm.group(1)}-{sm.group(2)}"
+                break
+
+    if tool is None:
+        # Fallback: pick the first tool, empty args (demo only)
+        tool = catalog[0]
+
+    return tool, args
+
+def validate_and_exec(pool: ODBCConnectionPool, tool: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+    specs = []
+    # Rebuild specs from DB (the MCP server does this at startup)
+    specs = build_param_contract(pool, tool["schema"], tool["proc"], tool["method"], None)
+    source = "query" if tool["method"] == "GET" else "body"
+    errors = validate_params(specs, args, source)
+    if errors:
+        return {
+            "fault": {
+                "faultstring": "Bad Request",
+                "detail": [{"errorcode": e} for e in errors]
+            }
+        }
+    rows = exec_proc(
+        pool,
+        tool["schema"],
+        tool["proc"],
+        args,
+        required_overrides=required_overrides_from_specs(specs),
+    )
+    return {"rows": rows}
+
+def format_reply(tool: Dict[str, Any], args: Dict[str, Any], result: Dict[str, Any]) -> str:
+    if "fault" in result:
+        codes = ", ".join(d.get("errorcode","") for d in result["fault"].get("detail", []))
+        return f"{tool['toolName']} failed validation ({codes}). Please fix your inputs."
+    rows = result.get("rows", [])
+    if not rows:
+        return "No records found."
+    # Minimal readable summary (don’t drown in columns)
+    # Try to pick a few common fields
+    samples = rows[:3]
+    lines = []
+    for r in samples:
+        appid = r.get("AppId") or r.get("APPID") or r.get("app_id")
+        name  = r.get("AppName") or r.get("APPNAME") or r.get("name")
+        rm    = r.get("ReportMonth") or r.get("REPORTMONTH")
+        lines.append(f"- AppId={appid} Name={name} ReportMonth={rm}")
+    more = "" if len(rows) <= 3 else f" (+{len(rows)-3} more)"
+    return f"{tool['toolName']} → {len(rows)} row(s):\n" + "\n".join(lines) + more
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="MCP tools CLI (catalog + call). Uses orjson for output.")
-    ap.add_argument("--catalog", action="store_true", help="Print the tool catalog JSON and exit (like listTools).")
-    ap.add_argument("--endpoint", help="Select by toolName OR proc OR path OR modelName.")
-    ap.add_argument("--args-json", help="Arguments as JSON string.")
-    ap.add_argument("--arg", action="append", help="Add Name=Value (repeatable).")
-    ap.add_argument("--limit", type=int, default=5, help="Preview at most N rows (default 5).")
-    ap.add_argument("--save", help="Save full result JSON to this path.")
-    args = ap.parse_args()
-
+    # 1) Load catalog (what MCP listTools would show)
     registry_path = os.getenv("REGISTRY_PATH", "./procs.registry.json")
-    registry = load_registry(registry_path)
     pool = ODBCConnectionPool(size=int(os.getenv("POOL_SIZE", str(POOL_SIZE))))
+    catalog = load_catalog(pool, registry_path)
 
-    if args.catalog or not args.endpoint:
-        _print_json(build_tool_catalog(registry, pool))
-        if not args.endpoint:
-            return
+    print("=== Tool catalog (what clients see) ===")
+    jprint([{"name": t["toolName"], "description": t["description"], "input_schema": t["inputSchema"]} for t in catalog])
 
-    ep = select_endpoint(registry, args.endpoint)
-    method = ep["method"].upper()
+    # 2) Read a natural-language prompt from stdin
+    print("\nType a prompt, e.g.: show me app details for app 471 for user 1234567890")
+    prompt = input("> ").strip()
+    if not prompt:
+        print("No prompt provided.")
+        return
 
-    # Build argument object
-    arg_obj: Dict[str, Any] = {}
-    if args.args_json:
-        try:
-            arg_obj.update(json.loads(args.args_json))  # parsing input is fine with stdlib
-        except json.JSONDecodeError as ex:
-            raise SystemExit(f"--args-json invalid: {ex}")
-    if args.arg:
-        arg_obj.update(parse_args_kv(args.arg))
+    # 3) Route to tool + build args
+    tool, args = route_prompt_to_tool(prompt, catalog)
+    print(f"\nChosen tool: {tool['toolName']}  ({tool['schema']}.{tool['proc']})")
+    print("Arguments:")
+    jprint(args)
 
-    # Validate like MCP would
-    specs = build_param_contract(pool, ep["schema"], ep["proc"], method, ep.get("params"))
-    source = "query" if method == "GET" else "body"
-    errors = validate_params(specs, arg_obj, source)
-    if errors:
-        _print_json({"fault": {"faultstring": "Bad Request", "detail": [{"errorcode": e} for e in errors]}})
-        sys.exit(1)
+    # 4) Validate + execute (like MCP tools/call)
+    result = validate_and_exec(pool, tool, args)
 
-    # Exec proc (same path as server)
-    rows = exec_proc(pool, ep["schema"], ep["proc"], arg_obj,
-                     required_overrides=required_overrides_from_specs(specs))
+    # 5) Raw JSON + friendly reply
+    print("\n=== Raw JSON result (truncated preview) ===")
+    preview = result
+    if "rows" in result and isinstance(result["rows"], list):
+        preview = {"rows": result["rows"][:3], "total_rows": len(result["rows"])}
+    jprint(preview)
 
-    result = {"rows": rows}
-    preview = rows[: max(0, args.limit)]
-    _print_json({"rows": preview, "preview_count": len(preview), "total_rows": len(rows)})
-
-    if args.save:
-        _save_json(args.save, result)
-        print(f"Saved full result to: {args.save}")
+    print("\n=== Agent-style reply ===")
+    print(format_reply(tool, args, result))
 
 if __name__ == "__main__":
     main()
-
