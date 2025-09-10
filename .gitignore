@@ -1,33 +1,13 @@
-# === Settings ===
-$DistroName  = "Ubuntu"            # change only if your wsl -l shows a different name
-$TargetDir   = "D:\WSL\Ubuntu"
-$ExportTar   = "D:\WSL\ubuntu_export.tar"
+# Pick a Linux username to create (replace alice)
+$User = "alice"
 
-# Ensure WSL1 for compatibility in your VM
-wsl --set-default-version 1
+# Create user and give sudo
+wsl -d Ubuntu -u root -- bash -lc "id -u $User >/dev/null 2>&1 || adduser $User"
+wsl -d Ubuntu -u root -- usermod -aG sudo $User
 
-# Create target folders
-New-Item -ItemType Directory -Path (Split-Path $ExportTar) -Force | Out-Null
-New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+# Make it the default user for this distro
+wsl -d Ubuntu -u root -- bash -lc "printf '[user]\ndefault=%s\n' $User > /etc/wsl.conf"
 
-# Stop the distro if running (ignore errors)
-wsl --terminate $DistroName 2>$null
-
-# Export current C:-based install to a tarball on D:
-Write-Host "Exporting $DistroName to $ExportTar ..."
-wsl --export $DistroName $ExportTar
-
-# Unregister (removes the C: copy)
-Write-Host "Unregistering $DistroName (removing old location) ..."
-wsl --unregister $DistroName
-
-# Re-import onto D: as WSL1
-Write-Host "Importing $DistroName to $TargetDir as WSL1 ..."
-wsl --import $DistroName $TargetDir $ExportTar --version 1
-
-# Optional: remove the export tar to reclaim space
-# Remove-Item $ExportTar
-
-# Verify
-wsl -l -v
-Write-Host "`nIf VERSION shows '1' for $DistroName and it's listed, you're set."
+# Restart the distro to apply default user
+wsl --terminate Ubuntu
+wsl -d Ubuntu
