@@ -1,9 +1,49 @@
-# Get likely WSL-related PIDs
-$procs = Get-Process -Name wslhost,wsl,ubuntu*,bash -ErrorAction SilentlyContinue
-$wslPids = $procs.Id
+# WSL listeners audit (WSL1/WSL2). Highlights exposure:
+#   RED   -> 0.0.0.0 / ::   (all interfaces)
+#   GREEN -> 127.0.0.1 / ::1 (loopback only)
 
-# Show only listeners owned by those PIDs
-Get-NetTCPConnection -State Listen |
-  Where-Object { $wslPids -contains $_.OwningProcess } |
-  Sort-Object LocalAddress,LocalPort |
-  Format-Table LocalAddress,LocalPort,State,OwningProcess
+$procNames = @('wslhost','wsl','ubuntu','ubuntu2004','ubuntu2204','ubuntu2404','bash')
+$procs = Get-Process -Name $procNames -ErrorAction SilentlyContinue
+if (-not $procs) {
+  Write-Host "No WSL-related processes running." -ForegroundColor Yellow
+  return
+}
+
+$pidToName = @{}
+foreach ($p in $procs) { $pidToName[$p.Id] = $p.Name }
+
+# Grab listeners owned by those PIDs
+$listeners = Get-NetTCPConnection -State Listen |
+  Where-Object { $pidToName.ContainsKey($_.OwningProcess) } |
+  Sort-Object LocalAddress, LocalPort
+
+if (-not $listeners) {
+  Write-Host "No listening sockets owned by WSL-related processes." -ForegroundColor Green
+  return
+}
+
+# Header
+"{0,-15} {1,-7} {2,-8} {3}" -f "LocalAddress","Port","PID","Process"
+Write-Host ("-" * 48)
+
+foreach ($l in $listeners) {
+  $addr = $l.LocalAddress
+  $port = $l.LocalPort
+  $pid  = $l.OwningProcess
+  $name = $pidToName[$pid]
+
+  $isAllIf = ($addr -eq '0.0.0.0' -or $addr -eq '::')
+  $isLocal = ($addr -eq '127.0.0.1' -or $addr -eq '::1')
+
+  $line = "{0,-15} {1,-7} {2,-8} {3}" -f $addr, $port, $pid, $name
+
+  if ($isAllIf) {
+    Write-Host $line -ForegroundColor Red
+  } elseif ($isLocal) {
+    Write-Host $line -ForegroundColor Green
+  } else {
+    Write-Host $line
+  }
+}
+
+Write-Host "`nTip: Prefer binding services to 127.0.0.1 inside WSL1 (e.g., 'python3 -m http.server --bind 127.0.0.1 8000')." -ForegroundColor DarkCyan
