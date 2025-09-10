@@ -1,33 +1,33 @@
-CREATE OR ALTER PROCEDURE dbo.usp_AuthorizeOrgWrite
-  @OrgID         INT,
-  @ActorEID      NVARCHAR(64)    = NULL,
-  @ActorUserName NVARCHAR(256)   = NULL
-AS
-BEGIN
-  SET NOCOUNT ON;
+# === Settings ===
+$DistroName  = "Ubuntu"            # change only if your wsl -l shows a different name
+$TargetDir   = "D:\WSL\Ubuntu"
+$ExportTar   = "D:\WSL\ubuntu_export.tar"
 
-  IF @ActorEID IS NULL AND @ActorUserName IS NULL
-    THROW 51020, 'Actor identity required.', 1;
+# Ensure WSL1 for compatibility in your VM
+wsl --set-default-version 1
 
-  -- Load policy names for this actor (Admin, Edit.<OrgCode>.All, etc.)
-  CREATE TABLE #pol (PolicyName NVARCHAR(128) NOT NULL);
-  INSERT INTO #pol(PolicyName)
-    EXEC dbo.usp_PortalPolicies_GetForUser
-         @UserEID  = @ActorEID,
-         @UserName = @ActorUserName;
+# Create target folders
+New-Item -ItemType Directory -Path (Split-Path $ExportTar) -Force | Out-Null
+New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
 
-  -- Admin can edit all orgs
-  IF EXISTS (SELECT 1 FROM #pol WHERE PolicyName = 'Admin')
-    RETURN;
+# Stop the distro if running (ignore errors)
+wsl --terminate $DistroName 2>$null
 
-  -- Otherwise, the actor must have a matching Edit.<OrgCode>.All for the given OrgID
-  IF NOT EXISTS (
-      SELECT 1
-      FROM #pol p
-      JOIN dbo.Portal_OrgMap om
-        ON ('Edit.' + om.OrgCode + '.All') = p.PolicyName
-      WHERE om.OrgId = @OrgID
-  )
-    THROW 51021, 'Forbidden: not authorized to edit this Org.', 1;
-END
-GO
+# Export current C:-based install to a tarball on D:
+Write-Host "Exporting $DistroName to $ExportTar ..."
+wsl --export $DistroName $ExportTar
+
+# Unregister (removes the C: copy)
+Write-Host "Unregistering $DistroName (removing old location) ..."
+wsl --unregister $DistroName
+
+# Re-import onto D: as WSL1
+Write-Host "Importing $DistroName to $TargetDir as WSL1 ..."
+wsl --import $DistroName $TargetDir $ExportTar --version 1
+
+# Optional: remove the export tar to reclaim space
+# Remove-Item $ExportTar
+
+# Verify
+wsl -l -v
+Write-Host "`nIf VERSION shows '1' for $DistroName and it's listed, you're set."
