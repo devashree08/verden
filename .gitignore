@@ -1,78 +1,9 @@
-# ================== SETTINGS ==================
-$DistroName  = "Ubuntu"                 # Change only if your distro shows a different name in `wsl -l -v`
-$TargetDir   = "D:\WSL\Ubuntu"
-$ExportTar   = "D:\WSL\ubuntu_good.tar"
-$UserName    = "ubuntuuser"             # Pick your desired Linux username
-# ==============================================
+# Get likely WSL-related PIDs
+$procs = Get-Process -Name wslhost,wsl,ubuntu*,bash -ErrorAction SilentlyContinue
+$wslPids = $procs.Id
 
-Write-Host ">>> Forcing WSL1 (your VM doesn't expose virtualization)" -ForegroundColor Cyan
-wsl --set-default-version 1 2>$null
-
-Write-Host ">>> Removing any broken instance named $DistroName (ignore errors if not present)..." -ForegroundColor Cyan
-wsl --terminate $DistroName 2>$null
-wsl --unregister $DistroName 2>$null
-
-# Ensure folders exist
-New-Item -ItemType Directory -Path (Split-Path $ExportTar) -Force | Out-Null
-New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
-
-Write-Host ">>> Installing fresh $DistroName to default location (C:)..." -ForegroundColor Cyan
-# Use the built-in installer; on Server 2022 this usually works
-wsl --install -d $DistroName
-
-Write-Host ">>> Initializing distro NON-INTERACTIVELY as root (prevents half-baked export)..." -ForegroundColor Cyan
-# Try the launcher exe variants to force initialization as root
-$WinApps = "$env:LOCALAPPDATA\Microsoft\WindowsApps"
-$Candidates = @(
-  Join-Path $WinApps "ubuntu.exe",
-  Join-Path $WinApps "ubuntu2004.exe",
-  Join-Path $WinApps "ubuntu2204.exe",
-  Join-Path $WinApps "ubuntu2404.exe"
-) | Where-Object { Test-Path $_ }
-
-$Initialized = $false
-foreach ($exe in $Candidates) {
-  try {
-    & $exe install --root | Out-Null
-    $Initialized = $true
-    Write-Host ">>> Initialized using $exe" -ForegroundColor Green
-    break
-  } catch { }
-}
-
-if (-not $Initialized) {
-  # Fallback: running a simple command also forces initialization
-  wsl -d $DistroName -u root -- true 2>$null
-  $Initialized = $true
-  Write-Host ">>> Initialized via wsl fallback" -ForegroundColor Green
-}
-
-Write-Host ">>> Verifying core tools exist INSIDE Ubuntu (ls/id/touch)..." -ForegroundColor Cyan
-$Check = wsl -d $DistroName -u root -- bash -lc 'command -v ls && command -v id && command -v touch && dpkg -s coreutils >/dev/null 2>&1 && echo OK || echo FAIL'
-if ($Check -notmatch "OK") {
-  Write-Error "Ubuntu base utilities missing. The first-run may not have completed. Launch Ubuntu once from Start menu, let it finish, then re-run this script."
-  exit 1
-}
-
-Write-Host ">>> Exporting good, initialized $DistroName to $ExportTar ..." -ForegroundColor Cyan
-wsl --terminate $DistroName 2>$null
-wsl --export $DistroName $ExportTar
-
-Write-Host ">>> Unregistering the C: instance..." -ForegroundColor Cyan
-wsl --unregister $DistroName
-
-Write-Host ">>> Importing clean instance to $TargetDir as WSL1..." -ForegroundColor Cyan
-wsl --import $DistroName $TargetDir $ExportTar --version 1
-
-Write-Host ">>> Creating a normal user '$UserName' and making it default..." -ForegroundColor Cyan
-wsl -d $DistroName -u root -- bash -lc "id -u $UserName >/dev/null 2>&1 || adduser --disabled-password --gecos \"\" $UserName"
-wsl -d $DistroName -u root -- bash -lc "usermod -aG sudo $UserName"
-wsl -d $DistroName -u root -- bash -lc "printf '[user]\ndefault=%s\n' $UserName > /etc/wsl.conf"
-
-Write-Host ">>> Restarting distro..." -ForegroundColor Cyan
-wsl --terminate $DistroName
-
-Write-Host ">>> Final verification..." -ForegroundColor Cyan
-wsl -d $DistroName -- bash -lc 'echo PATH=$PATH; command -v ls; command -v id; command -v touch; uname -a; echo "ls of /:"; ls / | head -n 20'
-
-Write-Host ">>> All done. $DistroName now lives at $TargetDir and core commands work." -ForegroundColor Green
+# Show only listeners owned by those PIDs
+Get-NetTCPConnection -State Listen |
+  Where-Object { $wslPids -contains $_.OwningProcess } |
+  Sort-Object LocalAddress,LocalPort |
+  Format-Table LocalAddress,LocalPort,State,OwningProcess
