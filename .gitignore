@@ -1,45 +1,10 @@
-# Live WSL listener watcher (TCP + UDP). Press Ctrl+C to stop.
-$procNames = @('wslhost','wsl','ubuntu','ubuntu2004','ubuntu2204','ubuntu2404','bash','vmmem')
-function Get-WslPids { (Get-Process -Name $procNames -ErrorAction SilentlyContinue).Id }
-
-while ($true) {
-  Clear-Host
-  $pids = Get-WslPids
-  if (-not $pids) { Write-Host "No WSL-related processes running." -ForegroundColor Yellow; Start-Sleep 2; continue }
-
-  $tcp = Get-NetTCPConnection -State Listen | Where-Object { $pids -contains $_.OwningProcess }
-  $udp = Get-NetUDPEndpoint | Where-Object { $pids -contains $_.OwningProcess }
-
-  Write-Host "WSL-owned TCP listeners:" -ForegroundColor Cyan
-  if (-not $tcp) {
-    Write-Host "  (none)" -ForegroundColor Green
-  } else {
-    "{0,-15} {1,-7} {2,-8} {3}" -f "LocalAddress","Port","PID","Process"
-    Write-Host ("-"*48)
-    foreach ($l in $tcp | Sort-Object LocalAddress,LocalPort) {
-      $name = (Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue).Name
-      $line = "{0,-15} {1,-7} {2,-8} {3}" -f $l.LocalAddress,$l.LocalPort,$l.OwningProcess,$name
-      if ($l.LocalAddress -in '0.0.0.0','::') { Write-Host $line -ForegroundColor Red }
-      elseif ($l.LocalAddress -in '127.0.0.1','::1') { Write-Host $line -ForegroundColor Green }
-      else { Write-Host $line }
-    }
-  }
-
-  Write-Host "`nWSL-owned UDP endpoints:" -ForegroundColor Cyan
-  if (-not $udp) {
-    Write-Host "  (none)" -ForegroundColor Green
-  } else {
-    "{0,-15} {1,-7} {2,-8} {3}" -f "LocalAddress","Port","PID","Process"
-    Write-Host ("-"*48)
-    foreach ($u in $udp | Sort-Object LocalAddress,LocalPort) {
-      $name = (Get-Process -Id $u.OwningProcess -ErrorAction SilentlyContinue).Name
-      $line = "{0,-15} {1,-7} {2,-8} {3}" -f $u.LocalAddress,$u.LocalPort,$u.OwningProcess,$name
-      if ($u.LocalAddress -in '0.0.0.0','::') { Write-Host $line -ForegroundColor Red }
-      elseif ($u.LocalAddress -in '127.0.0.1','::1') { Write-Host $line -ForegroundColor Green }
-      else { Write-Host $line }
-    }
-  }
-
-  Write-Host "`nTip: bind WSL services to 127.0.0.1 to keep them local." -ForegroundColor DarkCyan
-  Start-Sleep 2
+$port = 8000  # change if needed
+$tcp = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
+if ($tcp) {
+  $pid = $tcp.OwningProcess
+  $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+  $name = if ($proc) { $proc.Name } else { "(unknown)" }
+  "Listening on $($tcp.LocalAddress):$($tcp.LocalPort)  PID=$pid  Process=$name"
+} else {
+  "No listener found on port $port"
 }
