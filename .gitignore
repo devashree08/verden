@@ -1,49 +1,45 @@
-# WSL listeners audit (WSL1/WSL2). Highlights exposure:
-#   RED   -> 0.0.0.0 / ::   (all interfaces)
-#   GREEN -> 127.0.0.1 / ::1 (loopback only)
+# Live WSL listener watcher (TCP + UDP). Press Ctrl+C to stop.
+$procNames = @('wslhost','wsl','ubuntu','ubuntu2004','ubuntu2204','ubuntu2404','bash','vmmem')
+function Get-WslPids { (Get-Process -Name $procNames -ErrorAction SilentlyContinue).Id }
 
-$procNames = @('wslhost','wsl','ubuntu','ubuntu2004','ubuntu2204','ubuntu2404','bash')
-$procs = Get-Process -Name $procNames -ErrorAction SilentlyContinue
-if (-not $procs) {
-  Write-Host "No WSL-related processes running." -ForegroundColor Yellow
-  return
-}
+while ($true) {
+  Clear-Host
+  $pids = Get-WslPids
+  if (-not $pids) { Write-Host "No WSL-related processes running." -ForegroundColor Yellow; Start-Sleep 2; continue }
 
-$pidToName = @{}
-foreach ($p in $procs) { $pidToName[$p.Id] = $p.Name }
+  $tcp = Get-NetTCPConnection -State Listen | Where-Object { $pids -contains $_.OwningProcess }
+  $udp = Get-NetUDPEndpoint | Where-Object { $pids -contains $_.OwningProcess }
 
-# Grab listeners owned by those PIDs
-$listeners = Get-NetTCPConnection -State Listen |
-  Where-Object { $pidToName.ContainsKey($_.OwningProcess) } |
-  Sort-Object LocalAddress, LocalPort
-
-if (-not $listeners) {
-  Write-Host "No listening sockets owned by WSL-related processes." -ForegroundColor Green
-  return
-}
-
-# Header
-"{0,-15} {1,-7} {2,-8} {3}" -f "LocalAddress","Port","PID","Process"
-Write-Host ("-" * 48)
-
-foreach ($l in $listeners) {
-  $addr = $l.LocalAddress
-  $port = $l.LocalPort
-  $pid  = $l.OwningProcess
-  $name = $pidToName[$pid]
-
-  $isAllIf = ($addr -eq '0.0.0.0' -or $addr -eq '::')
-  $isLocal = ($addr -eq '127.0.0.1' -or $addr -eq '::1')
-
-  $line = "{0,-15} {1,-7} {2,-8} {3}" -f $addr, $port, $pid, $name
-
-  if ($isAllIf) {
-    Write-Host $line -ForegroundColor Red
-  } elseif ($isLocal) {
-    Write-Host $line -ForegroundColor Green
+  Write-Host "WSL-owned TCP listeners:" -ForegroundColor Cyan
+  if (-not $tcp) {
+    Write-Host "  (none)" -ForegroundColor Green
   } else {
-    Write-Host $line
+    "{0,-15} {1,-7} {2,-8} {3}" -f "LocalAddress","Port","PID","Process"
+    Write-Host ("-"*48)
+    foreach ($l in $tcp | Sort-Object LocalAddress,LocalPort) {
+      $name = (Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue).Name
+      $line = "{0,-15} {1,-7} {2,-8} {3}" -f $l.LocalAddress,$l.LocalPort,$l.OwningProcess,$name
+      if ($l.LocalAddress -in '0.0.0.0','::') { Write-Host $line -ForegroundColor Red }
+      elseif ($l.LocalAddress -in '127.0.0.1','::1') { Write-Host $line -ForegroundColor Green }
+      else { Write-Host $line }
+    }
   }
-}
 
-Write-Host "`nTip: Prefer binding services to 127.0.0.1 inside WSL1 (e.g., 'python3 -m http.server --bind 127.0.0.1 8000')." -ForegroundColor DarkCyan
+  Write-Host "`nWSL-owned UDP endpoints:" -ForegroundColor Cyan
+  if (-not $udp) {
+    Write-Host "  (none)" -ForegroundColor Green
+  } else {
+    "{0,-15} {1,-7} {2,-8} {3}" -f "LocalAddress","Port","PID","Process"
+    Write-Host ("-"*48)
+    foreach ($u in $udp | Sort-Object LocalAddress,LocalPort) {
+      $name = (Get-Process -Id $u.OwningProcess -ErrorAction SilentlyContinue).Name
+      $line = "{0,-15} {1,-7} {2,-8} {3}" -f $u.LocalAddress,$u.LocalPort,$u.OwningProcess,$name
+      if ($u.LocalAddress -in '0.0.0.0','::') { Write-Host $line -ForegroundColor Red }
+      elseif ($u.LocalAddress -in '127.0.0.1','::1') { Write-Host $line -ForegroundColor Green }
+      else { Write-Host $line }
+    }
+  }
+
+  Write-Host "`nTip: bind WSL services to 127.0.0.1 to keep them local." -ForegroundColor DarkCyan
+  Start-Sleep 2
+}
