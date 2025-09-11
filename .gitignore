@@ -1,1 +1,54 @@
 
+mcp-msql/
+├─ README.md
+├─ .gitignore
+├─ pyproject.toml                  # package metadata & tool config (ruff/black/pytest later)
+├─ .env.example                    # sample env keys (no secrets)
+├─ docs/
+│  ├─ adr/
+│  │  ├─ ADR-000_identity-and-EID.md
+│  │  ├─ ADR-001_stored-procs-only.md
+│  │  ├─ ADR-002_schema-atlas-and-exposure.md
+│  │  ├─ ADR-003_observability-and-audit.md
+│  │  └─ ADR-004_transport-and-secrets.md
+│  ├─ contracts.md                # tool names, error envelope, audit fields
+│  ├─ config-keys.md              # 12-factor keys you’ll support
+│  └─ security-baseline.md        # dev vs non-dev guardrails (ZT alignment)
+├─ app/                            # Python package root (code starts Phase 1)
+│  ├─ __init__.py
+│  ├─ api/                        # FastAPI routers (MCP binds live here later)
+│  │  └─ __init__.py
+│  ├─ mcp/                        # FastMCP server wrappers & tool registrations
+│  │  └─ __init__.py
+│  ├─ db/                         # pyodbc executor, pools, concurrency caps
+│  │  └─ __init__.py
+│  ├─ registry/                   # load/validate procedure registry; atlas merge
+│  │  └─ __init__.py
+│  ├─ models/                     # Pydantic v2 models (params/results) – generated + overrides
+│  │  └─ __init__.py
+│  ├─ security/                   # EID injection (dev), JWT (later), VAST↔EID checks
+│  │  └─ __init__.py
+│  ├─ policy/                     # in-app policy stubs (OPA later)
+│  │  └─ __init__.py
+│  ├─ observability/              # logging, OTEL setup, request_id propagation
+│  │  └─ __init__.py
+│  └─ utils/                      # small helpers (config loader, hashing EID, etc.)
+│     └─ __init__.py
+├─ registry/                      # Procedure Registry files (one per stored proc)
+│  └─ sample-proc.yml             # shape/example (real ones added Phase 1)
+├─ atlas/                         # Column metadata for each proc (editable descriptions/tags)
+│  └─ sample-proc.atlas.yml
+├─ ontology/                      # Synonym/intent → columns/tags mapping (kept tiny at start)
+│  └─ synonyms.yml
+├─ tests/
+│  ├─ unit/
+│  └─ e2e/                        # MCP Inspector goldens & agent smoke tests later
+├─ ops/
+│  ├─ runbook.md                  # how to run locally / RHEL 8
+│  ├─ compose.yaml                # placeholder for future (not used now)
+│  └─ tasklist_phase_checklists.md
+├─ ci/
+│  ├─ pipeline.md                 # CI plan (build, SCA, SBOM, sign) – docs for now
+│  └─ policies.md                 # code-quality/security gate expectations
+└─ .github/                       # if using GitHub Actions later (empty now)
+   └─ workflows/
