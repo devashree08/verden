@@ -1,495 +1,5 @@
 from __future__ import annotations
 
-import re
-from datetime import date, datetime
-from typing import Optional, Union
-
-# --- VAST list parsing (numeric-only) -----------------------------------------
-
-_VAST_ITEM_RE = re.compile(r"^\d{1,20}$")  # numeric only, up to 20 digits
-
-
-def parse_vast_csv(
-    vast: Optional[str],
-    *,
-    max_ids: int = 200,
-    max_total_len: int = 16000,
-) -> list[str] | None:
-    """
-    Parse a comma-separated list of numeric VAST IDs.
-
-    Returns list[str] (deduped, order-preserving) or None if input is empty/whitespace.
-
-    Guards:
-      - numeric-only items (1..20 digits)
-      - maximum total length (DoS guard)
-      - maximum number of IDs
-    """
-    if vast is None:
-        return None
-    s = vast.strip()
-    if not s:
-        return None
-    if len(s) > max_total_len:
-        raise ValueError("VAST list too long")
-    out: list[str] = []
-    for raw in s.split(","):
-        item = raw.strip()
-        if not item:
-            continue
-        if not _VAST_ITEM_RE.match(item):
-            raise ValueError(f"Invalid VAST id: {item!r} (numeric only)")
-        out.append(item)
-        if len(out) > max_ids:
-            raise ValueError("Too many VAST ids")
-    # de-duplicate while preserving order
-    seen: set[str] = set()
-    dedup: list[str] = []
-    for v in out:
-        if v not in seen:
-            dedup.append(v)
-            seen.add(v)
-    return dedup or None
-
-
-# --- ReportMonth normalization (month key) ------------------------------------
-
-_ReportMonthLike = Union[str, date, datetime, None]
-
-
-def normalize_report_month(value: _ReportMonthLike) -> datetime:
-    """
-    Normalize a ReportMonth to the *first day of the month at 00:00:00*.
-    No timezone handling; result is a naive datetime, matching SQL Server's DATETIME usage.
-
-    Accepted inputs:
-      - None           -> current month (today's date)
-      - date           -> first-of-month at 00:00:00
-      - datetime       -> uses its year/month; sets day=1, time=00:00:00; tzinfo ignored
-      - 'YYYY-MM'      -> first-of-month at 00:00:00
-      - 'YYYY-MM-01'   -> first-of-month at 00:00:00
-      - 'YYYY-MM-01 00:00:00' (or ISO-like) -> coerced to first-of-month 00:00:00
-
-    Note: NL phrases like "last month"/"July 2025" are *out of scope for Phase 1*.
-    """
-    if value is None:
-        today = date.today()
-        return datetime(today.year, today.month, 1, 0, 0, 0)
-
-    if isinstance(value, datetime):
-        return datetime(value.year, value.month, 1, 0, 0, 0)
-
-    if isinstance(value, date):
-        return datetime(value.year, value.month, 1, 0, 0, 0)
-
-    # string parsing (strict, minimal forms we expect)
-    s = value.strip()
-    # 'YYYY-MM'
-    if len(s) == 7 and s[4] == "-":
-        y, m = s.split("-", 1)
-        return datetime(int(y), int(m), 1, 0, 0, 0)
-    # 'YYYY-MM-01' or 'YYYY-MM-01 00:00:00' or ISO-ish with T
-    try:
-        # try common formats without pulling in heavy parsers
-        if "T" in s:
-            # ISO-like 'YYYY-MM-01T00:00:00' -> use fromisoformat where possible
-            dt = datetime.fromisoformat(s)
-            return datetime(dt.year, dt.month, 1, 0, 0, 0)
-        # 'YYYY-MM-01 00:00:00'
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                dt = datetime.strptime(s, fmt)
-                return datetime(dt.year, dt.month, 1, 0, 0, 0)
-            except ValueError:
-                continue
-    except Exception:
-        pass
-
-    raise ValueError("Unsupported ReportMonth format")
-
-
-from __future__ import annotations
-
-import os
-import threading
-import time
-from contextlib import contextmanager
-from dataclasses import dataclass
-from queue import Queue, Empty
-from typing import Any, Dict, Iterable, Optional
-
-import pyodbc  # type: ignore
-
-from .errors import DbError, DbInternalError, DbTimeoutError, DbInvalidInputError
-
-# ---- Connection Pool ---------------------------------------------------------
-
-@dataclass(slots=True)
-class _ConnConfig:
-    server: str
-    database: str
-    username: str
-    password: str
-    encrypt: bool
-    trust_server_cert: bool
-    conn_timeout_sec: int
-    command_timeout_sec: int
-    autocommit: bool = True
-
-    def to_conn_str(self) -> str:
-        # SQL Server ODBC connection string
-        parts = [
-            "DRIVER={ODBC Driver 18 for SQL Server}",
-            f"SERVER={self.server}",
-            f"DATABASE={self.database}",
-            f"UID={self.username}",
-            f"PWD={self.password}",
-            f"Encrypt={'Yes' if self.encrypt else 'No'}",
-            f"TrustServerCertificate={'Yes' if self.trust_server_cert else 'No'}",
-            f"Connect Timeout={self.conn_timeout_sec}",
-        ]
-        return ";".join(parts)
-
-class ConnectionPool:
-    """
-    Simple bounded pool of pyodbc connections.
-    Thread-safe. Pre-creates connections to control churn/latency.
-    """
-
-    def __init__(self, config: _ConnConfig, max_connections: int = 10) -> None:
-        self._config = config
-        self._max = max_connections
-        self._pool: "Queue[pyodbc.Connection]" = Queue(maxsize=max_connections)
-        self._lock = threading.Lock()
-        self._created = 0
-
-    def _create_connection(self) -> pyodbc.Connection:
-        conn = pyodbc.connect(self._config.to_conn_str(), autocommit=self._config.autocommit)
-        # Set default command timeout on connection; can override per cursor if needed
-        conn.timeout = self._config.command_timeout_sec
-        return conn
-
-    @contextmanager
-    def acquire(self) -> Iterable[pyodbc.Connection]:
-        try:
-            conn = self._pool.get_nowait()
-        except Empty:
-            with self._lock:
-                if self._created < self._max:
-                    conn = self._create_connection()
-                    self._created += 1
-                else:
-                    # wait until a connection is returned
-                    conn = self._pool.get()
-        try:
-            yield conn
-        finally:
-            # If connection is closed/broken, do not return it to the pool
-            try:
-                conn.getinfo(pyodbc.SQL_DATABASE_NAME)  # lightweight liveness check
-                self._pool.put(conn, block=False)
-            except Exception:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-# ---- Per-proc concurrency caps ----------------------------------------------
-
-class ProcLimiter:
-    """
-    Per-procedure semaphores to cap concurrency and protect the DB.
-    """
-
-    def __init__(self) -> None:
-        self._sems: dict[str, threading.Semaphore] = {}
-        self._lock = threading.Lock()
-
-    def register(self, proc_fqn: str, max_concurrency: int) -> None:
-        with self._lock:
-            self._sems[proc_fqn] = threading.Semaphore(max_concurrency)
-
-    @contextmanager
-    def acquire(self, proc_fqn: str) -> Iterable[None]:
-        sem = self._sems.get(proc_fqn)
-        if sem is None:
-            # default to 1 if not registered
-            sem = threading.Semaphore(1)
-            with self._lock:
-                self._sems[proc_fqn] = sem
-        sem.acquire()
-        try:
-            yield
-        finally:
-            sem.release()
-
-# ---- Executor ----------------------------------------------------------------
-
-class DbExecutor:
-    """
-    Blocking pyodbc executor wrapped with:
-    - connection pooling
-    - per-proc concurrency caps
-    - request-level timeout guard
-    """
-
-    def __init__(
-        self,
-        pool: ConnectionPool,
-        limiter: ProcLimiter,
-        request_timeout_sec: int = 30,
-    ) -> None:
-        self._pool = pool
-        self._limiter = limiter
-        self._request_timeout_sec = request_timeout_sec
-
-    def execute_proc(
-        self,
-        proc_fqn: str,
-        params: Dict[str, Any],
-        *,
-        max_rows: Optional[int] = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Execute a stored procedure safely and return rows as list[dict].
-        Assumes proc is read-only (SELECT).
-        """
-        start = time.monotonic()
-        with self._limiter.acquire(proc_fqn):
-            with self._pool.acquire() as conn:
-                try:
-                    cursor = conn.cursor()
-                    # pyodbc param style uses "?" placeholders in EXEC
-                    # Build EXEC statement with named params for clarity in logs (not sent as text values)
-                    # Example: EXEC schema.proc @EID=?, @VAST=?, @ReportMonth=?
-                    ordered_names, qmarks, values = _order_params(params)
-                    exec_sql = f"EXEC {proc_fqn} " + ", ".join(f"@{n}=?" for n in ordered_names)
-                    cursor.execute(exec_sql, values)
-                    # fetchall may be heavy; stream rows and respect max_rows
-                    columns = [col[0] for col in cursor.description] if cursor.description else []
-                    rows: list[dict[str, Any]] = []
-                    count = 0
-                    while True:
-                        rec = cursor.fetchone()
-                        if rec is None:
-                            break
-                        row = {columns[i]: rec[i] for i in range(len(columns))}
-                        rows.append(row)
-                        count += 1
-                        if max_rows is not None and count >= max_rows:
-                            break
-                    # Sanity check for request timeout
-                    elapsed = time.monotonic() - start
-                    if elapsed > self._request_timeout_sec:
-                        raise DbTimeoutError(f"Request exceeded {self._request_timeout_sec}s")
-                    return rows
-                except pyodbc.ProgrammingError as e:
-                    raise DbInvalidInputError(str(e)) from e
-                except pyodbc.Error as e:
-                    # pyodbc.Error covers timeouts and SQL errors; inspect for timeout where possible
-                    msg = str(e)
-                    if "timeout" in msg.lower():
-                        raise DbTimeoutError(msg) from e
-                    raise DbInternalError(msg) from e
-
-def _order_params(params: Dict[str, Any]) -> tuple[list[str], list[str], list[Any]]:
-    """
-    Deterministic order for params to match EXEC statement.
-    Returns (ordered_names, placeholders, values).
-    """
-    ordered = sorted(params.keys(), key=lambda s: s.lower())
-    values = [params[k] for k in ordered]
-    return ordered, ["?"] * len(ordered), values
-
-
-
-from __future__ import annotations
-
-import re
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-from typing import Optional, Sequence
-
-VAST_ITEM_RE = re.compile(r"^\d{1,20}$")  # numeric only, up to 20 digits
-
-def parse_vast_csv(vast: Optional[str], *, max_ids: int = 200, max_total_len: int = 16000) -> list[str] | None:
-    """
-    Parse a comma-separated list of numeric VAST IDs.
-    Returns list[str] or None if input is falsy after trimming.
-    Enforces caps to avoid abuse.
-    """
-    if vast is None:
-        return None
-    s = vast.strip()
-    if not s:
-        return None
-    if len(s) > max_total_len:
-        raise ValueError("VAST list too long")
-    parts = [p.strip() for p in s.split(",")]
-    out: list[str] = []
-    for p in parts:
-        if not p:
-            continue
-        if not VAST_ITEM_RE.match(p):
-            raise ValueError(f"Invalid VAST id: {p!r} (numeric only)")
-        out.append(p)
-        if len(out) > max_ids:
-            raise ValueError("Too many VAST ids")
-    # de-duplicate while preserving order
-    seen: set[str] = set()
-    dedup: list[str] = []
-    for v in out:
-        if v not in seen:
-            dedup.append(v)
-            seen.add(v)
-    return dedup or None
-
-NY_TZ = ZoneInfo("America/New_York")
-
-def normalize_report_month(dt: Optional[datetime]) -> datetime:
-    """
-    For the Summary proc: if dt is None, return first day of current month at 00:00:00 EST.
-    If dt is provided, normalize to first-of-month at 00:00:00 EST (no timezone info for DB).
-    """
-    if dt is None:
-        now_est = datetime.now(tz=NY_TZ)
-        normalized = datetime(year=now_est.year, month=now_est.month, day=1, tzinfo=NY_TZ, hour=0, minute=0, second=0, microsecond=0)
-    else:
-        dt_est = dt.astimezone(NY_TZ) if dt.tzinfo else dt.replace(tzinfo=NY_TZ)
-        normalized = datetime(year=dt_est.year, month=dt_est.month, day=1, tzinfo=NY_TZ, hour=0, minute=0, second=0, microsecond=0)
-    # SQL Server expects naive datetime; drop tzinfo after establishing EST wall time
-    return normalized.replace(tzinfo=None)
-
-
-
-
-
-from __future__ import annotations
-
-from typing import Literal, Optional
-from pydantic import BaseModel, Field, ConfigDict
-
-ProcType = Literal["read", "write"]
-
-class ProcParam(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    name: str
-    sql_type: str
-    required: bool = True
-    server_supplied: bool = False  # EID=True; others False
-
-class ProcColumn(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    name: str
-    sql_type: str
-    nullable: bool
-
-class ProcLimits(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    max_concurrency: int = 5
-
-class ProcTimeouts(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    request_ms: int = 30_000
-
-class ProcRegistryEntry(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    procedure: str  # schema.proc
-    type: ProcType = "read"
-    timeouts: ProcTimeouts = Field(default_factory=ProcTimeouts)
-    limits: ProcLimits = Field(default_factory=ProcLimits)
-    params: list[ProcParam]
-    result_columns: list[ProcColumn]
-
-
-
-
-
-
-from __future__ import annotations
-
-from typing import Iterable
-import pyodbc  # type: ignore
-
-def _compose_type_name(system_type_name: str, max_length: int, precision: int, scale: int) -> str:
-    """
-    Normalize SQL Server type display consistently (e.g., NVARCHAR(50), DECIMAL(19,4), DATETIME).
-    For nvarchar/nchar, max_length is bytes; characters = bytes/2. NVARCHAR(MAX) returns max_length=-1.
-    """
-    t = system_type_name.upper()
-    if t in {"NVARCHAR", "NCHAR"}:
-        if max_length == -1:
-            return f"{t}(MAX)"
-        chars = max(int(max_length / 2), 1)
-        return f"{t}({chars})"
-    if t in {"VARCHAR", "CHAR", "VARBINARY", "BINARY"}:
-        if max_length == -1:
-            return f"{t}(MAX)"
-        return f"{t}({max_length})"
-    if t in {"DECIMAL", "NUMERIC"}:
-        if precision and scale is not None:
-            return f"{t}({precision},{scale})"
-    return t
-
-def get_proc_params(cursor: pyodbc.Cursor, schema: str, proc: str) -> list[dict]:
-    sql = """
-    SELECT p.name AS param_name,
-           t.name AS system_type_name,
-           p.max_length,
-           p.precision,
-           p.scale,
-           p.is_output,
-           p.has_default_value
-    FROM sys.parameters p
-    JOIN sys.objects o ON o.object_id = p.object_id
-    JOIN sys.types t ON t.user_type_id = p.user_type_id
-    WHERE o.type IN ('P', 'PC') AND SCHEMA_NAME(o.schema_id) = ? AND o.name = ?
-    ORDER BY p.parameter_id;
-    """
-    rows = cursor.execute(sql, (schema, proc)).fetchall()
-    params: list[dict] = []
-    for r in rows:
-        tname = _compose_type_name(r.system_type_name, r.max_length, r.precision, r.scale)
-        pname = r.param_name.lstrip("@")
-        params.append({
-            "name": pname,
-            "sql_type": tname,
-            "required": not bool(r.has_default_value),  # SQL default means optional
-        })
-    return params
-
-def get_proc_result_columns(conn: pyodbc.Connection, schema: str, proc: str) -> list[dict]:
-    # Use dm_exec_describe_first_result_set_for_object (safe; does not execute)
-    cursor = conn.cursor()
-    sql = """
-    SELECT c.name,
-           c.system_type_name,
-           c.is_nullable,
-           c.max_length,
-           c.precision,
-           c.scale
-    FROM sys.dm_exec_describe_first_result_set_for_object(
-         OBJECT_ID(QUOTENAME(?) + '.' + QUOTENAME(?)), NULL) AS c
-    WHERE c.error_code IS NULL
-    ORDER BY c.column_ordinal;
-    """
-    rows = cursor.execute(sql, (schema, proc)).fetchall()
-    cols: list[dict] = []
-    for r in rows:
-        tname = _compose_type_name(r.system_type_name, getattr(r, "max_length", 0), getattr(r, "precision", 0), getattr(r, "scale", 0))
-        cols.append({
-            "name": r.name,
-            "sql_type": tname,
-            "nullable": bool(r.is_nullable),
-        })
-    return cols
-
-
-
-
-
-from __future__ import annotations
-
 import os
 from pathlib import Path
 from typing import Tuple
@@ -524,7 +34,50 @@ def generate_registry_yaml(conn: pyodbc.Connection, proc_fqn: str, *, set_server
         procedure=proc_fqn,
         type="read",
         params=[ProcParam(**p) for p in params],
-        result
+        result_columns=[ProcColumn(**c) for c in columns],
+    )
+    return entry
+
+def save_registry(entry: ProcRegistryEntry) -> Path:
+    REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+    path = REGISTRY_DIR / f"{entry.procedure}.yml"
+    # Write once if not exists; if exists, we only update params/result_columns if file is empty.
+    if path.exists():
+        # Do not overwrite a curated file; Phase 1 policy is "generate-if-missing"
+        return path
+    data = {
+        "procedure": entry.procedure,
+        "type": entry.type,
+        "timeouts": {"request_ms": entry.timeouts.request_ms},
+        "limits": {"max_concurrency": entry.limits.max_concurrency},
+        "params": [p.model_dump() for p in entry.params],
+        "result_columns": [c.model_dump() for c in entry.result_columns],
+    }
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return path
+
+def ensure_atlas_placeholder(entry: ProcRegistryEntry) -> Path:
+    ATLAS_DIR.mkdir(parents=True, exist_ok=True)
+    path = ATLAS_DIR / f"{entry.procedure}.atlas.yml"
+    if path.exists():
+        return path
+    # Create placeholder atlas with governance defaults, empty descriptions
+    atlas = {
+        "procedure": entry.procedure,
+        "columns": [
+            {
+                "name": c.name,
+                "description": "",
+                "tags": [],
+                "expose_to_llm": False,
+                "mask_in_logs": True if "name" in c.name.lower() else False,
+            }
+            for c in entry.result_columns
+        ],
+    }
+    path.write_text(yaml.safe_dump(atlas, sort_keys=False), encoding="utf-8")
+    return path
+
 
 
 
