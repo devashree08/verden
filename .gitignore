@@ -1,175 +1,23 @@
-from __future__ import annotations
-
-import os
-from pathlib import Path
-from typing import Tuple
-
-import pyodbc  # type: ignore
-import yaml
-from pydantic import ValidationError
-
-from .types import ProcRegistryEntry, ProcParam, ProcColumn
-from .introspect import get_proc_params, get_proc_result_columns
-
-REGISTRY_DIR = Path("registry")
-ATLAS_DIR = Path("atlas")
-
-def _split_fqn(proc_fqn: str) -> Tuple[str, str]:
-    if "." not in proc_fqn:
-        raise ValueError("Procedure must be schema-qualified: e.g., dbo.MyProc")
-    schema, proc = proc_fqn.split(".", 1)
-    return schema, proc
-
-def generate_registry_yaml(conn: pyodbc.Connection, proc_fqn: str, *, set_server_supplied_eid: bool = True) -> ProcRegistryEntry:
-    schema, proc = _split_fqn(proc_fqn)
-    cursor = conn.cursor()
-    params = get_proc_params(cursor, schema, proc)
-    # Mark EID as server-supplied when present
-    if set_server_supplied_eid:
-        for p in params:
-            if p["name"].lower() == "eid":
-                p["server_supplied"] = True
-    columns = get_proc_result_columns(conn, schema, proc)
-    entry = ProcRegistryEntry(
-        procedure=proc_fqn,
-        type="read",
-        params=[ProcParam(**p) for p in params],
-        result_columns=[ProcColumn(**c) for c in columns],
-    )
-    return entry
-
-def save_registry(entry: ProcRegistryEntry) -> Path:
-    REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
-    path = REGISTRY_DIR / f"{entry.procedure}.yml"
-    # Write once if not exists; if exists, we only update params/result_columns if file is empty.
-    if path.exists():
-        # Do not overwrite a curated file; Phase 1 policy is "generate-if-missing"
-        return path
-    data = {
-        "procedure": entry.procedure,
-        "type": entry.type,
-        "timeouts": {"request_ms": entry.timeouts.request_ms},
-        "limits": {"max_concurrency": entry.limits.max_concurrency},
-        "params": [p.model_dump() for p in entry.params],
-        "result_columns": [c.model_dump() for c in entry.result_columns],
-    }
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    return path
-
-def ensure_atlas_placeholder(entry: ProcRegistryEntry) -> Path:
-    ATLAS_DIR.mkdir(parents=True, exist_ok=True)
-    path = ATLAS_DIR / f"{entry.procedure}.atlas.yml"
-    if path.exists():
-        return path
-    # Create placeholder atlas with governance defaults, empty descriptions
-    atlas = {
-        "procedure": entry.procedure,
-        "columns": [
-            {
-                "name": c.name,
-                "description": "",
-                "tags": [],
-                "expose_to_llm": False,
-                "mask_in_logs": True if "name" in c.name.lower() else False,
-            }
-            for c in entry.result_columns
-        ],
-    }
-    path.write_text(yaml.safe_dump(atlas, sort_keys=False), encoding="utf-8")
-    return path
-
-
-
-
-
-
-
-
-from __future__ import annotations
-
-import os
-from dataclasses import dataclass
-
-def _getenv(name: str, default: str | None = None) -> str:
-    val = os.getenv(name, default)
-    if val is None:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return val
-
-@dataclass(slots=True, frozen=True)
-class DbSettings:
-    server: str
-    database: str
-    username: str
-    password: str
-    encrypt: bool
-    trust_server_cert: bool
-    conn_timeout_sec: int
-    command_timeout_sec: int
-    max_connections: int
-    max_workers: int
-    request_timeout_sec: int
-
-    @staticmethod
-    def from_env() -> "DbSettings":
-        return DbSettings(
-            server=_getenv("DB_SERVER"),
-            database=_getenv("DB_DATABASE"),
-            username=_getenv("DB_USERNAME"),
-            password=_getenv("DB_PASSWORD"),
-            encrypt=os.getenv("DB_ENCRYPT", "false").lower() == "true",
-            trust_server_cert=os.getenv("DB_TRUST_SERVER_CERT", "false").lower() == "true",
-            conn_timeout_sec=int(os.getenv("DB_CONN_TIMEOUT_SEC", "5")),
-            command_timeout_sec=int(os.getenv("DB_COMMAND_TIMEOUT_SEC", "30")),
-            max_connections=int(os.getenv("DB_MAX_CONNECTIONS", "10")),
-            max_workers=int(os.getenv("DB_MAX_WORKERS", "10")),
-            request_timeout_sec=int(os.getenv("DB_REQUEST_TIMEOUT_SEC", "30")),
-        )
-
-
-
-from __future__ import annotations
-
-import os
-import sys
-import pyodbc  # type: ignore
-from app.utils.config import DbSettings
-from app.db.executor import _ConnConfig  # reuse the same DSN builder
-from .loader import generate_registry_yaml, save_registry, ensure_atlas_placeholder
-
-PROCS = [
-    "dbo.SPGetAllAppsValueByEID",
-    "dbo.SPGetAllAppsSummaryByEID",
-    "dbo.SPGetVastGeneralByEID",
-]
-
-def main() -> int:
-    settings = DbSettings.from_env()
-    conn_cfg = _ConnConfig(
-        server=settings.server,
-        database=settings.database,
-        username=settings.username,
-        password=settings.password,
-        encrypt=settings.encrypt,
-        trust_server_cert=settings.trust_server_cert,
-        conn_timeout_sec=settings.conn_timeout_sec,
-        command_timeout_sec=settings.command_timeout_sec,
-    )
-    conn = pyodbc.connect(conn_cfg.to_conn_str(), autocommit=True)
-    try:
-        for fqn in PROCS:
-            entry = generate_registry_yaml(conn, fqn, set_server_supplied_eid=True)
-            reg_path = save_registry(entry)
-            atlas_path = ensure_atlas_placeholder(entry)
-            print(f"[OK] {fqn} → {reg_path} ; {atlas_path}")
-    finally:
-        conn.close()
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
-
-
-
+    SELECT
+        p.name                        AS param_name,
+        CASE
+            WHEN t.is_user_defined = 1 THEN bt.name   -- resolve base/system type for UDTT/alias types
+            ELSE t.name
+        END                           AS system_type_name,
+        p.max_length,
+        p.precision,
+        p.scale,
+        p.is_output,
+        p.has_default_value
+    FROM sys.parameters AS p
+    JOIN sys.objects    AS o
+         ON o.object_id = p.object_id
+    JOIN sys.types      AS t
+         ON t.user_type_id = p.user_type_id
+    LEFT JOIN sys.types AS bt
+         ON bt.system_type_id = t.system_type_id
+        AND bt.user_type_id   = bt.system_type_id
+    WHERE o.type IN ('P','PC')
+      AND SCHEMA_NAME(o.schema_id) = ?
+      AND o.name = ?
+    ORDER BY p.parameter_id;
