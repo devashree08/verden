@@ -1,19 +1,111 @@
 from __future__ import annotations
 
-class DbError(Exception):
-    """Base DB error."""
+import re
+from datetime import date, datetime
+from typing import Optional, Union
 
-class DbTimeoutError(DbError):
-    """Command/connection timed out."""
+# --- VAST list parsing (numeric-only) -----------------------------------------
 
-class DbInvalidInputError(DbError):
-    """Client input failed validation."""
+_VAST_ITEM_RE = re.compile(r"^\d{1,20}$")  # numeric only, up to 20 digits
 
-class DbUnauthorizedError(DbError):
-    """Permission/authorization issue detected pre-DB or from SQL Server."""
 
-class DbInternalError(DbError):
-    """Unexpected DB/driver error."""
+def parse_vast_csv(
+    vast: Optional[str],
+    *,
+    max_ids: int = 200,
+    max_total_len: int = 16000,
+) -> list[str] | None:
+    """
+    Parse a comma-separated list of numeric VAST IDs.
+
+    Returns list[str] (deduped, order-preserving) or None if input is empty/whitespace.
+
+    Guards:
+      - numeric-only items (1..20 digits)
+      - maximum total length (DoS guard)
+      - maximum number of IDs
+    """
+    if vast is None:
+        return None
+    s = vast.strip()
+    if not s:
+        return None
+    if len(s) > max_total_len:
+        raise ValueError("VAST list too long")
+    out: list[str] = []
+    for raw in s.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if not _VAST_ITEM_RE.match(item):
+            raise ValueError(f"Invalid VAST id: {item!r} (numeric only)")
+        out.append(item)
+        if len(out) > max_ids:
+            raise ValueError("Too many VAST ids")
+    # de-duplicate while preserving order
+    seen: set[str] = set()
+    dedup: list[str] = []
+    for v in out:
+        if v not in seen:
+            dedup.append(v)
+            seen.add(v)
+    return dedup or None
+
+
+# --- ReportMonth normalization (month key) ------------------------------------
+
+_ReportMonthLike = Union[str, date, datetime, None]
+
+
+def normalize_report_month(value: _ReportMonthLike) -> datetime:
+    """
+    Normalize a ReportMonth to the *first day of the month at 00:00:00*.
+    No timezone handling; result is a naive datetime, matching SQL Server's DATETIME usage.
+
+    Accepted inputs:
+      - None           -> current month (today's date)
+      - date           -> first-of-month at 00:00:00
+      - datetime       -> uses its year/month; sets day=1, time=00:00:00; tzinfo ignored
+      - 'YYYY-MM'      -> first-of-month at 00:00:00
+      - 'YYYY-MM-01'   -> first-of-month at 00:00:00
+      - 'YYYY-MM-01 00:00:00' (or ISO-like) -> coerced to first-of-month 00:00:00
+
+    Note: NL phrases like "last month"/"July 2025" are *out of scope for Phase 1*.
+    """
+    if value is None:
+        today = date.today()
+        return datetime(today.year, today.month, 1, 0, 0, 0)
+
+    if isinstance(value, datetime):
+        return datetime(value.year, value.month, 1, 0, 0, 0)
+
+    if isinstance(value, date):
+        return datetime(value.year, value.month, 1, 0, 0, 0)
+
+    # string parsing (strict, minimal forms we expect)
+    s = value.strip()
+    # 'YYYY-MM'
+    if len(s) == 7 and s[4] == "-":
+        y, m = s.split("-", 1)
+        return datetime(int(y), int(m), 1, 0, 0, 0)
+    # 'YYYY-MM-01' or 'YYYY-MM-01 00:00:00' or ISO-ish with T
+    try:
+        # try common formats without pulling in heavy parsers
+        if "T" in s:
+            # ISO-like 'YYYY-MM-01T00:00:00' -> use fromisoformat where possible
+            dt = datetime.fromisoformat(s)
+            return datetime(dt.year, dt.month, 1, 0, 0, 0)
+        # 'YYYY-MM-01 00:00:00'
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                return datetime(dt.year, dt.month, 1, 0, 0, 0)
+            except ValueError:
+                continue
+    except Exception:
+        pass
+
+    raise ValueError("Unsupported ReportMonth format")
 
 
 from __future__ import annotations
