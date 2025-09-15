@@ -1,23 +1,20 @@
-    SELECT
-        p.name                        AS param_name,
-        CASE
-            WHEN t.is_user_defined = 1 THEN bt.name   -- resolve base/system type for UDTT/alias types
-            ELSE t.name
-        END                           AS system_type_name,
-        p.max_length,
-        p.precision,
-        p.scale,
-        p.is_output,
-        p.has_default_value
-    FROM sys.parameters AS p
-    JOIN sys.objects    AS o
-         ON o.object_id = p.object_id
-    JOIN sys.types      AS t
-         ON t.user_type_id = p.user_type_id
-    LEFT JOIN sys.types AS bt
-         ON bt.system_type_id = t.system_type_id
-        AND bt.user_type_id   = bt.system_type_id
-    WHERE o.type IN ('P','PC')
-      AND SCHEMA_NAME(o.schema_id) = ?
-      AND o.name = ?
-    ORDER BY p.parameter_id;
+import * as React from 'react';
+import { Paper, Box, Typography } from '@mui/material';
+import DoNotDisturbAltIcon from '@mui/icons-material/DoNotDisturbAlt';
+
+export default function OutOfScopeNotice({ orgName, subcatName }) {
+  return (
+    <Paper variant="outlined" sx={{ p: 2, borderRadius: 2, bgcolor: 'background.default' }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <DoNotDisturbAltIcon color="disabled" />
+        <Typography variant="subtitle1" sx={{ fontWeight: 800 }}>
+          {subcatName || 'This CSF 2.0 subcategory'}
+        </Typography>
+      </Box>
+      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
+        is currently <strong>out of scope</strong> for {orgName || 'this org'}. Attributes are hidden and
+        adding custom attributes is disabled. Update scope to “Yes” on the Readiness page to enable editing.
+      </Typography>
+    </Paper>
+  );
+}
