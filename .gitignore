@@ -36,9 +36,10 @@ import {
   ListItemText,
   Stack,
   Tooltip,
-  Link,
   Snackbar,
-  Alert
+  Alert,
+  useTheme,
+  useMediaQuery
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import SaveIcon from "@mui/icons-material/Save";
@@ -53,33 +54,32 @@ const theme = createTheme({
     primary: { main: "#1976d2" }, // MUI blue
   },
   shape: { borderRadius: 12 },
-  typography: { fontSize: 14 },
+  typography: {
+    fontSize: 14,
+    h4: { fontSize: "1.6rem", "@media (min-width:900px)": { fontSize: "2rem" } },
+  },
+  components: {
+    MuiCardContent: {
+      styleOverrides: {
+        root: { padding: 16, "@media (min-width:900px)": { padding: 20 } },
+      },
+    },
+    MuiAccordionSummary: { styleOverrides: { root: { minHeight: 40 } } },
+  },
 });
 
-// ---------- CSF 2.0 TEST DATA (grounded to csf.tools) ----------
-// Sources:
-// GV.RR-01: Organizational leadership accountable for cybersecurity risk.
-// PR.AA-01: Identities and credentials are managed.
-// PR.AT-01: Personnel receive awareness & training (general).
-// PR.DS-01: Data-at-rest protected.
-// PR.PS-01: Configuration management practices established.
-// DE.AE-02: Potentially adverse events are analyzed.
-// DE.AE-03: Information is correlated from multiple sources.
-// RS.MI-01: Incidents are contained.
-// RC.RP-01: Recovery plan portion executed.
-// ID.IM-01: Improvements identified from evaluations.
-
+// ---------- CSF 2.0 TEST DATA (grounded to csf.tools descriptions) ----------
 const SUBCATS = [
-  "GV.RR-01",
-  "PR.AA-01",
-  "PR.AT-01",
-  "PR.DS-01",
-  "PR.PS-01",
-  "DE.AE-02",
-  "DE.AE-03",
-  "RS.MI-01",
-  "RC.RP-01",
-  "ID.IM-01",
+  "GV.RR-01", // leadership accountable for cyber risk
+  "PR.AA-01", // identities/credentials managed
+  "PR.AT-01", // awareness & training
+  "PR.DS-01", // data-at-rest protected
+  "PR.PS-01", // configuration management
+  "DE.AE-02", // adverse events analyzed
+  "DE.AE-03", // info correlated from multiple sources
+  "RS.MI-01", // incidents contained
+  "RC.RP-01", // recovery plan executed
+  "ID.IM-01", // improvements identified
 ];
 
 const definitions = {
@@ -142,7 +142,6 @@ SUBCATS.forEach((sc) => {
   };
 });
 
-// ---------- SMALL HELPERS ----------
 function MultiSelect({ label, options, selected, onChange }) {
   return (
     <FormControl fullWidth size="small">
@@ -175,22 +174,22 @@ function MultiSelect({ label, options, selected, onChange }) {
 function AttributeBlock({ attr, value, onChange }) {
   return (
     <Accordion disableGutters sx={{ borderRadius: 2, overflow: "hidden" }}>
-      <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-        <Stack spacing={0.5}>
-          <Typography fontWeight={600}>{attr.title}</Typography>
+      <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: { xs: 1, md: 2 } }}>
+        <Stack spacing={0.5} sx={{ pr: 1 }}>
+          <Typography fontWeight={600} variant="body1">{attr.title}</Typography>
           <Typography variant="body2" color="text.secondary">
             {attr.definition}
           </Typography>
         </Stack>
       </AccordionSummary>
-      <AccordionDetails>
-        <Stack spacing={2}>
+      <AccordionDetails sx={{ px: { xs: 1.5, md: 2 } }}>
+        <Stack spacing={1.5}>
           <Box>
             <Typography variant="subtitle2">Artifacts</Typography>
-            <List dense>
+            <List dense sx={{ py: 0 }}>
               {attr.artifacts.map((a) => (
-                <ListItemButton key={a.id} component="a" href={a.url} target="_blank">
-                  <ListItemText primary={a.title} secondary={a.url} />
+                <ListItemButton key={a.id} component="a" href={a.url} target="_blank" sx={{ py: 0.5 }}>
+                  <ListItemText primaryTypographyProps={{ variant: 'body2' }} primary={a.title} secondary={a.url} />
                 </ListItemButton>
               ))}
             </List>
@@ -230,21 +229,20 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [snack, setSnack] = useState("");
   const printableRef = useRef(null);
+  const muiTheme = useTheme();
+  const downMd = useMediaQuery(muiTheme.breakpoints.down('md'));
+  const downLg = useMediaQuery(muiTheme.breakpoints.down('lg'));
 
   const narrative = useMemo(() => {
     const lines = [];
     lines.push(`# Narrative for ${org}`);
     lines.push("");
-    lines.push(`**Executive Summary**
-${execSum}`);
+    lines.push(`**Executive Summary**\n${execSum}`);
     lines.push("");
-    lines.push(`**Scope**
-${scope}`);
+    lines.push(`**Scope**\n${scope}`);
     lines.push("");
-    if (quant) lines.push(`**Coverage / Profile (Quantitative)**
-Assessed population coverage: ~${pct}%.`);
-    else lines.push(`**Coverage / Profile (Qualitative)**
-${coverage}`);
+    if (quant) lines.push(`**Coverage / Profile (Quantitative)**\nAssessed population coverage: ~${pct}%.`);
+    else lines.push(`**Coverage / Profile (Qualitative)**\n${coverage}`);
     lines.push("");
     subcats.forEach((sc) => {
       lines.push(`## Subcategory ${sc}`);
@@ -260,19 +258,11 @@ ${coverage}`);
         lines.push("");
       });
     });
-    return lines.join("
-");
+    return lines.join("\n");
   }, [org, subcats, execSum, scope, quant, coverage, pct, comments]);
 
   const saveNarrative = () => {
-    const entry = {
-      id: Date.now(),
-      org,
-      subcats: [...subcats],
-      narrative,
-      meta: { execSum, scope, quant, coverage, pct },
-      comments,
-    };
+    const entry = { id: Date.now(), org, subcats: [...subcats], narrative, meta: { execSum, scope, quant, coverage, pct }, comments };
     setSaved((s) => [entry, ...s]);
     setSnack("Saved draft");
   };
@@ -296,10 +286,7 @@ ${coverage}`);
       const doc = new jsPDF({ unit: "pt", format: "a4" });
       const margin = 40;
       const maxWidth = 515;
-      const text = narrative.replaceAll("
-", "
-
-");
+      const text = narrative.replaceAll("\n", "\n\n");
       const lines = doc.splitTextToSize(text, maxWidth);
       doc.text(lines, margin, margin);
       doc.save(`Narrative_${org}.pdf`);
@@ -314,8 +301,7 @@ ${coverage}`);
       const { Document, Packer, Paragraph, TextRun, HeadingLevel } = docx;
       const blocks = [];
       blocks.push(new Paragraph({ heading: HeadingLevel.TITLE, children: [new TextRun(`Narrative for ${org}`)] }));
-      narrative.split("
-").forEach((line) => {
+      narrative.split("\n").forEach((line) => {
         if (!line.trim()) { blocks.push(new Paragraph("")); return; }
         if (line.startsWith("## ")) {
           blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun(line.replace("## ", ""))] }));
@@ -341,27 +327,36 @@ ${coverage}`);
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
-      <Box sx={{ bgcolor: "background.default", minHeight: "100dvh", py: 3 }}>
-        <Container maxWidth="lg">
+      <Box sx={{ bgcolor: "background.default", minHeight: "100dvh", py: 2 }}>
+        <Container maxWidth={downLg ? "md" : "lg"}>
           <Typography variant="h4" fontWeight={700} gutterBottom>
-            CSF 2.0 Narrative Generator (MUI / JSX)
+            CSF 2.0 Narrative Generator (MUI / Responsive JSX)
           </Typography>
 
-          <Grid container spacing={3}>
+          <Grid container spacing={2} alignItems="start">
             {/* Left column */}
-            <Grid item xs={12} md={4}>
+            <Grid item xs={12} md={5} lg={4}>
               <Card>
                 <CardContent>
                   <Stack spacing={2}>
                     <Box>
                       <Typography variant="subtitle2" sx={{ mb: 1 }}>Organization</Typography>
-                      <ButtonGroup fullWidth>
-                        {fakeDB.orgs.map((o) => (
-                          <Button key={o} variant={org === o ? "contained" : "outlined"} onClick={() => setOrg(o)}>
-                            {o}
-                          </Button>
-                        ))}
-                      </ButtonGroup>
+                      {downMd ? (
+                        <FormControl fullWidth size="small">
+                          <InputLabel id="org-label">Organization</InputLabel>
+                          <Select labelId="org-label" value={org} label="Organization" onChange={(e)=>setOrg(e.target.value)}>
+                            {fakeDB.orgs.map(o=> <MenuItem key={o} value={o}>{o}</MenuItem>)}
+                          </Select>
+                        </FormControl>
+                      ) : (
+                        <ButtonGroup fullWidth>
+                          {fakeDB.orgs.map((o) => (
+                            <Button key={o} variant={org === o ? "contained" : "outlined"} onClick={() => setOrg(o)}>
+                              {o}
+                            </Button>
+                          ))}
+                        </ButtonGroup>
+                      )}
                     </Box>
 
                     <MultiSelect
@@ -376,7 +371,7 @@ ${coverage}`);
                       value={execSum}
                       onChange={(e) => setExecSum(e.target.value)}
                       multiline
-                      minRows={4}
+                      minRows={downMd ? 3 : 4}
                       fullWidth
                     />
 
@@ -385,7 +380,7 @@ ${coverage}`);
                       value={scope}
                       onChange={(e) => setScope(e.target.value)}
                       multiline
-                      minRows={3}
+                      minRows={downMd ? 2 : 3}
                       fullWidth
                     />
 
@@ -405,7 +400,7 @@ ${coverage}`);
                           fullWidth
                           size="small"
                           multiline
-                          minRows={3}
+                          minRows={downMd ? 2 : 3}
                         />
                       ) : (
                         <TextField
@@ -423,23 +418,11 @@ ${coverage}`);
                     <Divider />
 
                     <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
-                      <Button startIcon={<SaveIcon />} onClick={saveNarrative}>
-                        Save
-                      </Button>
-                      <Button startIcon={<VisibilityIcon />} color="secondary" variant="outlined" onClick={() => setPreviewOpen(true)}>
-                        Preview
-                      </Button>
-                      <Tooltip title="Export to PDF">
-                        <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF}>
-                          PDF
-                        </Button>
-                      </Tooltip>
-                      <Tooltip title="Export to Word (.docx)">
-                        <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>
-                          DOCX
-                        </Button>
-                      </Tooltip>
-                      <Button variant="text" onClick={() => setDrawerOpen(true)}>Edit existing narrative…</Button>
+                      <Button startIcon={<SaveIcon />} onClick={saveNarrative}>Save</Button>
+                      <Button startIcon={<VisibilityIcon />} color="secondary" variant="outlined" onClick={() => setPreviewOpen(true)}>Preview</Button>
+                      <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF}>PDF</Button>
+                      <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>DOCX</Button>
+                      <Button variant="text" onClick={() => setDrawerOpen(true)}>Edit existing…</Button>
                     </Stack>
                   </Stack>
                 </CardContent>
@@ -447,23 +430,29 @@ ${coverage}`);
             </Grid>
 
             {/* Right column */}
-            <Grid item xs={12} md={8}>
+            <Grid item xs={12} md={7} lg={8}>
               <Card>
                 <CardContent>
-                  <Tabs value={tab} onChange={(_, v) => setTab(v)} aria-label="maturity tabs">
+                  <Tabs
+                    value={tab}
+                    onChange={(_, v) => setTab(v)}
+                    aria-label="maturity tabs"
+                    variant="scrollable"
+                    allowScrollButtons
+                  >
                     <Tab label="Maturity Level 3" value="L3" />
                     <Tab label="Maturity Level 4" value="L4" />
                   </Tabs>
 
-                  <Divider sx={{ my: 2 }} />
+                  <Divider sx={{ my: 1.5 }} />
 
-                  <Stack spacing={3}>
+                  <Stack spacing={1.5}>
                     {subcats.map((sc) => (
                       <Box key={sc}>
-                        <Typography variant="h6" sx={{ mb: 1 }}>
+                        <Typography variant="subtitle1" sx={{ mb: 0.5 }}>
                           {sc}: {definitions[sc]}
                         </Typography>
-                        <Stack spacing={1.5}>
+                        <Stack spacing={1}>
                           {fakeDB.maturity[sc][tab].map((attr) => {
                             const key = `${sc}|${tab}|${attr.id}`;
                             return (
@@ -493,10 +482,9 @@ ${coverage}`);
         {/* Preview Dialog */}
         <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} fullWidth maxWidth="md">
           <DialogTitle>Narrative Preview</DialogTitle>
-          <DialogContent dividers>
+          <DialogContent dividers sx={{ maxHeight: { xs: '65vh', md: '70vh' } }}>
             <Box sx={{ typography: "body1" }}>
-              {narrative.split("
-").map((line, i) => (
+              {narrative.split("\n").map((line, i) => (
                 <Typography key={i} sx={{
                   fontWeight: line.startsWith("**") ? 600 : undefined,
                   fontSize: line.startsWith("## ") ? 18 : undefined,
@@ -545,12 +533,13 @@ ${coverage}`);
           <Alert onClose={() => setSnack("")} severity="success" variant="filled">{snack}</Alert>
         </Snackbar>
 
-        <Box sx={{ textAlign: "center", mt: 4 }}>
+        <Box sx={{ textAlign: "center", mt: 3 }}>
           <Typography variant="caption" color="text.secondary">
-            Preview uses CSF 2.0 subcategories sourced from csf.tools. Buttons use MUI primary blue.
+            Responsive: stacked on tablets, two-column on laptops/monitors. Buttons use MUI primary blue.
           </Typography>
         </Box>
       </Box>
     </ThemeProvider>
   );
 }
+
