@@ -1,8 +1,6 @@
 import * as React from "react";
 import { useMemo, useRef, useState } from "react";
 import {
-  ThemeProvider,
-  createTheme,
   CssBaseline,
   Container,
   Grid,
@@ -38,48 +36,41 @@ import {
   Tooltip,
   Snackbar,
   Alert,
-  useMediaQuery
+  useTheme,
+  useMediaQuery,
+  Chip as MuiChip
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import SaveIcon from "@mui/icons-material/Save";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
 import DescriptionIcon from "@mui/icons-material/Description";
+import DoneAllIcon from "@mui/icons-material/DoneAll";
 
-// Theme with blue primary
-const theme = createTheme({
-  palette: {
-    mode: "light",
-    primary: { main: "#1976d2" },
-  },
-  shape: { borderRadius: 12 },
-  typography: { fontSize: 14 },
-});
-
-// --- CSF 2.0 Test Data ---
+// ===================== CSF 2.0 realistic test data (10 subcategories) =====================
 const SUBCATS = [
-  "GV.RR-01",
-  "PR.AA-01",
-  "PR.AT-01",
-  "PR.DS-01",
-  "PR.PS-01",
-  "DE.AE-02",
-  "DE.AE-03",
-  "RS.MI-01",
-  "RC.RP-01",
-  "ID.IM-01",
+  "GV.RR-01", // leadership accountable for cyber risk
+  "PR.AA-01", // identities & credentials managed
+  "PR.AT-01", // awareness & training
+  "PR.DS-01", // data-at-rest protected
+  "PR.PS-01", // configuration management
+  "DE.AE-02", // adverse events analyzed
+  "DE.AE-03", // correlation across sources
+  "RS.MI-01", // incidents contained
+  "RC.RP-01", // recovery plan executed
+  "ID.IM-01", // improvements identified
 ];
 
 const definitions = {
-  "GV.RR-01": "Organizational leadership is responsible and accountable for cybersecurity risk.",
-  "PR.AA-01": "Identities and credentials are managed.",
-  "PR.AT-01": "Personnel are provided awareness and training.",
-  "PR.DS-01": "Data-at-rest is protected.",
-  "PR.PS-01": "Configuration management practices are established.",
-  "DE.AE-02": "Potentially adverse events are analyzed.",
+  "GV.RR-01": "Organizational leadership is responsible and accountable for cybersecurity risk and fosters a risk‑aware, ethical, continually improving culture.",
+  "PR.AA-01": "Identities and credentials for authorized users, services, and hardware are managed by the organization.",
+  "PR.AT-01": "Personnel receive awareness and training to perform general tasks with cybersecurity risks in mind.",
+  "PR.DS-01": "Data‑at‑rest is protected (confidentiality, integrity, availability).",
+  "PR.PS-01": "Configuration management practices are established and applied.",
+  "DE.AE-02": "Potentially adverse events are analyzed to better understand associated activities.",
   "DE.AE-03": "Information is correlated from multiple sources.",
   "RS.MI-01": "Incidents are contained.",
-  "RC.RP-01": "Recovery portion of incident response executed.",
+  "RC.RP-01": "The recovery portion of the incident response plan is executed once initiated from the incident response process.",
   "ID.IM-01": "Improvements are identified from evaluations.",
 };
 
@@ -87,24 +78,27 @@ const makeArtifacts = (count, sc, lvl) =>
   Array.from({ length: count }, (_, i) => ({
     id: `${sc}-${lvl}-A${i + 1}`,
     title: `Artifact ${i + 1} for ${sc}`,
-    url: `https://example.com/artifacts/${sc}/${lvl}/${i + 1}`,
+    url: `https://example.com/artifacts/${encodeURIComponent(sc)}/${lvl}/${i + 1}`,
   }));
 
-const fakeDB = { orgs: ["VCS", "TPD", "NETWORK"], subcategories: SUBCATS, maturity: {} };
+const maturity = {};
 SUBCATS.forEach((sc) => {
-  fakeDB.maturity[sc] = {
+  maturity[sc] = {
     L3: [
-      { id: `${sc}-L3-1`, title: `Attribute 1`, definition: `${definitions[sc]} (baseline L3).`, artifacts: makeArtifacts(2, sc, "L3") },
-      { id: `${sc}-L3-2`, title: `Attribute 2`, definition: `Documented process for ${sc}.`, artifacts: makeArtifacts(2, sc, "L3") },
+      { id: `${sc}-L3-1`, title: "Attribute 1", definition: `${definitions[sc]} (baseline L3).`, artifacts: makeArtifacts(2, sc, "L3") },
+      { id: `${sc}-L3-2`, title: "Attribute 2", definition: `Documented process, periodic review, and stakeholder visibility for ${sc}.`, artifacts: makeArtifacts(2, sc, "L3") },
     ],
     L4: [
-      { id: `${sc}-L4-1`, title: `Attribute 1`, definition: `Metrics-driven improvement for ${sc}.`, artifacts: makeArtifacts(3, sc, "L4") },
-      { id: `${sc}-L4-2`, title: `Attribute 2`, definition: `Proactive validation for ${sc}.`, artifacts: makeArtifacts(2, sc, "L4") },
-      { id: `${sc}-L4-3`, title: `Attribute 3`, definition: `Integration with enterprise risk metrics for ${sc}.`, artifacts: makeArtifacts(2, sc, "L4") },
+      { id: `${sc}-L4-1`, title: "Attribute 1", definition: `Metrics‑driven continuous improvement & automation for ${sc}.`, artifacts: makeArtifacts(3, sc, "L4") },
+      { id: `${sc}-L4-2`, title: "Attribute 2", definition: `Proactive validation and governance for ${sc}.`, artifacts: makeArtifacts(2, sc, "L4") },
+      { id: `${sc}-L4-3`, title: "Attribute 3", definition: `Integrated with enterprise risk metrics & assurance for ${sc}.`, artifacts: makeArtifacts(2, sc, "L4") },
     ],
   };
 });
 
+const fakeDB = { orgs: ["VCS", "TPD", "NETWORK"], subcategories: SUBCATS, maturity };
+
+// ===================== Small reusable pieces =====================
 function MultiSelect({ label, options, selected, onChange }) {
   return (
     <FormControl fullWidth size="small">
@@ -114,13 +108,18 @@ function MultiSelect({ label, options, selected, onChange }) {
         multiple
         value={selected}
         onChange={(e) => onChange(e.target.value)}
+        label={label}
         renderValue={(sel) => (
           <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
-            {sel.map((v) => <Chip key={v} label={v} size="small" />)}
+            {sel.map((v) => (
+              <Chip key={v} label={v} size="small" />
+            ))}
           </Box>
         )}
       >
-        {options.map((opt) => <MenuItem key={opt} value={opt}>{opt}</MenuItem>)}
+        {options.map((opt) => (
+          <MenuItem key={opt} value={opt}>{opt}</MenuItem>
+        ))}
       </Select>
     </FormControl>
   );
@@ -128,100 +127,238 @@ function MultiSelect({ label, options, selected, onChange }) {
 
 function AttributeBlock({ attr, value, onChange }) {
   return (
-    <Accordion disableGutters sx={{ borderRadius: 2 }}>
-      <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-        <Stack spacing={0.5}>
+    <Accordion disableGutters>
+      <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 1 }}>
+        <Stack spacing={0.25} sx={{ pr: 1 }}>
           <Typography fontWeight={600}>{attr.title}</Typography>
           <Typography variant="body2" color="text.secondary">{attr.definition}</Typography>
         </Stack>
       </AccordionSummary>
       <AccordionDetails>
-        <Stack spacing={2}>
-          <List dense>
-            {attr.artifacts.map((a) => (
-              <ListItemButton key={a.id} component="a" href={a.url} target="_blank">
-                <ListItemText primary={a.title} secondary={a.url} />
-              </ListItemButton>
-            ))}
-          </List>
-          <TextField
-            label="User comment"
-            fullWidth
-            size="small"
-            multiline
-            minRows={3}
-            value={value || ""}
-            onChange={(e) => onChange(e.target.value)}
-          />
+        <Stack spacing={1.25}>
+          <Box>
+            <Typography variant="subtitle2">Artifacts</Typography>
+            <List dense sx={{ py: 0 }}>
+              {attr.artifacts.map((a) => (
+                <ListItemButton key={a.id} component="a" href={a.url} target="_blank" sx={{ py: 0.5 }}>
+                  <ListItemText primary={a.title} secondary={a.url} />
+                </ListItemButton>
+              ))}
+            </List>
+          </Box>
+          <TextField label="User comment" fullWidth size="small" multiline minRows={3} value={value || ""} onChange={(e) => onChange(e.target.value)} />
         </Stack>
       </AccordionDetails>
     </Accordion>
   );
 }
 
+// ===================== App =====================
 export default function App() {
-  const isSmall = useMediaQuery(theme.breakpoints.down("md"));
+  const theme = useTheme();
+  const downMd = useMediaQuery(theme.breakpoints.down("md"));
+
   const [org, setOrg] = useState("VCS");
-  const [subcats, setSubcats] = useState(["GV.RR-01", "DE.AE-02"]);
-  const [execSum, setExecSum] = useState("Exec summary...");
-  const [scope, setScope] = useState("Scope...");
+  const [subcats, setSubcats] = useState(["GV.RR-01", "DE.AE-02", "DE.AE-03"]);
+  const [execSum, setExecSum] = useState("We operate a central catalog of role‑aligned training, publish quarterly updates, and continually refine service delivery.");
+  const [scope, setScope] = useState("Covers VCS, TPD, Network, and corporate cybersecurity functions.");
   const [quant, setQuant] = useState(false);
-  const [coverage, setCoverage] = useState("Qualitative coverage...");
-  const [pct, setPct] = useState(80);
-  const [comments, setComments] = useState({});
+  const [coverage, setCoverage] = useState("Coverage sampled via interviews and artifact review.");
+  const [pct, setPct] = useState(85);
   const [tab, setTab] = useState("L3");
+  const [comments, setComments] = useState({});
+  const [saved, setSaved] = useState([]);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [snack, setSnack] = useState("");
+  const [completed, setCompleted] = useState(false);
 
   const narrative = useMemo(() => {
-    return `Narrative for ${org}`;
-  }, [org]);
+    const lines = [];
+    lines.push(`# Narrative for ${org}`);
+    lines.push("");
+    lines.push(`**Executive Summary**\n${execSum}`);
+    lines.push("");
+    lines.push(`**Scope**\n${scope}`);
+    lines.push("");
+    if (quant) lines.push(`**Coverage / Profile (Quantitative)**\nAssessed population coverage: ~${pct}%.`);
+    else lines.push(`**Coverage / Profile (Qualitative)**\n${coverage}`);
+    lines.push("");
+    subcats.forEach((sc) => {
+      lines.push(`## Subcategory ${sc}`);
+      ["L3", "L4"].forEach((lvl) => {
+        lines.push(`**Maturity ${lvl.replace("L", "Level ")}:**`);
+        fakeDB.maturity[sc][lvl].forEach((a) => {
+          const key = `${sc}|${lvl}|${a.id}`;
+          lines.push(`- *${a.title}:* ${a.definition}`);
+          if (comments[key]) lines.push(`  - **Comment:** ${comments[key]}`);
+          const arts = a.artifacts.map((x) => x.title).join(", ");
+          lines.push(`  - **Artifacts:** ${arts}`);
+        });
+        lines.push("");
+      });
+    });
+    if (completed) {
+      lines.push("**Status:** Completed draft narrative.");
+    }
+    return lines.join("\n");
+  }, [org, subcats, execSum, scope, quant, coverage, pct, comments, completed]);
+
+  const saveNarrative = () => {
+    const entry = { id: Date.now(), org, subcats: [...subcats], narrative, meta: { execSum, scope, quant, coverage, pct, completed }, comments };
+    setSaved((s) => [entry, ...s]);
+    setSnack("Saved draft");
+  };
+
+  const loadNarrative = (n) => {
+    setOrg(n.org);
+    setSubcats(n.subcats);
+    setExecSum(n.meta.execSum);
+    setScope(n.meta.scope);
+    setQuant(n.meta.quant);
+    setCoverage(n.meta.coverage);
+    setPct(n.meta.pct);
+    setComments(n.comments || {});
+    setCompleted(!!n.meta.completed);
+    setDrawerOpen(false);
+    setSnack("Loaded draft");
+  };
+
+  async function exportPDF() {
+    try {
+      const { jsPDF } = await import("jspdf");
+      const doc = new jsPDF({ unit: "pt", format: "a4" });
+      const margin = 40;
+      const maxWidth = 515;
+      const text = narrative.replaceAll("\n", "\n\n");
+      const lines = doc.splitTextToSize(text, maxWidth);
+      doc.text(lines, margin, margin);
+      doc.save(`Narrative_${org}.pdf`);
+    } catch (e) {
+      setSnack("PDF export failed");
+    }
+  }
+
+  async function exportDocx() {
+    try {
+      const docx = await import("docx");
+      const { Document, Packer, Paragraph, TextRun, HeadingLevel } = docx;
+      const blocks = [];
+      blocks.push(new Paragraph({ heading: HeadingLevel.TITLE, children: [new TextRun(`Narrative for ${org}`)] }));
+      narrative.split("\n").forEach((line) => {
+        if (!line.trim()) { blocks.push(new Paragraph("")); return; }
+        if (line.startsWith("## ")) {
+          blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun(line.replace("## ", ""))] }));
+        } else if (line.startsWith("**") && line.endsWith("**")) {
+          blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_3, children: [new TextRun(line.replaceAll("**", ""))] }));
+        } else {
+          blocks.push(new Paragraph({ children: [new TextRun(line.replaceAll("**", ""))] }));
+        }
+      });
+      const doc = new Document({ sections: [{ children: blocks }] });
+      const blob = await Packer.toBlob(doc);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `Narrative_${org}.docx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setSnack("DOCX export failed");
+    }
+  }
 
   return (
-    <ThemeProvider theme={theme}>
+    <React.Fragment>
       <CssBaseline />
-      <Container maxWidth="xl" sx={{ py: 2 }}>
-        <Grid container spacing={2}>
-          <Grid item xs={12} md={4}>
-            <Card sx={{ height: "100%" }}>
+      <Container maxWidth="lg" sx={{ py: 2 }}>
+        <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
+          <Typography variant="h5">CSF 2.0 Narrative Generator</Typography>
+          {completed && <MuiChip color="success" size="small" icon={<DoneAllIcon />} label="Completed" />}
+        </Stack>
+
+        <Grid container spacing={2} alignItems="flex-start">
+          {/* Left column */}
+          <Grid item xs={12} md={4} lg={4}>
+            <Card variant="outlined">
               <CardContent>
                 <Stack spacing={2}>
-                  <ButtonGroup fullWidth orientation={isSmall ? "vertical" : "horizontal"}>
-                    {fakeDB.orgs.map((o) => (
-                      <Button key={o} variant={org === o ? "contained" : "outlined"} onClick={() => setOrg(o)}>
-                        {o}
-                      </Button>
-                    ))}
-                  </ButtonGroup>
+                  <Box>
+                    <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Organization</Typography>
+                    {downMd ? (
+                      <FormControl fullWidth size="small">
+                        <InputLabel id="org-label">Organization</InputLabel>
+                        <Select labelId="org-label" value={org} onChange={(e)=>setOrg(e.target.value)} label="Organization">
+                          {fakeDB.orgs.map(o => <MenuItem key={o} value={o}>{o}</MenuItem>)}
+                        </Select>
+                      </FormControl>
+                    ) : (
+                      <ButtonGroup fullWidth>
+                        {fakeDB.orgs.map((o) => (
+                          <Button key={o} variant={org === o ? "contained" : "outlined"} onClick={() => setOrg(o)}>{o}</Button>
+                        ))}
+                      </ButtonGroup>
+                    )}
+                  </Box>
+
                   <MultiSelect label="Subcategories" options={fakeDB.subcategories} selected={subcats} onChange={setSubcats} />
+
                   <TextField label="Executive Summary" value={execSum} onChange={(e) => setExecSum(e.target.value)} multiline minRows={3} fullWidth />
                   <TextField label="Scope" value={scope} onChange={(e) => setScope(e.target.value)} multiline minRows={2} fullWidth />
-                  <FormControlLabel control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />} label={quant ? "Quantitative" : "Qualitative"} />
-                  {!quant ? (
-                    <TextField label="Coverage" value={coverage} onChange={(e) => setCoverage(e.target.value)} multiline minRows={2} fullWidth />
-                  ) : (
-                    <TextField label="Coverage %" type="number" value={pct} onChange={(e) => setPct(Number(e.target.value))} fullWidth />
-                  )}
+
+                  <Box>
+                    <FormControlLabel control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />} label={quant ? "Quantitative" : "Qualitative"} />
+                    {!quant ? (
+                      <TextField label="Coverage/Profile" value={coverage} onChange={(e) => setCoverage(e.target.value)} fullWidth />
+                    ) : (
+                      <TextField label="Coverage %" type="number" inputProps={{ min: 0, max:100 }} value={pct} onChange={(e) => setPct(Number(e.target.value))} sx={{ width: 160 }} />
+                    )}
+                  </Box>
+
+                  <Divider />
+
+                  <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                    <Button startIcon={<SaveIcon />} onClick={saveNarrative}>Save</Button>
+                    <Button startIcon={<VisibilityIcon />} color="secondary" variant="outlined" onClick={() => setPreviewOpen(true)}>Preview</Button>
+                    <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF}>PDF</Button>
+                    <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>DOCX</Button>
+                    <Button variant="text" onClick={() => setDrawerOpen(true)}>Edit existing…</Button>
+                    <Button startIcon={<DoneAllIcon />} color={completed ? "success" : "primary"} variant={completed ? "outlined" : "contained"} onClick={() => setCompleted((v)=>!v)}>
+                      {completed ? "Mark as Draft" : "Complete Narrative"}
+                    </Button>
+                  </Stack>
                 </Stack>
               </CardContent>
             </Card>
           </Grid>
 
-          <Grid item xs={12} md={8}>
-            <Card>
+          {/* Right column */}
+          <Grid item xs={12} md={8} lg={8}>
+            <Card variant="outlined">
               <CardContent>
-                <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable">
-                  <Tab value="L3" label="Level 3" />
-                  <Tab value="L4" label="Level 4" />
+                <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable" aria-label="maturity tabs">
+                  <Tab label="Level 3" value="L3" />
+                  <Tab label="Level 4" value="L4" />
                 </Tabs>
-                <Divider sx={{ my: 2 }} />
-                <Stack spacing={2}>
+                <Divider sx={{ my: 1 }} />
+
+                <Stack spacing={1.25}>
                   {subcats.map((sc) => (
                     <Box key={sc}>
-                      <Typography variant="h6">{sc}: {definitions[sc]}</Typography>
-                      {fakeDB.maturity[sc][tab].map((attr) => {
-                        const key = `${sc}|${tab}|${attr.id}`;
-                        return <AttributeBlock key={key} attr={attr} value={comments[key]} onChange={(v) => setComments((c) => ({ ...c, [key]: v }))} />;
-                      })}
+                      <Typography variant="h6" sx={{ mb: 0.5 }}>{sc}: {definitions[sc]}</Typography>
+                      <Stack spacing={1}>
+                        {fakeDB.maturity[sc][tab].map((attr) => {
+                          const key = `${sc}|${tab}|${attr.id}`;
+                          return (
+                            <AttributeBlock
+                              key={key}
+                              attr={attr}
+                              value={comments[key]}
+                              onChange={(v) => setComments((c) => ({ ...c, [key]: v }))}
+                            />
+                          );
+                        })}
+                      </Stack>
                     </Box>
                   ))}
                 </Stack>
@@ -229,17 +366,46 @@ export default function App() {
             </Card>
           </Grid>
         </Grid>
-
-        <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} fullScreen={isSmall} maxWidth="md" fullWidth>
-          <DialogTitle>Preview</DialogTitle>
-          <DialogContent>
-            <Typography>{narrative}</Typography>
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={() => setPreviewOpen(false)}>Close</Button>
-          </DialogActions>
-        </Dialog>
       </Container>
-    </ThemeProvider>
+
+      {/* Preview Dialog */}
+      <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} fullWidth maxWidth="md">
+        <DialogTitle>Narrative Preview</DialogTitle>
+        <DialogContent dividers sx={{ maxHeight: { xs: '65vh', md: '70vh' } }}>
+          <Box sx={{ typography: "body1" }}>
+            {narrative.split("\n").map((line, i) => (
+              <Typography key={i} sx={{ fontWeight: line.startsWith("**") ? 600 : undefined, fontSize: line.startsWith("## ") ? 18 : undefined }}>
+                {line.replaceAll("**", "").replace("## ", "")}
+              </Typography>
+            ))}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPreviewOpen(false)}>Close</Button>
+          <Button startIcon={<PictureAsPdfIcon />} onClick={exportPDF}>Export PDF</Button>
+          <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>Export DOCX</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Drawer: saved narratives */}
+      <Drawer anchor="left" open={drawerOpen} onClose={() => setDrawerOpen(false)}>
+        <Box sx={{ width: 360 }} role="presentation">
+          <Typography variant="h6" sx={{ p: 2 }}>Saved narratives</Typography>
+          <Divider />
+          <List>
+            {saved.length === 0 && (<ListItemText primary="Nothing saved yet." sx={{ p: 2 }} />)}
+            {saved.map((n) => (
+              <ListItemButton key={n.id} onClick={() => loadNarrative(n)}>
+                <ListItemText primary={`${n.org}`} secondary={<Typography variant="caption" color="text.secondary">{n.subcats.join(', ')}</Typography>} />
+              </ListItemButton>
+            ))}
+          </List>
+        </Box>
+      </Drawer>
+
+      <Snackbar open={!!snack} autoHideDuration={2200} onClose={() => setSnack("")} anchorOrigin={{ vertical: "bottom", horizontal: "center" }}>
+        <Alert onClose={() => setSnack("")} severity="success" variant="filled">{snack}</Alert>
+      </Snackbar>
+    </React.Fragment>
   );
 }
