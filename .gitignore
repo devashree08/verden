@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useState, useMemo, useRef } from "react";
+import { useState, useMemo } from "react";
 import {
   CssBaseline,
   Container,
@@ -24,28 +24,90 @@ import {
   Accordion,
   AccordionSummary,
   AccordionDetails,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  Drawer,
   List,
   ListItemButton,
   ListItemText,
   Stack,
-  Snackbar,
-  Alert,
   useTheme,
   useMediaQuery
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
-import SaveIcon from "@mui/icons-material/Save";
-import VisibilityIcon from "@mui/icons-material/Visibility";
-import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
-import DescriptionIcon from "@mui/icons-material/Description";
 
-// Dummy test data
-const fakeDB = { orgs: ["VCS", "TPD", "NETWORK"], subcategories: ["GV.RR-01", "DE.AE-02"] };
+// === CSF 2.0 realistic test data (subset) ===
+const SUBCATS = [
+  "GV.RR-01",
+  "DE.AE-02",
+  "DE.AE-03",
+  "PR.AA-01",
+  "PR.AT-01",
+  "PR.DS-01",
+  "PR.PS-01",
+  "RS.MI-01",
+  "RC.RP-01",
+  "ID.IM-01",
+];
+
+const definitions = {
+  "GV.RR-01": "Organizational leadership is responsible and accountable for cybersecurity risk and fosters a risk‑aware culture.",
+  "DE.AE-02": "Potentially adverse events are analyzed to better understand associated activities.",
+  "DE.AE-03": "Information is correlated from multiple sources.",
+  "PR.AA-01": "Identities and credentials are managed for users, services, and hardware.",
+  "PR.AT-01": "Personnel receive awareness and training to perform general tasks with cyber risks in mind.",
+  "PR.DS-01": "Data‑at‑rest is protected (confidentiality, integrity, availability).",
+  "PR.PS-01": "Configuration management practices are established and applied.",
+  "RS.MI-01": "Incidents are contained.",
+  "RC.RP-01": "Recovery portion of the incident response plan is executed when initiated.",
+  "ID.IM-01": "Improvements are identified from evaluations.",
+};
+
+const makeArtifacts = (count, sc, lvl) =>
+  Array.from({ length: count }, (_, i) => ({
+    id: `${sc}-${lvl}-A${i + 1}`,
+    title: `Artifact ${i + 1} for ${sc}`,
+    url: `https://example.com/artifacts/${encodeURIComponent(sc)}/${lvl}/${i + 1}`,
+  }));
+
+const maturity = {};
+SUBCATS.forEach((sc) => {
+  maturity[sc] = {
+    L3: [
+      {
+        id: `${sc}-L3-1`,
+        title: "Attribute 1",
+        definition: `${definitions[sc]} (baseline L3).`,
+        artifacts: makeArtifacts(2, sc, "L3"),
+      },
+      {
+        id: `${sc}-L3-2`,
+        title: "Attribute 2",
+        definition: `Documented process and periodic review for ${sc}.`,
+        artifacts: makeArtifacts(2, sc, "L3"),
+      },
+    ],
+    L4: [
+      {
+        id: `${sc}-L4-1`,
+        title: "Attribute 1",
+        definition: `Metrics‑driven continuous improvement & automation for ${sc}.`,
+        artifacts: makeArtifacts(3, sc, "L4"),
+      },
+      {
+        id: `${sc}-L4-2`,
+        title: "Attribute 2",
+        definition: `Proactive validation and governance for ${sc}.`,
+        artifacts: makeArtifacts(2, sc, "L4"),
+      },
+      {
+        id: `${sc}-L4-3`,
+        title: "Attribute 3",
+        definition: `Integrated with enterprise risk metrics for ${sc}.`,
+        artifacts: makeArtifacts(2, sc, "L4"),
+      },
+    ],
+  };
+});
+
+const fakeDB = { orgs: ["VCS", "TPD", "NETWORK"], subcategories: SUBCATS, maturity };
 
 function MultiSelect({ label, options, selected, onChange }) {
   return (
@@ -56,6 +118,7 @@ function MultiSelect({ label, options, selected, onChange }) {
         multiple
         value={selected}
         onChange={(e) => onChange(e.target.value)}
+        label={label}
         renderValue={(sel) => (
           <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
             {sel.map((v) => (
@@ -72,77 +135,140 @@ function MultiSelect({ label, options, selected, onChange }) {
   );
 }
 
+function AttributeBlock({ attr, value, onChange }) {
+  return (
+    <Accordion disableGutters>
+      <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 1 }}>
+        <Stack spacing={0.25} sx={{ pr: 1 }}>
+          <Typography fontWeight={600}>{attr.title}</Typography>
+          <Typography variant="body2" color="text.secondary">{attr.definition}</Typography>
+        </Stack>
+      </AccordionSummary>
+      <AccordionDetails>
+        <Stack spacing={1.25}>
+          <Box>
+            <Typography variant="subtitle2">Artifacts</Typography>
+            <List dense>
+              {attr.artifacts.map((a) => (
+                <ListItemButton key={a.id} component="a" href={a.url} target="_blank">
+                  <ListItemText primary={a.title} secondary={a.url} />
+                </ListItemButton>
+              ))}
+            </List>
+          </Box>
+          <TextField
+            label="User comment"
+            fullWidth
+            size="small"
+            multiline
+            minRows={3}
+            value={value || ""}
+            onChange={(e) => onChange(e.target.value)}
+          />
+        </Stack>
+      </AccordionDetails>
+    </Accordion>
+  );
+}
+
 export default function App() {
   const theme = useTheme();
-  const downSm = useMediaQuery(theme.breakpoints.down("sm"));
+  const isTabletUp = useMediaQuery(theme.breakpoints.up("md"));
+
   const [org, setOrg] = useState("VCS");
-  const [subcats, setSubcats] = useState(["GV.RR-01"]);
+  const [subcats, setSubcats] = useState(["GV.RR-01", "DE.AE-02"]);
   const [execSum, setExecSum] = useState("");
   const [scope, setScope] = useState("");
   const [quant, setQuant] = useState(false);
   const [coverage, setCoverage] = useState("");
+  const [pct, setPct] = useState(85);
   const [tab, setTab] = useState("L3");
+  const [comments, setComments] = useState({});
 
   const narrative = useMemo(() => `Narrative for ${org}`, [org]);
 
   return (
     <React.Fragment>
       <CssBaseline />
-      <Container maxWidth={false} disableGutters>
-        <Box sx={{ maxWidth: 1400, mx: "auto", px: { xs: 1, sm: 2, md: 3 }, py: 2 }}>
-          <Typography variant="h5" gutterBottom>CSF 2.0 Narrative Generator</Typography>
+      <Container maxWidth="lg" sx={{ py: 2 }}>
+        <Typography variant="h5" gutterBottom>CSF 2.0 Narrative Generator</Typography>
 
-          <Grid container spacing={2} alignItems="flex-start">
-            {/* Left column */}
-            <Grid item xs={12} md={4} lg={3}>
-              <Card>
-                <CardContent>
-                  <Stack spacing={2}>
-                    <Box>
-                      {downSm ? (
-                        <FormControl fullWidth size="small">
-                          <InputLabel id="org-label">Organization</InputLabel>
-                          <Select labelId="org-label" value={org} onChange={(e) => setOrg(e.target.value)}>
-                            {fakeDB.orgs.map((o) => <MenuItem key={o} value={o}>{o}</MenuItem>)}
-                          </Select>
-                        </FormControl>
-                      ) : (
-                        <ButtonGroup fullWidth>
-                          {fakeDB.orgs.map((o) => (
-                            <Button key={o} variant={org === o ? "contained" : "outlined"} onClick={() => setOrg(o)}>
-                              {o}
-                            </Button>
-                          ))}
-                        </ButtonGroup>
-                      )}
-                    </Box>
+        <Grid container spacing={2} alignItems="flex-start">
+          {/* Left column */}
+          <Grid item xs={12} md={4} lg={4}>
+            <Card variant="outlined">
+              <CardContent>
+                <Stack spacing={2}>
+                  <Box>
+                    {isTabletUp ? (
+                      <ButtonGroup fullWidth>
+                        {fakeDB.orgs.map((o) => (
+                          <Button key={o} variant={org === o ? "contained" : "outlined"} onClick={() => setOrg(o)}>{o}</Button>
+                        ))}
+                      </ButtonGroup>
+                    ) : (
+                      <FormControl fullWidth size="small">
+                        <InputLabel id="org-label">Organization</InputLabel>
+                        <Select labelId="org-label" value={org} onChange={(e)=>setOrg(e.target.value)} label="Organization">
+                          {fakeDB.orgs.map(o => <MenuItem key={o} value={o}>{o}</MenuItem>)}
+                        </Select>
+                      </FormControl>
+                    )}
+                  </Box>
 
-                    <MultiSelect label="Subcategories" options={fakeDB.subcategories} selected={subcats} onChange={setSubcats} />
-                    <TextField label="Executive Summary" value={execSum} onChange={(e) => setExecSum(e.target.value)} multiline minRows={3} fullWidth />
-                    <TextField label="Scope" value={scope} onChange={(e) => setScope(e.target.value)} multiline minRows={2} fullWidth />
+                  <MultiSelect label="Subcategories" options={fakeDB.subcategories} selected={subcats} onChange={setSubcats} />
 
+                  <TextField label="Executive Summary" value={execSum} onChange={(e) => setExecSum(e.target.value)} multiline minRows={3} fullWidth />
+
+                  <TextField label="Scope" value={scope} onChange={(e) => setScope(e.target.value)} multiline minRows={2} fullWidth />
+
+                  <Box>
                     <FormControlLabel control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />} label={quant ? "Quantitative" : "Qualitative"} />
-                    <TextField label="Coverage/Profile" value={coverage} onChange={(e) => setCoverage(e.target.value)} fullWidth />
-                  </Stack>
-                </CardContent>
-              </Card>
-            </Grid>
-
-            {/* Right column */}
-            <Grid item xs={12} md={8} lg={9}>
-              <Card>
-                <CardContent>
-                  <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable">
-                    <Tab label="Level 3" value="L3" />
-                    <Tab label="Level 4" value="L4" />
-                  </Tabs>
-                  <Divider sx={{ my: 1 }} />
-                  <Typography variant="body1">Showing attributes and artifacts for: {subcats.join(", ")}</Typography>
-                </CardContent>
-              </Card>
-            </Grid>
+                    {!quant ? (
+                      <TextField label="Coverage/Profile" value={coverage} onChange={(e) => setCoverage(e.target.value)} fullWidth />
+                    ) : (
+                      <TextField label="Coverage %" type="number" inputProps={{ min: 0, max:100 }} value={pct} onChange={(e) => setPct(Number(e.target.value))} sx={{ width: 160 }} />
+                    )}
+                  </Box>
+                </Stack>
+              </CardContent>
+            </Card>
           </Grid>
-        </Box>
+
+          {/* Right column */}
+          <Grid item xs={12} md={8} lg={8}>
+            <Card variant="outlined">
+              <CardContent>
+                <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable">
+                  <Tab label="Level 3" value="L3" />
+                  <Tab label="Level 4" value="L4" />
+                </Tabs>
+                <Divider sx={{ my: 1 }} />
+
+                {subcats.map((sc) => (
+                  <Box key={sc} sx={{ mb: 2 }}>
+                    <Typography variant="h6" sx={{ mb: 0.5 }}>
+                      {sc}: {definitions[sc]}
+                    </Typography>
+                    <Stack spacing={1}>
+                      {fakeDB.maturity[sc][tab].map((attr) => {
+                        const key = `${sc}|${tab}|${attr.id}`;
+                        return (
+                          <AttributeBlock
+                            key={key}
+                            attr={attr}
+                            value={comments[key]}
+                            onChange={(v) => setComments((c) => ({ ...c, [key]: v }))}
+                          />
+                        );
+                      })}
+                    </Stack>
+                  </Box>
+                ))}
+              </CardContent>
+            </Card>
+          </Grid>
+        </Grid>
       </Container>
     </React.Fragment>
   );
