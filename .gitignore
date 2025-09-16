@@ -1,8 +1,6 @@
 import * as React from "react";
-import { useMemo, useRef, useState } from "react";
+import { useState, useMemo, useRef } from "react";
 import {
-  ThemeProvider,
-  createTheme,
   CssBaseline,
   Container,
   Grid,
@@ -35,7 +33,6 @@ import {
   ListItemButton,
   ListItemText,
   Stack,
-  Tooltip,
   Snackbar,
   Alert,
   useTheme,
@@ -47,78 +44,8 @@ import VisibilityIcon from "@mui/icons-material/Visibility";
 import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
 import DescriptionIcon from "@mui/icons-material/Description";
 
-// ---------- THEME (blue primary buttons) ----------
-const theme = createTheme({
-  palette: {
-    mode: "light",
-    primary: { main: "#1976d2" },
-  },
-  shape: { borderRadius: 10 },
-  typography: {
-    fontSize: 14,
-    h4: { fontSize: "1.4rem", "@media (min-width:900px)": { fontSize: "1.9rem" } },
-  },
-  components: {
-    MuiCard: { defaultProps: { variant: "outlined" } },
-    MuiCardContent: {
-      styleOverrides: {
-        root: { padding: 12, "@media (min-width:900px)": { padding: 16 } },
-      },
-    },
-    MuiAccordion: { styleOverrides: { root: { border: "1px solid", borderColor: "divider" } } },
-    MuiAccordionSummary: { styleOverrides: { root: { minHeight: 40, paddingLeft: 8, paddingRight: 8 } } },
-    MuiAccordionDetails: { styleOverrides: { root: { padding: 12 } } },
-  },
-});
-
-// ---------- CSF 2.0 TEST DATA (grounded to csf.tools descriptions) ----------
-const SUBCATS = [
-  "GV.RR-01",
-  "PR.AA-01",
-  "PR.AT-01",
-  "PR.DS-01",
-  "PR.PS-01",
-  "DE.AE-02",
-  "DE.AE-03",
-  "RS.MI-01",
-  "RC.RP-01",
-  "ID.IM-01",
-];
-
-const definitions = {
-  "GV.RR-01": "Organizational leadership is responsible and accountable for cybersecurity risk and fosters a risk-aware, ethical, continually improving culture.",
-  "PR.AA-01": "Identities and credentials for authorized users, services, and hardware are managed by the organization.",
-  "PR.AT-01": "Personnel are provided with awareness and training to perform general tasks with cybersecurity risks in mind.",
-  "PR.DS-01": "The confidentiality, integrity, and availability of data-at-rest are protected.",
-  "PR.PS-01": "Configuration management practices are established and applied.",
-  "DE.AE-02": "Potentially adverse events are analyzed to better understand associated activities.",
-  "DE.AE-03": "Information is correlated from multiple sources.",
-  "RS.MI-01": "Incidents are contained.",
-  "RC.RP-01": "The recovery portion of the incident response plan is executed once initiated from the incident response process.",
-  "ID.IM-01": "Improvements are identified from evaluations.",
-};
-
-const makeArtifacts = (count, sc, lvl) =>
-  Array.from({ length: count }, (_, i) => ({
-    id: `${sc}-${lvl}-A${i + 1}`,
-    title: `Artifact ${i + 1} for ${sc}`,
-    url: `https://example.com/artifacts/${encodeURIComponent(sc)}/${lvl}/${i + 1}`,
-  }));
-
-const fakeDB = { orgs: ["VCS", "TPD", "NETWORK"], subcategories: SUBCATS, maturity: {} };
-SUBCATS.forEach((sc) => {
-  fakeDB.maturity[sc] = {
-    L3: [
-      { id: `${sc}-L3-1`, title: `Attribute 1`, definition: `${definitions[sc]} (baseline L3).`, artifacts: makeArtifacts(2, sc, "L3") },
-      { id: `${sc}-L3-2`, title: `Attribute 2`, definition: `Documented process, periodic review, and stakeholder visibility for ${sc}.`, artifacts: makeArtifacts(2, sc, "L3") },
-    ],
-    L4: [
-      { id: `${sc}-L4-1`, title: `Attribute 1`, definition: `Metrics-driven improvement & automation for ${sc}.`, artifacts: makeArtifacts(3, sc, "L4") },
-      { id: `${sc}-L4-2`, title: `Attribute 2`, definition: `Proactive validation and governance for ${sc}.`, artifacts: makeArtifacts(2, sc, "L4") },
-      { id: `${sc}-L4-3`, title: `Attribute 3`, definition: `Integration with enterprise risk metrics and assurance for ${sc}.`, artifacts: makeArtifacts(2, sc, "L4") },
-    ],
-  };
-});
+// Dummy test data
+const fakeDB = { orgs: ["VCS", "TPD", "NETWORK"], subcategories: ["GV.RR-01", "DE.AE-02"] };
 
 function MultiSelect({ label, options, selected, onChange }) {
   return (
@@ -129,8 +56,6 @@ function MultiSelect({ label, options, selected, onChange }) {
         multiple
         value={selected}
         onChange={(e) => onChange(e.target.value)}
-        inputProps={{ "aria-label": label }}
-        label={label}
         renderValue={(sel) => (
           <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
             {sel.map((v) => (
@@ -140,193 +65,45 @@ function MultiSelect({ label, options, selected, onChange }) {
         )}
       >
         {options.map((opt) => (
-          <MenuItem key={opt} value={opt}>
-            {opt}
-          </MenuItem>
+          <MenuItem key={opt} value={opt}>{opt}</MenuItem>
         ))}
       </Select>
     </FormControl>
   );
 }
 
-function AttributeBlock({ attr, value, onChange }) {
-  return (
-    <Accordion disableGutters>
-      <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 1 }}>
-        <Stack spacing={0.25} sx={{ pr: 1 }}>
-          <Typography fontWeight={600} variant="body1">{attr.title}</Typography>
-          <Typography variant="body2" color="text.secondary" noWrap>
-            {attr.definition}
-          </Typography>
-        </Stack>
-      </AccordionSummary>
-      <AccordionDetails>
-        <Stack spacing={1.25}>
-          <Box>
-            <Typography variant="subtitle2">Artifacts</Typography>
-            <List dense sx={{ py: 0 }}>
-              {attr.artifacts.map((a) => (
-                <ListItemButton key={a.id} component="a" href={a.url} target="_blank" sx={{ py: 0.25 }}>
-                  <ListItemText primaryTypographyProps={{ variant: 'body2' }} primary={a.title} secondary={a.url} />
-                </ListItemButton>
-              ))}
-            </List>
-          </Box>
-          <TextField
-            label="User comment"
-            placeholder="Add context for assessor…"
-            fullWidth
-            size="small"
-            multiline
-            minRows={3}
-            value={value || ""}
-            onChange={(e) => onChange(e.target.value)}
-          />
-        </Stack>
-      </AccordionDetails>
-    </Accordion>
-  );
-}
-
 export default function App() {
+  const theme = useTheme();
+  const downSm = useMediaQuery(theme.breakpoints.down("sm"));
   const [org, setOrg] = useState("VCS");
-  const [subcats, setSubcats] = useState(["GV.RR-01", "DE.AE-02", "DE.AE-03"]);
+  const [subcats, setSubcats] = useState(["GV.RR-01"]);
   const [execSum, setExecSum] = useState("");
   const [scope, setScope] = useState("");
   const [quant, setQuant] = useState(false);
   const [coverage, setCoverage] = useState("");
-  const [pct, setPct] = useState(85);
-  const [comments, setComments] = useState({});
   const [tab, setTab] = useState("L3");
-  const [saved, setSaved] = useState([]);
-  const [previewOpen, setPreviewOpen] = useState(false);
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [snack, setSnack] = useState("");
-  const printableRef = useRef(null);
-  const muiTheme = useTheme();
-  const downSm = useMediaQuery(muiTheme.breakpoints.down('sm'));
 
-  const narrative = useMemo(() => {
-    const lines = [];
-    lines.push(`# Narrative for ${org}`);
-    lines.push("");
-    if (execSum) { lines.push(`**Executive Summary**
-${execSum}`); lines.push(""); }
-    if (scope) { lines.push(`**Scope**
-${scope}`); lines.push(""); }
-    if (quant) lines.push(`**Coverage / Profile (Quantitative)**
-Assessed population coverage: ~${pct}%.`);
-    else if (coverage) lines.push(`**Coverage / Profile (Qualitative)**
-${coverage}`);
-    lines.push("");
-    subcats.forEach((sc) => {
-      lines.push(`## Subcategory ${sc}`);
-      ["L3", "L4"].forEach((lvl) => {
-        lines.push(`**Maturity ${lvl.replace("L", "Level ")}:**`);
-        fakeDB.maturity[sc][lvl].forEach((a) => {
-          const key = `${sc}|${lvl}|${a.id}`;
-          lines.push(`- *${a.title}:* ${a.definition}`);
-          if (comments[key]) lines.push(`  - **Comment:** ${comments[key]}`);
-          const arts = a.artifacts.map((x) => x.title).join(", ");
-          lines.push(`  - **Artifacts:** ${arts}`);
-        });
-        lines.push("");
-      });
-    });
-    return lines.join("
-");
-  }, [org, subcats, execSum, scope, quant, coverage, pct, comments]);
-
-  const saveNarrative = () => {
-    const entry = { id: Date.now(), org, subcats: [...subcats], narrative, meta: { execSum, scope, quant, coverage, pct }, comments };
-    setSaved((s) => [entry, ...s]);
-    setSnack("Saved draft");
-  };
-
-  const loadNarrative = (n) => {
-    setOrg(n.org);
-    setSubcats(n.subcats);
-    setExecSum(n.meta.execSum);
-    setScope(n.meta.scope);
-    setQuant(n.meta.quant);
-    setCoverage(n.meta.coverage);
-    setPct(n.meta.pct);
-    setComments(n.comments || {});
-    setDrawerOpen(false);
-    setSnack("Loaded draft");
-  };
-
-  async function exportPDF() {
-    try {
-      const { jsPDF } = await import("jspdf");
-      const doc = new jsPDF({ unit: "pt", format: "a4" });
-      const margin = 40;
-      const maxWidth = 515;
-      const text = narrative.replaceAll("
-", "
-
-");
-      const lines = doc.splitTextToSize(text, maxWidth);
-      doc.text(lines, margin, margin);
-      doc.save(`Narrative_${org}.pdf`);
-    } catch (e) {
-      setSnack("PDF export failed");
-    }
-  }
-
-  async function exportDocx() {
-    try {
-      const docx = await import("docx");
-      const { Document, Packer, Paragraph, TextRun, HeadingLevel } = docx;
-      const blocks = [];
-      blocks.push(new Paragraph({ heading: HeadingLevel.TITLE, children: [new TextRun(`Narrative for ${org}`)] }));
-      narrative.split("
-").forEach((line) => {
-        if (!line.trim()) { blocks.push(new Paragraph("")); return; }
-        if (line.startsWith("## ")) {
-          blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun(line.replace("## ", ""))] }));
-        } else if (line.startsWith("**") && line.endsWith("**")) {
-          blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_3, children: [new TextRun(line.replaceAll("**", ""))] }));
-        } else {
-          blocks.push(new Paragraph({ children: [new TextRun(line.replaceAll("**", ""))] }));
-        }
-      });
-      const doc = new Document({ sections: [{ children: blocks }] });
-      const blob = await Packer.toBlob(doc);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `Narrative_${org}.docx`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setSnack("DOCX export failed");
-    }
-  }
+  const narrative = useMemo(() => `Narrative for ${org}`, [org]);
 
   return (
-    <ThemeProvider theme={theme}>
+    <React.Fragment>
       <CssBaseline />
-      {/* Full-bleed background; content constrained inside */}
       <Container maxWidth={false} disableGutters>
-        <Box sx={{ maxWidth: 1280, mx: "auto", px: { xs: 1, sm: 2, md: 3 }, py: 2 }}>
-          <Typography variant="h4" fontWeight={700} gutterBottom>
-            CSF 2.0 Narrative Generator (MUI / Tight Responsive)
-          </Typography>
+        <Box sx={{ maxWidth: 1400, mx: "auto", px: { xs: 1, sm: 2, md: 3 }, py: 2 }}>
+          <Typography variant="h5" gutterBottom>CSF 2.0 Narrative Generator</Typography>
 
-          <Grid container columnSpacing={2} rowSpacing={2} alignItems="start">
+          <Grid container spacing={2} alignItems="flex-start">
             {/* Left column */}
-            <Grid item xs={12} sm={6} md={5} lg={4}>
+            <Grid item xs={12} md={4} lg={3}>
               <Card>
                 <CardContent>
-                  <Stack spacing={1.5}>
+                  <Stack spacing={2}>
                     <Box>
-                      <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Organization</Typography>
                       {downSm ? (
                         <FormControl fullWidth size="small">
                           <InputLabel id="org-label">Organization</InputLabel>
-                          <Select labelId="org-label" value={org} label="Organization" onChange={(e)=>setOrg(e.target.value)}>
-                            {fakeDB.orgs.map(o=> <MenuItem key={o} value={o}>{o}</MenuItem>)}
+                          <Select labelId="org-label" value={org} onChange={(e) => setOrg(e.target.value)}>
+                            {fakeDB.orgs.map((o) => <MenuItem key={o} value={o}>{o}</MenuItem>)}
                           </Select>
                         </FormControl>
                       ) : (
@@ -341,115 +118,32 @@ ${coverage}`);
                     </Box>
 
                     <MultiSelect label="Subcategories" options={fakeDB.subcategories} selected={subcats} onChange={setSubcats} />
-
                     <TextField label="Executive Summary" value={execSum} onChange={(e) => setExecSum(e.target.value)} multiline minRows={3} fullWidth />
-
                     <TextField label="Scope" value={scope} onChange={(e) => setScope(e.target.value)} multiline minRows={2} fullWidth />
 
-                    <Box>
-                      <Stack direction="row" alignItems="center" justifyContent="space-between">
-                        <Typography variant="subtitle2">Coverage / Profile</Typography>
-                        <FormControlLabel control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />} label={quant ? "Quantitative" : "Qualitative"} componentsProps={{ typography: { variant: "body2" } }} />
-                      </Stack>
-                      {!quant ? (
-                        <TextField value={coverage} onChange={(e) => setCoverage(e.target.value)} fullWidth size="small" multiline minRows={2} />
-                      ) : (
-                        <TextField label="Coverage %" type="number" size="small" inputProps={{ min: 0, max: 100 }} value={pct} onChange={(e) => setPct(Number(e.target.value))} sx={{ mt: 1, maxWidth: 140 }} />
-                      )}
-                    </Box>
-
-                    <Divider />
-
-                    <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
-                      <Button startIcon={<SaveIcon />} onClick={saveNarrative}>Save</Button>
-                      <Button startIcon={<VisibilityIcon />} color="secondary" variant="outlined" onClick={() => setPreviewOpen(true)}>Preview</Button>
-                      <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF}>PDF</Button>
-                      <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>DOCX</Button>
-                      <Button variant="text" onClick={() => setDrawerOpen(true)}>Edit existing…</Button>
-                    </Stack>
+                    <FormControlLabel control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />} label={quant ? "Quantitative" : "Qualitative"} />
+                    <TextField label="Coverage/Profile" value={coverage} onChange={(e) => setCoverage(e.target.value)} fullWidth />
                   </Stack>
                 </CardContent>
               </Card>
             </Grid>
 
             {/* Right column */}
-            <Grid item xs={12} sm={6} md={7} lg={8}>
+            <Grid item xs={12} md={8} lg={9}>
               <Card>
                 <CardContent>
-                  <Tabs value={tab} onChange={(_, v) => setTab(v)} aria-label="maturity tabs" variant="scrollable" allowScrollButtons>
+                  <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable">
                     <Tab label="Level 3" value="L3" />
                     <Tab label="Level 4" value="L4" />
                   </Tabs>
                   <Divider sx={{ my: 1 }} />
-
-                  <Stack spacing={1}>
-                    {subcats.map((sc) => (
-                      <Box key={sc}>
-                        <Typography variant="subtitle1" sx={{ mb: 0.5 }}>
-                          {sc}: {definitions[sc]}
-                        </Typography>
-                        <Stack spacing={0.75}>
-                          {fakeDB.maturity[sc][tab].map((attr) => {
-                            const key = `${sc}|${tab}|${attr.id}`;
-                            return (
-                              <AttributeBlock key={key} attr={attr} value={comments[key]} onChange={(v) => setComments((c) => ({ ...c, [key]: v }))} />
-                            );
-                          })}
-                        </Stack>
-                      </Box>
-                    ))}
-                  </Stack>
+                  <Typography variant="body1">Showing attributes and artifacts for: {subcats.join(", ")}</Typography>
                 </CardContent>
               </Card>
             </Grid>
           </Grid>
-
-          {/* Hidden printable for fallback */}
-          <Box ref={printableRef} sx={{ display: "none" }} aria-hidden>
-            <pre>{narrative}</pre>
-          </Box>
         </Box>
       </Container>
-
-      {/* Preview Dialog */}
-      <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} fullWidth maxWidth="md">
-        <DialogTitle>Narrative Preview</DialogTitle>
-        <DialogContent dividers sx={{ maxHeight: { xs: '65vh', md: '70vh' } }}>
-          <Box sx={{ typography: "body1" }}>
-            {narrative.split("
-").map((line, i) => (
-              <Typography key={i} sx={{ fontWeight: line.startsWith("**") ? 600 : undefined, fontSize: line.startsWith("## ") ? 18 : undefined }}>
-                {line.replaceAll("**", "").replace("## ", "")}
-              </Typography>
-            ))}
-          </Box>
-        </DialogContent>
-        <DialogActions>
-          <Button color="secondary" variant="outlined" onClick={() => setPreviewOpen(false)}>Close</Button>
-          <Button startIcon={<PictureAsPdfIcon />} onClick={exportPDF}>Export PDF</Button>
-          <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>Export DOCX</Button>
-        </DialogActions>
-      </Dialog>
-
-      {/* Drawer: saved narratives */}
-      <Drawer anchor="left" open={drawerOpen} onClose={() => setDrawerOpen(false)}>
-        <Box sx={{ width: 340 }} role="presentation">
-          <Typography variant="h6" sx={{ p: 2 }}>Saved narratives</Typography>
-          <Divider />
-          <List>
-            {saved.length === 0 && (<ListItemText primary="Nothing saved yet." sx={{ p: 2 }} />)}
-            {saved.map((n) => (
-              <ListItemButton key={n.id} onClick={() => loadNarrative(n)}>
-                <ListItemText primary={`${n.org}`} secondary={<Typography variant="caption" color="text.secondary">{n.subcats.join(', ')}</Typography>} />
-              </ListItemButton>
-            ))}
-          </List>
-        </Box>
-      </Drawer>
-
-      <Snackbar open={!!snack} autoHideDuration={2200} onClose={() => setSnack("")} anchorOrigin={{ vertical: "bottom", horizontal: "center" }}>
-        <Alert onClose={() => setSnack("")} severity="success" variant="filled">{snack}</Alert>
-      </Snackbar>
-    </ThemeProvider>
+    </React.Fragment>
   );
 }
