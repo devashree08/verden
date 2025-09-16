@@ -1,20 +1,27 @@
-import * as React from 'react';
-import { Paper, Box, Typography } from '@mui/material';
-import DoNotDisturbAltIcon from '@mui/icons-material/DoNotDisturbAlt';
+     {header?.note ? (
++          <Button
++            size={size}
++            variant="text"
++            onClick={() => setViewNoteOpen(true)}
++            disabled={saving}
++          >
++            View note
++          </Button>
++        ) : null}
 
-export default function OutOfScopeNotice({ orgName, subcatName }) {
-  return (
-    <Paper variant="outlined" sx={{ p: 2, borderRadius: 2, bgcolor: 'background.default' }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-        <DoNotDisturbAltIcon color="disabled" />
-        <Typography variant="subtitle1" sx={{ fontWeight: 800 }}>
-          {subcatName || 'This CSF 2.0 subcategory'}
-        </Typography>
-      </Box>
-      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
-        is currently <strong>out of scope</strong> for {orgName || 'this org'}. Attributes are hidden and
-        adding custom attributes is disabled. Update scope to “Yes” on the Readiness page to enable editing.
-      </Typography>
-    </Paper>
-  );
-}
+
+
+
++      {/* Read-only note viewer */}
++      <Dialog open={viewNoteOpen} onClose={() => setViewNoteOpen(false)} fullWidth maxWidth="sm">
++        <DialogTitle>Sign-off note</DialogTitle>
++        <DialogContent>
++          <Box component="pre" sx={{ whiteSpace: 'pre-wrap', fontFamily: 'inherit', m: 0, mt: 1 }}>
++            {header?.note || '—'}
++          </Box>
++        </DialogContent>
++        <DialogActions>
++          <Button onClick={() => setViewNoteOpen(false)}>Close</Button>
++        </DialogActions>
++      </Dialog>
+
