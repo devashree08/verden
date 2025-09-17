@@ -1,20 +1,61 @@
-// Models/AttributeArtifactsDtos.cs
 namespace YourApp.Api.Models.AttributeArtifacts
 {
+    public enum ArtifactListMode { Attribute, ReusePool }
+
     public sealed class MutateRequest
     {
-        public string Action { get; set; } = default!;  // "Link" | "Unlink"
+        public string Action { get; set; } = default!; // "Link" | "Unlink"
+
         public int OrgID { get; set; }
         public int Csf2SubcategoryID { get; set; }
         public int MaturityLevel { get; set; }
 
-        public int? Csf1SubcategoryID { get; set; }     // baseline only
-        public int? AttributeNum { get; set; }          // baseline only
-        public int? CustomAttributeNum { get; set; }    // custom only
+        public int? Csf1SubcategoryID { get; set; }   // baseline only
+        public int? AttributeNum { get; set; }        // baseline only
+        public int? CustomAttributeNum { get; set; }  // custom only
 
-        public string? Url { get; set; }                // required for Link; or pass ArtifactLinkID for Unlink
-        public string? Title { get; set; }              // ignored for Unlink
-        public int? ArtifactLinkID { get; set; }        // Unlink convenience
+        public string? Url { get; set; }              // required for Link; optional for Unlink if ArtifactLinkID provided
+        public string? Title { get; set; }            // optional; ignored for Unlink
+        public int? ArtifactLinkID { get; set; }      // optional shortcut for Unlink
+    }
+
+    public sealed class MutateLinkResult
+    {
+        public int ArtifactLinkID { get; set; }
+        public int OrgID { get; set; }
+        public int Csf2SubcategoryID { get; set; }
+        public int MaturityLevel { get; set; }
+        public int? Csf1SubcategoryID { get; set; }
+        public int? AttributeNum { get; set; }
+        public int? CustomAttributeNum { get; set; }
+        public string Url { get; set; } = default!;
+        public string? Title { get; set; }
+        public bool IsActive { get; set; }
+        public string? CreatedBy { get; set; }
+        public DateTime CreatedAt { get; set; }
+        public DateTime? UpdatedAt { get; set; }
+    }
+
+    public sealed class MutateUnlinkResult
+    {
+        public int Affected { get; set; }
+    }
+
+    public sealed class ArtifactListQuery
+    {
+        public ArtifactListMode Mode { get; set; }
+
+        public int OrgID { get; set; }
+        public int Csf2SubcategoryID { get; set; }
+
+        // Mode=Attribute (full attribute identity)
+        public int? MaturityLevel { get; set; }
+        public int? Csf1SubcategoryID { get; set; }
+        public int? AttributeNum { get; set; }
+        public int? CustomAttributeNum { get; set; }
+
+        // Mode=ReusePool
+        public string? Q { get; set; }
     }
 
     public sealed class ArtifactItem
@@ -35,22 +76,6 @@ namespace YourApp.Api.Models.AttributeArtifacts
         public int Uses { get; set; }
     }
 
-    public sealed class ArtifactListQuery
-    {
-        public string Mode { get; set; } = default!; // "Attribute" | "ReusePool"
-        public int OrgID { get; set; }
-        public int Csf2SubcategoryID { get; set; }
-
-        // Mode=Attribute
-        public int? MaturityLevel { get; set; }
-        public int? Csf1SubcategoryID { get; set; }
-        public int? AttributeNum { get; set; }
-        public int? CustomAttributeNum { get; set; }
-
-        // Mode=ReusePool
-        public string? Q { get; set; }
-    }
-
     public sealed class BulkExportRequest
     {
         public List<int>? OrgIDs { get; set; }
@@ -67,142 +92,4 @@ namespace YourApp.Api.Models.AttributeArtifacts
         public int? CustomAttributeNum { get; set; }
         public string? Artifacts { get; set; } // newline-delimited
     }
-
-
-
-
-
-// Controllers/AttributeArtifactsController.cs
-using System.Data;
-using System.Data.SqlClient;
-using Dapper;
-using Microsoft.AspNetCore.Mvc;
-using YourApp.Api.Models.AttributeArtifacts;
-
-namespace YourApp.Api.Controllers
-{
-    [ApiController]
-    [Route("api/attribute-artifacts")]
-    public sealed class AttributeArtifactsController : ControllerBase
-    {
-        private readonly string _connStr;
-        public AttributeArtifactsController(IConfiguration cfg)
-        {
-            _connStr = cfg.GetConnectionString("DefaultConnection")!;
-        }
-
-        // POST: /api/attribute-artifacts/mutate
-        [HttpPost("mutate")]
-        public async Task<IActionResult> Mutate([FromBody] MutateRequest dto)
-        {
-            var actor = User.GetDisplayNameStrict(); // your extension
-
-            try
-            {
-                using var conn = new SqlConnection(_connStr);
-                if (conn.State != ConnectionState.Open) await conn.OpenAsync();
-
-                var p = new DynamicParameters();
-                p.Add("@Action", dto.Action);
-                p.Add("@OrgID", dto.OrgID);
-                p.Add("@CSF2SubcategoryID", dto.Csf2SubcategoryID);
-                p.Add("@MaturityLevel", dto.MaturityLevel);
-                p.Add("@CSF1SubcategoryID", dto.Csf1SubcategoryID);
-                p.Add("@AttributeNum", dto.AttributeNum);
-                p.Add("@CustomAttributeNum", dto.CustomAttributeNum);
-                p.Add("@Url", dto.Url);
-                p.Add("@Title", dto.Title);
-                p.Add("@Actor", actor);
-                p.Add("@ArtifactLinkID", dto.ArtifactLinkID);
-
-                if (string.Equals(dto.Action, "Link", StringComparison.OrdinalIgnoreCase))
-                {
-                    // returns the linked row
-                    var result = await conn.QueryFirstOrDefaultAsync(
-                        new CommandDefinition("dbo.sp_AttributeArtifact_Mutate", p, commandType: CommandType.StoredProcedure));
-
-                    return Ok(result ?? new { ok = true });
-                }
-                else
-                {
-                    // Unlink returns a single int 'affected'
-                    var affected = await conn.QueryFirstOrDefaultAsync<int>(
-                        new CommandDefinition("dbo.sp_AttributeArtifact_Mutate", p, commandType: CommandType.StoredProcedure));
-
-                    return Ok(new { affected });
-                }
-            }
-            catch (Exception)
-            {
-                return StatusCode(500, "Failed to mutate artifact link.");
-            }
-        }
-
-        // GET: /api/attribute-artifacts/list?mode=Attribute&orgID=1&csf2SubcategoryID=43&...
-        [HttpGet("list")]
-        public async Task<IActionResult> List([FromQuery] ArtifactListQuery q)
-        {
-            try
-            {
-                using var conn = new SqlConnection(_connStr);
-                if (conn.State != ConnectionState.Open) await conn.OpenAsync();
-
-                var p = new DynamicParameters();
-                p.Add("@Mode", q.Mode);
-                p.Add("@OrgID", q.OrgID);
-                p.Add("@CSF2SubcategoryID", q.Csf2SubcategoryID);
-                p.Add("@MaturityLevel", q.MaturityLevel);
-                p.Add("@CSF1SubcategoryID", q.Csf1SubcategoryID);
-                p.Add("@AttributeNum", q.AttributeNum);
-                p.Add("@CustomAttributeNum", q.CustomAttributeNum);
-                p.Add("@Q", q.Q);
-
-                if (string.Equals(q.Mode, "Attribute", StringComparison.OrdinalIgnoreCase))
-                {
-                    var rows = await conn.QueryAsync<ArtifactItem>(
-                        new CommandDefinition("dbo.sp_AttributeArtifact_List", p, commandType: CommandType.StoredProcedure));
-                    return Ok(rows);
-                }
-                else
-                {
-                    var rows = await conn.QueryAsync<ReuseArtifactItem>(
-                        new CommandDefinition("dbo.sp_AttributeArtifact_List", p, commandType: CommandType.StoredProcedure));
-                    return Ok(rows);
-                }
-            }
-            catch (Exception)
-            {
-                return StatusCode(500, "Failed to list artifact links.");
-            }
-        }
-
-        // POST: /api/attribute-artifacts/bulk-export
-        [HttpPost("bulk-export")]
-        public async Task<IActionResult> BulkExport([FromBody] BulkExportRequest dto)
-        {
-            try
-            {
-                using var conn = new SqlConnection(_connStr);
-                if (conn.State != ConnectionState.Open) await conn.OpenAsync();
-
-                var orgCsv = (dto.OrgIDs != null && dto.OrgIDs.Count > 0) ? string.Join(",", dto.OrgIDs) : null;
-                var subCsv = (dto.Csf2SubcategoryIDs != null && dto.Csf2SubcategoryIDs.Count > 0) ? string.Join(",", dto.Csf2SubcategoryIDs) : null;
-
-                var p = new DynamicParameters();
-                p.Add("@OrgIDsCsv", orgCsv);
-                p.Add("@CSF2SubcatIDsCsv", subCsv);
-
-                var rows = await conn.QueryAsync<BulkExportRow>(
-                    new CommandDefinition("dbo.sp_AttributeArtifact_BulkForExport", p, commandType: CommandType.StoredProcedure));
-
-                return Ok(rows);
-            }
-            catch (Exception)
-            {
-                return StatusCode(500, "Failed to fetch artifacts for export.");
-            }
-        }
-    }
-}
-
 }
