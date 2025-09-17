@@ -1,25 +1,227 @@
-const wasOpenRef = React.useRef(false);
-React.useEffect(() => {
-  if (open && !wasOpenRef.current) {
-    wasOpenRef.current = true;
-    setTab(0);
-    reloadCurrent();           // load "Current" once on open
-  } else if (!open && wasOpenRef.current) {
-    wasOpenRef.current = false;
-  }
-}, [open]); // <-- only depends on 'open'
+// bulk artifacts for Excel export (one call for the whole scope)
+export async function bulkArtifactsForExport({ orgIDs, csf2SubcategoryIDs }) {
+  const { data } = await api.post('/api/attribute-artifacts/bulk-export', {
+    orgIDs,
+    csf2SubcategoryIDs,
+  });
+  return data; // array of { orgID, csF2SubcategoryID, maturityLevel, csf1SubcategoryID, attributeNum, customAttributeNum, artifacts }
+}
 
-// identity change while open -> refresh 'Current' silently (do NOT reset tab)
-React.useEffect(() => {
-  if (!open) return;
-  reloadCurrent();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [
-  open,
-  identity?.orgID,
-  identity?.csf2SubcategoryID,
-  identity?.maturityLevel,
-  identity?.csf1SubcategoryID,
-  identity?.attributeNum,
-  identity?.customAttributeNum
-]);
+
+
+// src/features/attributeMapping/utils/exportAttributeMappingExcel.js
+import { exportExcel } from '../../../ui/data/ExcelExport';
+import { fetchAttributeFeed } from '../api/attributeApi';
+import { normalizeHeaders, normalizeRows } from '../utils/normalizeFeed';
+import { buildSheetsForAttributeMapping } from './attributeWorkbook';
+import { bulkArtifactsForExport } from '../api/artifactsApi';
+
+/**
+ * exportAttributeMappingExcel({ filters, selectedSubcatID, fileName })
+ * - If selectedSubcatID is present -> export just that subcat scope
+ * - Else, export all subcats under current filters
+ */
+export async function exportAttributeMappingExcel({ filters, selectedSubcatID, fileName }) {
+  // 1) pull headers for the current filters (finalOnly=false so we get everything)
+  const headerResp = await fetchAttributeFeed({
+    functionIds:    filters.functionIds,
+    categoryIds:    filters.categoryIds,
+    subcatIds:      filters.subcatIds,
+    ownerNames:     filters.ownerNames,
+    custodianNames: filters.custodianNames,
+    maturity:       filters.maturity,
+    finalOnly:      false,
+    search:         filters.search,
+  });
+  const headers = normalizeHeaders(headerResp.headers || []);
+
+  // Subcategory scope for rows + artifacts
+  let subcatIdsWanted = [];
+  if (selectedSubcatID) {
+    subcatIdsWanted = [selectedSubcatID];
+  } else if (filters.subcatIds?.length) {
+    subcatIdsWanted = filters.subcatIds;
+  } else {
+    const set = new Set(headers.map(h => String(h.csF2SubcategoryID)));
+    subcatIdsWanted = Array.from(set);
+  }
+
+  // 2) pull rows for those subcats
+  const rowsResp = await fetchAttributeFeed({
+    functionIds:    filters.functionIds,
+    categoryIds:    filters.categoryIds,
+    subcatIds:      subcatIdsWanted,
+    ownerNames:     filters.ownerNames,
+    custodianNames: filters.custodianNames,
+    maturity:       filters.maturity,
+    finalOnly:      false,
+    search:         filters.search,
+  });
+  const rows = normalizeRows(rowsResp.rows || []);
+
+  // 3) bulk artifacts for the export scope (deriving orgIDs and subcatIDs from headers)
+  const orgIDs = Array.from(new Set(headers.map(h => h.orgID))).filter(Boolean);
+  const csf2SubcategoryIDs = subcatIdsWanted;
+
+  const bulk = await bulkArtifactsForExport({
+    orgIDs,
+    csf2SubcategoryIDs,
+  });
+
+  // 4) index artifacts by the same composite identity we use for rows
+  const makeKey = ({ orgID, csF2SubcategoryID, maturityLevel, csF1SubcategoryID, attributeNum, customAttributeNum }) => {
+    const org = String(orgID ?? '0');
+    const sub = String(csF2SubcategoryID ?? '0');
+    const ml  = String(maturityLevel ?? '0');
+    // custom → C|0|customNum; baseline → B|csf1|attrNum
+    if (customAttributeNum != null) {
+      return `${org}|${sub}|${ml}|C|0|${String(customAttributeNum ?? '0')}`;
+    }
+    return `${org}|${sub}|${ml}|B|${String(csF1SubcategoryID ?? '0')}|${String(attributeNum ?? '0')}`;
+  };
+
+  const artifactByKey = new Map(
+    (bulk || []).map(r => [ makeKey({
+      orgID: r.orgID,
+      csF2SubcategoryID: r.csF2SubcategoryID,
+      maturityLevel: r.maturityLevel,
+      csF1SubcategoryID: r.csf1SubcategoryID,
+      attributeNum: r.attributeNum,
+      customAttributeNum: r.customAttributeNum
+    }), r.artifacts || '' ])
+  );
+
+  // 5) build sheets and export (Final View still applied inside workbook builder)
+  const sheets = buildSheetsForAttributeMapping({
+    headers,
+    rows,
+    finalOnly: !!filters.finalOnly,
+    artifacts: artifactByKey,     // <-- new
+  });
+
+  await exportExcel({
+    fileName: fileName || `CSF-Attribute-Mapping ${new Date().toISOString().slice(0,10)}.xlsx`,
+    sheets,
+  });
+}
+
+
+// src/features/attributeMapping/utils/attributeWorkbook.js
+
+export function buildSheetsForAttributeMapping({ headers = [], rows = [], finalOnly = false, artifacts = new Map() }) {
+  // org list from headers so we create sheets even when an org has zero rows
+  const orgs = dedupeBy(headers.map(h => ({ orgID: h.orgID, orgName: h.orgName })), x => x.orgID);
+
+  // sign-off per (org, subcat)
+  const signoff = new Map();
+  headers.forEach(h => {
+    const key = `${h.orgID}|${h.csF2SubcategoryID}`;
+    const cAt = h.completedAt ? new Date(h.completedAt) : null;
+    const rAt = h.reopenedAt  ? new Date(h.reopenedAt)  : null;
+    const isDone = !!(cAt && (!rAt || cAt >= rAt));
+    signoff.set(key, isDone);
+  });
+
+  // Composite key must match exporter
+  const makeKey = (r) => {
+    const org = String(r.orgID ?? '0');
+    const sub = String(r.csF2SubcategoryID ?? '0');
+    const ml  = String(r.maturityLevel ?? '0');
+    const isCustom = !!(r.isCustom || r.customAttributeDefinition || r.customAttributeNum != null);
+    if (isCustom) {
+      return `${org}|${sub}|${ml}|C|0|${String(r.customAttributeNum ?? '0')}`;
+    }
+    const csf1 = String(r.csF1SubcategoryID ?? '0');
+    return `${org}|${sub}|${ml}|B|${csf1}|${String(r.attributeNum ?? '0')}`;
+  };
+
+  const columns = [
+    // (Optional) if you already added an "Org" column earlier, keep position consistent
+    { header: 'CSF 2.0 Function',      key: 'function',    width: 28 },
+    { header: 'CSF 2.0 Category',      key: 'category',    width: 28 },
+    { header: 'CSF 2.0 Subcategory',   key: 'subcategory', width: 34 },
+    { header: 'ML',                    key: 'ml',          width: 6  },
+    { header: 'Attribute #',           key: 'attrNum',     width: 12 },
+    { header: 'Attribute Definition',  key: 'attrDef',     width: 80 },
+    { header: 'Artifacts',             key: 'artifacts',   width: 60 },   // <-- NEW
+    { header: 'Status',                key: 'status',      width: 14 },
+    { header: '2025 Attestation',      key: 'attest2025',  width: 18 },
+    { header: '2024 Assessor Score',   key: 'assess2024',  width: 20 },
+    { header: 'Subcategory Sign-Off?', key: 'signoff',     width: 22 },
+  ];
+
+  const editableHeaders = ['Status', '2025 Attestation', 'Subcategory Sign-Off?'];
+
+  const sheets = orgs.map(({ orgID, orgName }) => {
+    const rOrg = rows.filter(r => String(r.orgID) === String(orgID));
+
+    const inScope = finalOnly
+      ? rOrg.filter(r => {
+          const isCustom = !!(r.isCustom || r.customAttributeDefinition);
+          if (isCustom) return true;
+          return (r.selectionStatus || '') !== 'Remove';
+        })
+      : rOrg;
+
+    const excelRows = inScope.map(r => {
+      const isCustom = !!(r.isCustom || r.customAttributeDefinition);
+      const key = `${r.orgID}|${r.csF2SubcategoryID}`;
+      const artText = artifacts.get(makeKey(r)) || ''; // newline-delimited
+
+      return {
+        function:    r.functionName || '',
+        category:    r.categoryName || '',
+        subcategory: r.csF2SubcategoryName || '',
+        ml:          r.maturityLevel ?? '',
+        attrNum:     isCustom ? (r.customAttributeNum ?? '') : (r.attributeNum ?? ''),
+        attrDef:     r.customAttributeDefinition || r.attributeDefinition || '',
+        artifacts:   artText, // <-- NEW
+        status:      isCustom ? 'Add' : (r.selectionStatus || ''),
+        attest2025:  isCustom ? (r.customAttributeAttestation || '') : (r.selectionAttestation || ''),
+        assess2024:  r.assessScore2024 || '',
+        signoff:     signoff.get(key) ? 'Yes' : 'No',
+      };
+    });
+
+    return {
+      name: orgName || `Org ${orgID}`,
+      columns,
+      rows: excelRows,
+      freezeHeader: true,
+      editableHeaders,
+      editableHeaderColor: 'FFFDE68A',
+      // Optional per-column style hint if your Excel helper supports it later
+      // but most helpers allow cell-level format at write time:
+      // we rely on exportExcel to set wrapText when it sees newline chars
+    };
+  });
+
+  if (!sheets.length) {
+    sheets.push({
+      name: 'Export',
+      columns,
+      rows: [],
+      freezeHeader: true,
+      editableHeaders,
+      editableHeaderColor: 'FFFDE68A',
+    });
+  }
+
+  return sheets;
+}
+
+/* helpers */
+function dedupeBy(arr, keyFn) {
+  const seen = new Set();
+  return arr.filter(x => {
+    const k = keyFn(x);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+
+
+
+
