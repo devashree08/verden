@@ -1,37 +1,249 @@
--- One row = one link attached to one attribute row (baseline or custom)
-CREATE TABLE dbo.AttributeArtifact (
-  ArtifactLinkID       INT IDENTITY(1,1) PRIMARY KEY,
-  OrgID                INT                NOT NULL,
-  CSF2SubcategoryID    INT                NOT NULL,
-  MaturityLevel        INT                NOT NULL,
-  CSF1SubcategoryID    INT                NULL,  -- baseline only; NULL for custom
-  AttributeNum         INT                NULL,  -- baseline only; NULL for custom
-  CustomAttributeNum   INT                NULL,  -- custom only; NULL for baseline
+CREATE OR ALTER PROCEDURE dbo.sp_AttributeArtifact_Mutate
+  @Action             NVARCHAR(16),          -- 'Link' | 'Unlink'
+  @OrgID              INT,
+  @CSF2SubcategoryID  INT,
+  @MaturityLevel      INT,
+  @CSF1SubcategoryID  INT = NULL,            -- baseline only; NULL for custom
+  @AttributeNum       INT = NULL,            -- baseline only; NULL for custom
+  @CustomAttributeNum INT = NULL,            -- custom only; NULL for baseline
+  @Url                NVARCHAR(2048) = NULL, -- required for Link; optional for Unlink if @ArtifactLinkID used
+  @Title              NVARCHAR(300) = NULL,  -- optional (ignored for Unlink)
+  @Actor              NVARCHAR(200) = NULL,  -- for CreatedBy on Link
+  @ArtifactLinkID     INT = NULL             -- Unlink convenience
+AS
+BEGIN
+  SET NOCOUNT ON;
 
-  Url                  NVARCHAR(2048)     NOT NULL,
-  Title                NVARCHAR(300)      NULL,
+  IF @Action NOT IN ('Link','Unlink')
+  BEGIN
+    RAISERROR('Invalid @Action. Use Link | Unlink.', 16, 1);
+    RETURN;
+  END
 
-  IsActive             BIT                NOT NULL CONSTRAINT DF_AttributeArtifact_IsActive DEFAULT (1),
-  CreatedBy            NVARCHAR(200)      NULL,
-  CreatedAt            DATETIME2(0)       NOT NULL CONSTRAINT DF_AttributeArtifact_CreatedAt DEFAULT (SYSUTCDATETIME()),
-  UpdatedAt            DATETIME2(0)       NULL
-);
+  IF @Action = 'Link'
+  BEGIN
+    SET @Url = LTRIM(RTRIM(@Url));
+    IF (@Url IS NULL OR @Url = '')
+    BEGIN
+      RAISERROR('Url is required for Link.', 16, 1);
+      RETURN;
+    END
+
+    -- 1) Try to reactivate a previously inactive identical row (same attribute + URL)
+    UPDATE TOP (1) dbo.AttributeArtifact
+       SET IsActive = 1,
+           Title = COALESCE(@Title, Title),
+           UpdatedAt = SYSUTCDATETIME()
+     WHERE OrgID             = @OrgID
+       AND CSF2SubcategoryID = @CSF2SubcategoryID
+       AND MaturityLevel     = @MaturityLevel
+       AND (
+             (@CustomAttributeNum IS NULL AND CustomAttributeNum IS NULL
+              AND CSF1SubcategoryID = @CSF1SubcategoryID
+              AND AttributeNum      = @AttributeNum)
+          OR (@CustomAttributeNum IS NOT NULL AND CustomAttributeNum = @CustomAttributeNum)
+           )
+       AND Url = @Url
+       AND IsActive = 0;
+
+    IF @@ROWCOUNT = 0
+    BEGIN
+      BEGIN TRY
+        INSERT dbo.AttributeArtifact
+          (OrgID, CSF2SubcategoryID, MaturityLevel, CSF1SubcategoryID, AttributeNum, CustomAttributeNum,
+           Url, Title, IsActive, CreatedBy)
+        VALUES
+          (@OrgID, @CSF2SubcategoryID, @MaturityLevel, @CSF1SubcategoryID, @AttributeNum, @CustomAttributeNum,
+           @Url, NULLIF(@Title,''), 1, @Actor);
+      END TRY
+      BEGIN CATCH
+        -- If unique index is hit (already active), fall through to select
+        IF ERROR_NUMBER() NOT IN (2601, 2627) -- duplicate key
+          THROW;
+      END CATCH
+    END
+
+    -- Return the effective row
+    SELECT TOP (1)
+      ArtifactLinkID, OrgID, CSF2SubcategoryID, MaturityLevel,
+      CSF1SubcategoryID, AttributeNum, CustomAttributeNum,
+      Url, Title, IsActive, CreatedBy, CreatedAt, UpdatedAt
+    FROM dbo.AttributeArtifact
+    WHERE OrgID             = @OrgID
+      AND CSF2SubcategoryID = @CSF2SubcategoryID
+      AND MaturityLevel     = @MaturityLevel
+      AND (
+            (@CustomAttributeNum IS NULL AND CustomAttributeNum IS NULL
+             AND CSF1SubcategoryID = @CSF1SubcategoryID
+             AND AttributeNum      = @AttributeNum)
+         OR (@CustomAttributeNum IS NOT NULL AND CustomAttributeNum = @CustomAttributeNum)
+          )
+      AND Url = @Url
+    ORDER BY ArtifactLinkID DESC;
+
+    RETURN;
+  END
+
+  -- Unlink
+  IF @Action = 'Unlink'
+  BEGIN
+    IF @ArtifactLinkID IS NOT NULL
+    BEGIN
+      UPDATE dbo.AttributeArtifact
+         SET IsActive = 0,
+             UpdatedAt = SYSUTCDATETIME()
+       WHERE ArtifactLinkID = @ArtifactLinkID
+         AND IsActive = 1;
+
+      SELECT @@ROWCOUNT AS affected;
+      RETURN;
+    END
+
+    -- Composite + Url path
+    SET @Url = LTRIM(RTRIM(@Url));
+    IF (@Url IS NULL OR @Url = '')
+    BEGIN
+      RAISERROR('Url (or ArtifactLinkID) is required for Unlink.', 16, 1);
+      RETURN;
+    END
+
+    UPDATE dbo.AttributeArtifact
+       SET IsActive = 0,
+           UpdatedAt = SYSUTCDATETIME()
+     WHERE OrgID             = @OrgID
+       AND CSF2SubcategoryID = @CSF2SubcategoryID
+       AND MaturityLevel     = @MaturityLevel
+       AND (
+             (@CustomAttributeNum IS NULL AND CustomAttributeNum IS NULL
+              AND CSF1SubcategoryID = @CSF1SubcategoryID
+              AND AttributeNum      = @AttributeNum)
+          OR (@CustomAttributeNum IS NOT NULL AND CustomAttributeNum = @CustomAttributeNum)
+           )
+       AND Url      = @Url
+       AND IsActive = 1;
+
+    SELECT @@ROWCOUNT AS affected;
+    RETURN;
+  END
+END
 GO
 
-/* Enforce “no duplicate link for the same attribute” (baseline vs custom) */
 
--- Baseline attributes: unique per (org, subcat, ml, csf1, attrNum, url)
-CREATE UNIQUE INDEX UX_AttributeArtifact_Baseline
-ON dbo.AttributeArtifact(OrgID, CSF2SubcategoryID, MaturityLevel, CSF1SubcategoryID, AttributeNum, Url)
-WHERE IsActive = 1 AND CustomAttributeNum IS NULL;
 
--- Custom attributes: unique per (org, subcat, ml, customAttrNum, url)
-CREATE UNIQUE INDEX UX_AttributeArtifact_Custom
-ON dbo.AttributeArtifact(OrgID, CSF2SubcategoryID, MaturityLevel, CustomAttributeNum, Url)
-WHERE IsActive = 1 AND CustomAttributeNum IS NOT NULL;
+CREATE OR ALTER PROCEDURE dbo.sp_AttributeArtifact_List
+  @Mode              NVARCHAR(16),          -- 'Attribute' | 'ReusePool'
+  @OrgID             INT,
+  @CSF2SubcategoryID INT,
+  @MaturityLevel     INT = NULL,            -- required for Mode=Attribute
+  @CSF1SubcategoryID INT = NULL,            -- "
+  @AttributeNum      INT = NULL,            -- "
+  @CustomAttributeNum INT = NULL,           -- "
+  @Q                 NVARCHAR(200) = NULL   -- optional search for ReusePool
+AS
+BEGIN
+  SET NOCOUNT ON;
 
--- Fast lookups for “reuse pool” within org+subcat
-CREATE INDEX IX_AttributeArtifact_OrgSubcat_Active
-ON dbo.AttributeArtifact(OrgID, CSF2SubcategoryID, IsActive)
-INCLUDE (Url, Title, MaturityLevel, CSF1SubcategoryID, AttributeNum, CustomAttributeNum, CreatedAt);
+  IF @Mode = 'Attribute'
+  BEGIN
+    IF @MaturityLevel IS NULL
+    BEGIN
+      RAISERROR('Mode=Attribute requires full attribute identity.', 16, 1);
+      RETURN;
+    END
+
+    SELECT
+      ArtifactLinkID,
+      Url,
+      Title,
+      CreatedBy,
+      CreatedAt,
+      UpdatedAt
+    FROM dbo.AttributeArtifact
+    WHERE OrgID             = @OrgID
+      AND CSF2SubcategoryID = @CSF2SubcategoryID
+      AND MaturityLevel     = @MaturityLevel
+      AND (
+            (@CustomAttributeNum IS NULL AND CustomAttributeNum IS NULL
+             AND CSF1SubcategoryID = @CSF1SubcategoryID
+             AND AttributeNum      = @AttributeNum)
+         OR (@CustomAttributeNum IS NOT NULL AND CustomAttributeNum = @CustomAttributeNum)
+          )
+      AND IsActive = 1
+    ORDER BY COALESCE(UpdatedAt, CreatedAt) DESC, ArtifactLinkID DESC;
+
+    RETURN;
+  END
+
+  IF @Mode = 'ReusePool'
+  BEGIN
+    SELECT
+      Url,
+      Title = MAX(Title),
+      LastUsedAt = MAX(COALESCE(UpdatedAt, CreatedAt)),
+      Uses = COUNT(*)
+    FROM dbo.AttributeArtifact
+    WHERE OrgID             = @OrgID
+      AND CSF2SubcategoryID = @CSF2SubcategoryID
+      AND IsActive = 1
+      AND (@Q IS NULL OR Url LIKE '%' + @Q + '%' OR Title LIKE '%' + @Q + '%')
+    GROUP BY Url
+    ORDER BY LastUsedAt DESC;
+
+    RETURN;
+  END
+
+  RAISERROR('Invalid @Mode. Use Attribute | ReusePool.', 16, 1);
+END
 GO
+
+
+
+
+
+
+CREATE OR ALTER PROCEDURE dbo.sp_AttributeArtifact_BulkForExport
+  @OrgIDsCsv        NVARCHAR(MAX) = NULL,
+  @CSF2SubcatIDsCsv NVARCHAR(MAX) = NULL
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  CREATE TABLE #SelOrg (id INT PRIMARY KEY);
+  IF ISNULL(LTRIM(RTRIM(@OrgIDsCsv)),'') <> ''
+    INSERT #SelOrg
+    SELECT TRY_CAST(LTRIM(RTRIM(value)) AS INT)
+    FROM STRING_SPLIT(@OrgIDsCsv, ',')
+    WHERE LTRIM(RTRIM(value)) <> '';
+
+  CREATE TABLE #SelSub (id INT PRIMARY KEY);
+  IF ISNULL(LTRIM(RTRIM(@CSF2SubcatIDsCsv)),'') <> ''
+    INSERT #SelSub
+    SELECT TRY_CAST(LTRIM(RTRIM(value)) AS INT)
+    FROM STRING_SPLIT(@CSF2SubcatIDsCsv, ',')
+    WHERE LTRIM(RTRIM(value)) <> '';
+
+  SELECT
+    OrgID,
+    CSF2SubcategoryID,
+    MaturityLevel,
+    CSF1SubcategoryID,
+    AttributeNum,
+    CustomAttributeNum,
+    Artifacts = STRING_AGG(
+                  CASE WHEN Title IS NULL OR Title = ''
+                       THEN Url
+                       ELSE Title + ' (' + Url + ')'
+                  END,
+                  CHAR(10)
+                ) WITHIN GROUP (ORDER BY COALESCE(UpdatedAt, CreatedAt) DESC)
+  FROM dbo.AttributeArtifact
+  WHERE IsActive = 1
+    AND (NOT EXISTS(SELECT 1 FROM #SelOrg) OR OrgID IN (SELECT id FROM #SelOrg))
+    AND (NOT EXISTS(SELECT 1 FROM #SelSub) OR CSF2SubcategoryID IN (SELECT id FROM #SelSub))
+  GROUP BY
+    OrgID, CSF2SubcategoryID, MaturityLevel, CSF1SubcategoryID, AttributeNum, CustomAttributeNum;
+END
+GO
+
+
+
