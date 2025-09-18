@@ -1,12 +1,10 @@
-/* Generate a C# DTO from a stored procedure's first result set
-   — maps SQL types to C# and respects nullability.
+/* Generate a C# DTO from a stored procedure’s first result set
+   Uses sp_describe_first_result_set_for_object to avoid @params errors.
 */
-
-DECLARE @ProcName sysname = N'dbo.spGetAllApps';  -- ← change if needed
-DECLARE @UseNullableRefTypes bit = 1;             -- string? / byte[]? when column is nullable
+DECLARE @ProcName sysname = N'dbo.spGetAllApps';
+DECLARE @UseNullableRefTypes bit = 1;
 
 IF OBJECT_ID('tempdb..#meta') IS NOT NULL DROP TABLE #meta;
-
 CREATE TABLE #meta (
     is_hidden bit,
     column_ordinal int,
@@ -20,65 +18,36 @@ CREATE TABLE #meta (
     collation_name sysname NULL
 );
 
-DECLARE @sql nvarchar(max) = N'EXEC ' + QUOTENAME(PARSENAME(@ProcName,2)) + N'.' + QUOTENAME(PARSENAME(@ProcName,1));
 INSERT INTO #meta
-EXEC sys.sp_describe_first_result_set @tsql = @sql, @include_browse_information = 1;
+EXEC sys.sp_describe_first_result_set_for_object
+     @object_id = OBJECT_ID(@ProcName),
+     @include_browse_information = 1;
 
 WITH base AS (
     SELECT
-        m.column_ordinal,
-        m.name AS ColumnName,
-        m.is_nullable,
-        -- Strip size/precision: e.g., varchar(50) -> varchar
-        LOWER(LEFT(m.system_type_name, NULLIF(CHARINDEX('(', m.system_type_name + '(') - 1, -1))) AS base_sql_type,
-        m.system_type_name
-    FROM #meta m
-    WHERE m.is_hidden = 0
-)
-, mapped AS (
-    SELECT
         column_ordinal,
-        ColumnName,
+        name AS ColumnName,
         is_nullable,
-        base_sql_type,
-        system_type_name,
-        -- C# base type mapping
+        LOWER(LEFT(system_type_name, NULLIF(CHARINDEX('(', system_type_name + '(') - 1, -1))) AS base_sql_type,
+        system_type_name
+    FROM #meta
+    WHERE is_hidden = 0
+),
+mapped AS (
+    SELECT
+        column_ordinal, ColumnName, is_nullable, base_sql_type, system_type_name,
         CASE base_sql_type
-            WHEN 'bigint'           THEN 'long'
-            WHEN 'int'              THEN 'int'
-            WHEN 'smallint'         THEN 'short'
-            WHEN 'tinyint'          THEN 'byte'
-            WHEN 'bit'              THEN 'bool'
-            WHEN 'decimal'          THEN 'decimal'
-            WHEN 'numeric'          THEN 'decimal'
-            WHEN 'money'            THEN 'decimal'
-            WHEN 'smallmoney'       THEN 'decimal'
-            WHEN 'float'            THEN 'double'
-            WHEN 'real'             THEN 'float'
-            WHEN 'datetime'         THEN 'DateTime'
-            WHEN 'smalldatetime'    THEN 'DateTime'
-            WHEN 'datetime2'        THEN 'DateTime'
-            WHEN 'date'             THEN 'DateTime'
-            WHEN 'time'             THEN 'TimeSpan'
-            WHEN 'datetimeoffset'   THEN 'DateTimeOffset'
+            WHEN 'bigint' THEN 'long' WHEN 'int' THEN 'int' WHEN 'smallint' THEN 'short' WHEN 'tinyint' THEN 'byte'
+            WHEN 'bit' THEN 'bool'
+            WHEN 'decimal' THEN 'decimal' WHEN 'numeric' THEN 'decimal' WHEN 'money' THEN 'decimal' WHEN 'smallmoney' THEN 'decimal'
+            WHEN 'float' THEN 'double' WHEN 'real' THEN 'float'
+            WHEN 'datetime' THEN 'DateTime' WHEN 'smalldatetime' THEN 'DateTime' WHEN 'datetime2' THEN 'DateTime'
+            WHEN 'date' THEN 'DateTime' WHEN 'time' THEN 'TimeSpan' WHEN 'datetimeoffset' THEN 'DateTimeOffset'
             WHEN 'uniqueidentifier' THEN 'Guid'
-            WHEN 'binary'           THEN 'byte[]'
-            WHEN 'varbinary'        THEN 'byte[]'
-            WHEN 'image'            THEN 'byte[]'
-            WHEN 'rowversion'       THEN 'byte[]'
-            WHEN 'timestamp'        THEN 'byte[]'
-            WHEN 'xml'              THEN 'string'
-            WHEN 'char'             THEN 'string'
-            WHEN 'nchar'            THEN 'string'
-            WHEN 'varchar'          THEN 'string'
-            WHEN 'nvarchar'         THEN 'string'
-            WHEN 'text'             THEN 'string'
-            WHEN 'ntext'            THEN 'string'
-            WHEN 'sql_variant'      THEN 'object'
-            -- Spatial & hierarchy types → object by default (customize if you use specific client types)
-            WHEN 'geometry'         THEN 'object'
-            WHEN 'geography'        THEN 'object'
-            WHEN 'hierarchyid'      THEN 'object'
+            WHEN 'binary' THEN 'byte[]' WHEN 'varbinary' THEN 'byte[]' WHEN 'image' THEN 'byte[]' WHEN 'rowversion' THEN 'byte[]' WHEN 'timestamp' THEN 'byte[]'
+            WHEN 'xml' THEN 'string' WHEN 'char' THEN 'string' WHEN 'nchar' THEN 'string' WHEN 'varchar' THEN 'string' WHEN 'nvarchar' THEN 'string'
+            WHEN 'text' THEN 'string' WHEN 'ntext' THEN 'string'
+            WHEN 'sql_variant' THEN 'object' WHEN 'geometry' THEN 'object' WHEN 'geography' THEN 'object' WHEN 'hierarchyid' THEN 'object'
             ELSE 'object'
         END AS CSharpBaseType
     FROM base
@@ -87,15 +56,13 @@ SELECT
     'public '
     + CSharpBaseType
     + CASE
-        -- Value types get '?' when nullable
         WHEN CSharpBaseType IN ('long','int','short','byte','bool','decimal','double','float','DateTime','TimeSpan','DateTimeOffset','Guid')
              AND is_nullable = 1 THEN '?'
-        -- Reference/array types (string/byte[]) get '?' only if opted-in and nullable
         WHEN CSharpBaseType IN ('string','byte[]','object') AND @UseNullableRefTypes = 1 AND is_nullable = 1 THEN '?'
         ELSE ''
       END
     + ' '
-    + QUOTENAME(ColumnName)  -- keeps odd names valid; remove QUOTENAME(...) if your names are already clean identifiers
+    + QUOTENAME(ColumnName)
     + ' { get; set; }' AS DTO_Line
 FROM mapped
 ORDER BY column_ordinal;
