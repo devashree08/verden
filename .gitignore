@@ -1,60 +1,101 @@
--- Assumes staging table:
--- stg.TPD_CSF2_Custom(CSF2SubcategoryName NVARCHAR(200), MaturityLevel TINYINT, AttributeDefinition NVARCHAR(500))
+/* Generate a C# DTO from a stored procedure's first result set
+   — maps SQL types to C# and respects nullability.
+*/
 
-BEGIN TRAN;
+DECLARE @ProcName sysname = N'dbo.spGetAllApps';  -- ← change if needed
+DECLARE @UseNullableRefTypes bit = 1;             -- string? / byte[]? when column is nullable
 
-;WITH file_rows AS (
-  SELECT DISTINCT
-         LTRIM(RTRIM(s.CSF2SubcategoryName)) AS CSF2SubcategoryName,
-         s.MaturityLevel,
-         LTRIM(RTRIM(s.AttributeDefinition))  AS Definition
-  FROM stg.TPD_CSF2_Custom s
-),
-resolved AS (
-  SELECT
-    OrgID          = 4,
-    sc.SubcategoryID AS CSF2SubcatID,
-    f.MaturityLevel,
-    f.Definition
-  FROM file_rows f
-  JOIN ref.CSF2_Subcategory sc
-    ON sc.SubcategoryName = f.CSF2SubcategoryName
-),
-existing_max AS (
-  SELECT
-    CSF2SubcatID,
-    MaturityLevel,
-    MAX(AttributeNum) AS maxNum
-  FROM dbo.Org_CustomCsf2Attribute
-  WHERE OrgID = 4 AND IsActive = 1
-  GROUP BY CSF2SubcatID, MaturityLevel
-),
-numbered AS (
-  SELECT
-    r.OrgID,
-    r.CSF2SubcatID,
-    r.MaturityLevel,
-    r.Definition,
-    baseNum = CASE WHEN ISNULL(em.maxNum,0) < 15 THEN 14 ELSE em.maxNum END,
-    rn      = ROW_NUMBER() OVER (PARTITION BY r.CSF2SubcatID, r.MaturityLevel ORDER BY (SELECT 1))
-  FROM resolved r
-  LEFT JOIN existing_max em
-    ON em.CSF2SubcatID = r.CSF2SubcatID
-   AND em.MaturityLevel = r.MaturityLevel
+IF OBJECT_ID('tempdb..#meta') IS NOT NULL DROP TABLE #meta;
+
+CREATE TABLE #meta (
+    is_hidden bit,
+    column_ordinal int,
+    name sysname,
+    is_nullable bit,
+    system_type_id int,
+    system_type_name nvarchar(256),
+    max_length int,
+    precision tinyint,
+    scale tinyint,
+    collation_name sysname NULL
+);
+
+DECLARE @sql nvarchar(max) = N'EXEC ' + QUOTENAME(PARSENAME(@ProcName,2)) + N'.' + QUOTENAME(PARSENAME(@ProcName,1));
+INSERT INTO #meta
+EXEC sys.sp_describe_first_result_set @tsql = @sql, @include_browse_information = 1;
+
+WITH base AS (
+    SELECT
+        m.column_ordinal,
+        m.name AS ColumnName,
+        m.is_nullable,
+        -- Strip size/precision: e.g., varchar(50) -> varchar
+        LOWER(LEFT(m.system_type_name, NULLIF(CHARINDEX('(', m.system_type_name + '(') - 1, -1))) AS base_sql_type,
+        m.system_type_name
+    FROM #meta m
+    WHERE m.is_hidden = 0
 )
-INSERT dbo.Org_CustomCsf2Attribute
-  (OrgID, CSF2SubcatID, MaturityLevel, AttributeNum, Definition,
-   Attestation2025, IsActive, CreatedBy, ModifiedBy)
+, mapped AS (
+    SELECT
+        column_ordinal,
+        ColumnName,
+        is_nullable,
+        base_sql_type,
+        system_type_name,
+        -- C# base type mapping
+        CASE base_sql_type
+            WHEN 'bigint'           THEN 'long'
+            WHEN 'int'              THEN 'int'
+            WHEN 'smallint'         THEN 'short'
+            WHEN 'tinyint'          THEN 'byte'
+            WHEN 'bit'              THEN 'bool'
+            WHEN 'decimal'          THEN 'decimal'
+            WHEN 'numeric'          THEN 'decimal'
+            WHEN 'money'            THEN 'decimal'
+            WHEN 'smallmoney'       THEN 'decimal'
+            WHEN 'float'            THEN 'double'
+            WHEN 'real'             THEN 'float'
+            WHEN 'datetime'         THEN 'DateTime'
+            WHEN 'smalldatetime'    THEN 'DateTime'
+            WHEN 'datetime2'        THEN 'DateTime'
+            WHEN 'date'             THEN 'DateTime'
+            WHEN 'time'             THEN 'TimeSpan'
+            WHEN 'datetimeoffset'   THEN 'DateTimeOffset'
+            WHEN 'uniqueidentifier' THEN 'Guid'
+            WHEN 'binary'           THEN 'byte[]'
+            WHEN 'varbinary'        THEN 'byte[]'
+            WHEN 'image'            THEN 'byte[]'
+            WHEN 'rowversion'       THEN 'byte[]'
+            WHEN 'timestamp'        THEN 'byte[]'
+            WHEN 'xml'              THEN 'string'
+            WHEN 'char'             THEN 'string'
+            WHEN 'nchar'            THEN 'string'
+            WHEN 'varchar'          THEN 'string'
+            WHEN 'nvarchar'         THEN 'string'
+            WHEN 'text'             THEN 'string'
+            WHEN 'ntext'            THEN 'string'
+            WHEN 'sql_variant'      THEN 'object'
+            -- Spatial & hierarchy types → object by default (customize if you use specific client types)
+            WHEN 'geometry'         THEN 'object'
+            WHEN 'geography'        THEN 'object'
+            WHEN 'hierarchyid'      THEN 'object'
+            ELSE 'object'
+        END AS CSharpBaseType
+    FROM base
+)
 SELECT
-  OrgID,
-  CSF2SubcatID,
-  MaturityLevel,
-  baseNum + rn       AS AttributeNum,   -- first new number is ≥ 15 and continues from current max
-  Definition,
-  NULL               AS Attestation2025,
-  1                  AS IsActive,
-  N'TPD Initial Load',
-  N'TPD Initial Load'
-FROM numbered;
-
-COMMIT;
+    'public '
+    + CSharpBaseType
+    + CASE
+        -- Value types get '?' when nullable
+        WHEN CSharpBaseType IN ('long','int','short','byte','bool','decimal','double','float','DateTime','TimeSpan','DateTimeOffset','Guid')
+             AND is_nullable = 1 THEN '?'
+        -- Reference/array types (string/byte[]) get '?' only if opted-in and nullable
+        WHEN CSharpBaseType IN ('string','byte[]','object') AND @UseNullableRefTypes = 1 AND is_nullable = 1 THEN '?'
+        ELSE ''
+      END
+    + ' '
+    + QUOTENAME(ColumnName)  -- keeps odd names valid; remove QUOTENAME(...) if your names are already clean identifiers
+    + ' { get; set; }' AS DTO_Line
+FROM mapped
+ORDER BY column_ordinal;
