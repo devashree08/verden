@@ -1,8 +1,10 @@
 /* Generate C# DTO properties from a stored procedure's first result set
-   SQL Server 2019+ using sys.dm_exec_describe_first_result_set_for_object
+   SQL Server 2019 using sys.dm_exec_describe_first_result_set_for_object
+   - No brackets around property names
+   - All types rendered as nullable (int? string? DateTime? etc.)
 */
 DECLARE @ProcName sysname = N'dbo.spGetAllApps';  -- your proc
-DECLARE @UseNullableRefTypes bit = 1;             -- string? / byte[]? when column is nullable
+DECLARE @ForceAllNullable bit = 1;                -- always add '?' to types
 
 IF OBJECT_ID('tempdb..#meta') IS NOT NULL DROP TABLE #meta;
 CREATE TABLE #meta (
@@ -18,7 +20,6 @@ CREATE TABLE #meta (
     collation_name sysname NULL
 );
 
--- Use the DMF (table-valued function) — NOT an sp_ proc:
 INSERT INTO #meta
 SELECT *
 FROM sys.dm_exec_describe_first_result_set_for_object(
@@ -30,8 +31,6 @@ WITH base AS (
     SELECT
         column_ordinal,
         name AS ColumnName,
-        is_nullable,
-        -- strip "(...)" to get the base SQL type
         LOWER(LEFT(system_type_name, NULLIF(CHARINDEX('(', system_type_name + '(') - 1, -1))) AS base_sql_type,
         system_type_name
     FROM #meta
@@ -39,7 +38,7 @@ WITH base AS (
 ),
 mapped AS (
     SELECT
-        column_ordinal, ColumnName, is_nullable, base_sql_type, system_type_name,
+        column_ordinal, ColumnName, base_sql_type, system_type_name,
         CASE base_sql_type
             WHEN 'bigint'           THEN 'long'
             WHEN 'int'              THEN 'int'
@@ -82,16 +81,10 @@ mapped AS (
 SELECT
     'public '
     + CSharpBaseType
-    + CASE
-        -- nullable value types -> ?
-        WHEN CSharpBaseType IN ('long','int','short','byte','bool','decimal','double','float','DateTime','TimeSpan','DateTimeOffset','Guid')
-             AND is_nullable = 1 THEN '?'
-        -- reference/array types get ? only if you opt in and column is nullable
-        WHEN CSharpBaseType IN ('string','byte[]','object') AND @UseNullableRefTypes = 1 AND is_nullable = 1 THEN '?'
-        ELSE ''
-      END
+    + CASE WHEN @ForceAllNullable = 1 THEN '?' ELSE '' END
     + ' '
-    + QUOTENAME(ColumnName)  -- keep if you have spaces/keywords; remove to get bare identifiers
+    + ColumnName               -- no brackets; assumes your column names are C#-safe identifiers
     + ' { get; set; }' AS DTO_Line
 FROM mapped
 ORDER BY column_ordinal;
+
