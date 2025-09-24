@@ -1,44 +1,18 @@
 from __future__ import annotations
-from typing import Optional, Literal, List, Dict, Any
-from pydantic import BaseModel, Field, ConfigDict
+import os
+from fastapi import Request
 
-Columns = List[str]  # ["*"] or subset names
+DEV_EID_HEADER = os.getenv("DEV_EID_HEADER", "X-User-EID")
 
-class DescribeFieldsIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    proc: Literal["dbo.SPGetAllAppsValueByEID", "dbo.SPGetAllAppsSummaryByEID", "dbo.SPGetVastGeneralByEID"] = Field(..., description="Which procedure to inspect.")
-    search: Optional[str] = Field(None, description="Optional substring filter across column names/descriptions.")
-    tags: Optional[List[str]] = Field(None, description="Optional tags filter (from atlas).")
-    page: Optional[int] = Field(None, ge=1, description="Optional page number for large schemas.")
-
-class DescribeFieldsOut(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    proc: str
-    columns: List[Dict[str, Any]]  # {"name","sql_type","nullable","description","tags",...}
-
-class ValueToolIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    vast: Optional[str] = Field(None, description="Comma-separated list of VAST IDs (numeric).")
-    columns: Optional[Columns] = Field(None, description='Column projection. Use ["*"] for all.')
-    question: Optional[str] = Field(None, description="Optional natural-language hint for agent; not used by backend.")
-    time_window: Optional[str] = Field(None, description="Optional hint (agent usage); backend ignores.")
-
-class SummaryToolIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    vast: Optional[str] = None
-    report_month: Optional[str] = Field(None, description='Month key like "YYYY-MM" or "YYYY-MM-01 00:00:00".')
-    columns: Optional[Columns] = None
-    question: Optional[str] = None
-
-class GeneralToolIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    vast: Optional[str] = None
-    columns: Optional[Columns] = None
-    question: Optional[str] = None
-
-class ToolOut(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    columns_returned: List[str]
-    rows: List[Dict[str, Any]]
-    meta: Dict[str, Any]
-
+def get_eid_dev(request: Request) -> str:
+    """
+    DEV ONLY: derive EID from trusted header or env.
+    SECURITY: never expose EID in tool schemas or outputs.
+    """
+    val = request.headers.get(DEV_EID_HEADER)
+    if val:
+        return val.strip()
+    env_eid = os.getenv("DEV_EID")
+    if env_eid:
+        return env_eid.strip()
+    raise RuntimeError("Missing EID (dev). Provide header X-User-EID or DEV_EID env for local testing.")
