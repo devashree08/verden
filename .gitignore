@@ -1,18 +1,18 @@
 from __future__ import annotations
-import os
-from fastapi import Request
+import json, time, uuid
+from contextlib import contextmanager
+from typing import Iterator, Sequence
 
-DEV_EID_HEADER = os.getenv("DEV_EID_HEADER", "X-User-EID")
+def new_request_id() -> str:
+    return str(uuid.uuid4())
 
-def get_eid_dev(request: Request) -> str:
-    """
-    DEV ONLY: derive EID from trusted header or env.
-    SECURITY: never expose EID in tool schemas or outputs.
-    """
-    val = request.headers.get(DEV_EID_HEADER)
-    if val:
-        return val.strip()
-    env_eid = os.getenv("DEV_EID")
-    if env_eid:
-        return env_eid.strip()
-    raise RuntimeError("Missing EID (dev). Provide header X-User-EID or DEV_EID env for local testing.")
+@contextmanager
+def audit_span(request_id: str, tool: str, proc: str, columns: Sequence[str]) -> Iterator[dict]:
+    start = time.perf_counter()
+    log = {"request_id": request_id, "tool": tool, "proc": proc, "columns": list(columns)}
+    try:
+        yield log
+    finally:
+        log["duration_ms"] = round((time.perf_counter() - start) * 1000, 2)
+        # SECURITY: we log no row values or secrets
+        print(json.dumps({"audit": log}))
