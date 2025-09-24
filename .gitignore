@@ -1,33 +1,44 @@
 from __future__ import annotations
-from typing import Any, Mapping, Sequence
-from app.db.executor import DbExecutor
-from app.backend.base import DataBackend, BoundCall
+from typing import Optional, Literal, List, Dict, Any
+from pydantic import BaseModel, Field, ConfigDict
 
-class MssqlBackend(DataBackend):
-    def __init__(self, executor: DbExecutor, registry_index: dict[str, dict]) -> None:
-        """
-        registry_index: { "dbo.SP...": {"result_columns":[{"name":...}, ...]} }
-        """
-        self._exec = executor
-        self._index = registry_index
+Columns = List[str]  # ["*"] or subset names
 
-    def describe(self, name: str) -> list[dict]:
-        entry = self._index.get(name)
-        if not entry:
-            raise ValueError(f"Unknown procedure {name}")
-        return entry["result_columns"]
+class DescribeFieldsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    proc: Literal["dbo.SPGetAllAppsValueByEID", "dbo.SPGetAllAppsSummaryByEID", "dbo.SPGetVastGeneralByEID"] = Field(..., description="Which procedure to inspect.")
+    search: Optional[str] = Field(None, description="Optional substring filter across column names/descriptions.")
+    tags: Optional[List[str]] = Field(None, description="Optional tags filter (from atlas).")
+    page: Optional[int] = Field(None, ge=1, description="Optional page number for large schemas.")
 
-    def execute(self, call: BoundCall) -> list[dict]:
-        # Run proc, then project columns if needed
-        rows = self._exec.execute_proc(call.name, dict(call.params), max_rows=call.row_limit)
-        if not rows:
-            return rows
-        # Projection (already resolved to a concrete list in the service layer)
-        cols = list(call.columns)
-        if cols and cols != ["*"]:
-            out = []
-            for r in rows:
-                out.append({k: r.get(k) for k in cols})
-            return out
-        return rows
+class DescribeFieldsOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    proc: str
+    columns: List[Dict[str, Any]]  # {"name","sql_type","nullable","description","tags",...}
+
+class ValueToolIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    vast: Optional[str] = Field(None, description="Comma-separated list of VAST IDs (numeric).")
+    columns: Optional[Columns] = Field(None, description='Column projection. Use ["*"] for all.')
+    question: Optional[str] = Field(None, description="Optional natural-language hint for agent; not used by backend.")
+    time_window: Optional[str] = Field(None, description="Optional hint (agent usage); backend ignores.")
+
+class SummaryToolIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    vast: Optional[str] = None
+    report_month: Optional[str] = Field(None, description='Month key like "YYYY-MM" or "YYYY-MM-01 00:00:00".')
+    columns: Optional[Columns] = None
+    question: Optional[str] = None
+
+class GeneralToolIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    vast: Optional[str] = None
+    columns: Optional[Columns] = None
+    question: Optional[str] = None
+
+class ToolOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    columns_returned: List[str]
+    rows: List[Dict[str, Any]]
+    meta: Dict[str, Any]
 
