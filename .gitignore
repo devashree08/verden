@@ -1,6 +1,5 @@
-npx @modelcontextprotocol/cli@0.16.8 `
-  --transport stdio `
-  --command "D:\App\WorkingFolder\User\Prototype\MCP-MSQL\.venv\Scripts\python.exe" `
-  --args "-m","app.mcp.server" `
-  --env "PYTHONPATH=D:\App\WorkingFolder\User\Prototype\MCP-MSQL" `
-  list-tools
+npx @modelcontextprotocol/inspector --cli `
+  -e PYTHONPATH="D:\App\WorkingFolder\User\Prototype\MCP-MSQL" `
+  -e DEV_EID="<yourEID>" `
+  "D:\App\WorkingFolder\User\Prototype\MCP-MSQL\.venv\Scripts\python.exe" -m app.mcp.server `
+  --method tools/list
