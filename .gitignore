@@ -1,40 +1,229 @@
 from __future__ import annotations
-from pathlib import Path
-import yaml
+from typing import Any, Sequence
+from fastapi import Request
 
-def load_registry() -> dict[str, dict]:
-    out = {}
-    regdir = Path("registry")
-    for p in regdir.glob("*.yml"):
-        data = yaml.safe_load(p.read_text(encoding="utf-8"))
-        out[data["procedure"]] = data
-    return out
+from app.backend.base import DataBackend, BoundCall
+from app.utils.validation import parse_vast_csv, normalize_report_month
+from app.security.eid import get_eid_dev
+from app.observability.logging import audit_span, new_request_id
+from app.composition.openapi import load_registry, load_atlas, compose_columns_with_descriptions
 
-def load_atlas() -> dict[str, dict]:
-    out = {}
-    adir = Path("atlas")
-    for p in adir.glob("*.atlas.yml"):
-        data = yaml.safe_load(p.read_text(encoding="utf-8"))
-        out[data["procedure"]] = {c["name"]: c for c in data.get("columns", [])}
-    return out
+# Load registry + atlas once at startup
+_REGISTRY = load_registry()
+_ATLAS = load_atlas()
 
-def compose_columns_with_descriptions(registry_entry: dict, atlas_map: dict[str, dict]) -> list[dict]:
-    cols = []
-    for c in registry_entry["result_columns"]:
-        name = c["name"]
-        a = atlas_map.get(name, {})
-        merged = {
-            "name": name,
-            "sql_type": c["sql_type"],
-            "nullable": c["nullable"],
-            "description": a.get("description", ""),
-            "tags": a.get("tags", []),
-            "format": a.get("format"),
-            "pattern": a.get("pattern"),
-            "example": a.get("example"),
-            "deprecated": a.get("deprecated", False),
-            "x-needs-review": a.get("needs_review", False),
-        }
-        cols.append(merged)
-    return cols
+# Helper: resolve projection list (default = all)
+def _resolve_projection(proc: str, columns: Sequence[str] | None) -> list[str]:
+    all_cols = [c["name"] for c in _REGISTRY[proc]["result_columns"]]
+    if not columns or columns == ["*"]:
+        return all_cols
+    # keep only known names (ignore unknowns silently)
+    wanted = [c for c in columns if c in all_cols]
+    return wanted or all_cols
+
+def describe_fields(request: Request, backend: DataBackend, *, proc: str, search: str | None = None, tags: list[str] | None = None, page: int | None = None) -> dict:
+    eid = get_eid_dev(request)  # used only for audit context; not exposed
+    columns = compose_columns_with_descriptions(_REGISTRY[proc], _ATLAS.get(proc, {}))
+    if search:
+        s = search.lower()
+        columns = [c for c in columns if s in c["name"].lower() or s in (c.get("description") or "").lower()]
+    if tags:
+        tagset = set(t.lower() for t in tags)
+        columns = [c for c in columns if tagset.intersection({t.lower() for t in c.get("tags", [])})]
+    # Optional simple paging for huge schemas
+    if page and page > 0:
+        size = 100
+        start = (page - 1) * size
+        columns = columns[start : start + size]
+
+    req_id = new_request_id()
+    with audit_span(req_id, "describe_fields", proc, [c["name"] for c in columns]):
+        pass
+    return {"proc": proc, "columns": columns}
+
+def get_all_apps_value(request: Request, backend: DataBackend, *, vast: str | None, columns: list[str] | None, question: str | None, time_window: str | None) -> dict:
+    eid = get_eid_dev(request)
+    vast_list = parse_vast_csv(vast)
+    projection = _resolve_projection("dbo.SPGetAllAppsValueByEID", columns)
+    call = BoundCall(
+        name="dbo.SPGetAllAppsValueByEID",
+        params={"EID": eid, "VAST": ",".join(vast_list) if vast_list else None},
+        columns=projection,
+        row_limit=int(__import__("os").getenv("RESULT_ROW_LIMIT_DEFAULT", "100")),
+    )
+    req_id = new_request_id()
+    with audit_span(req_id, "get_all_apps_value", call.name, projection) as log:
+        rows = backend.execute(call)
+        log["row_count"] = len(rows)
+    return {"columns_returned": projection, "rows": rows, "meta": {"request_id": req_id}}
+
+def get_all_apps_summary(request: Request, backend: DataBackend, *, vast: str | None, report_month: str | None, columns: list[str] | None, question: str | None) -> dict:
+    eid = get_eid_dev(request)
+    vast_list = parse_vast_csv(vast)
+    rm = normalize_report_month(report_month)
+    projection = _resolve_projection("dbo.SPGetAllAppsSummaryByEID", columns)
+    call = BoundCall(
+        name="dbo.SPGetAllAppsSummaryByEID",
+        params={"EID": eid, "VAST": ",".join(vast_list) if vast_list else None, "ReportMonth": rm},
+        columns=projection,
+        row_limit=int(__import__("os").getenv("RESULT_ROW_LIMIT_DEFAULT", "100")),
+    )
+    req_id = new_request_id()
+    with audit_span(req_id, "get_all_apps_summary", call.name, projection) as log:
+        rows = backend.execute(call)
+        log["row_count"] = len(rows)
+    return {"columns_returned": projection, "rows": rows, "meta": {"request_id": req_id, "report_month": rm.isoformat(sep=" ")}}
+
+def get_vast_general(request: Request, backend: DataBackend, *, vast: str | None, columns: list[str] | None, question: str | None) -> dict:
+    eid = get_eid_dev(request)
+    vast_list = parse_vast_csv(vast)
+    projection = _resolve_projection("dbo.SPGetVastGeneralByEID", columns)
+    call = BoundCall(
+        name="dbo.SPGetVastGeneralByEID",
+        params={"EID": eid, "VAST": ",".join(vast_list) if vast_list else None},
+        columns=projection,
+        row_limit=int(__import__("os").getenv("RESULT_ROW_LIMIT_DEFAULT", "100")),
+    )
+    req_id = new_request_id()
+    with audit_span(req_id, "get_vast_general", call.name, projection) as log:
+        rows = backend.execute(call)
+        log["row_count"] = len(rows)
+    return {"columns_returned": projection, "rows": rows, "meta": {"request_id": req_id}}
+
+
+
+from __future__ import annotations
+from fastapi import APIRouter, Depends, Request
+from app.backend.mssql import MssqlBackend
+from app.db.executor import DbExecutor, ConnectionPool, ProcLimiter
+from app.utils.config import DbSettings
+from app.composition.openapi import load_registry, load_atlas, compose_columns_with_descriptions
+from app.mcp.tools import describe_fields, get_all_apps_value, get_all_apps_summary, get_vast_general
+from app.models.schemas import DescribeFieldsIn, ValueToolIn, SummaryToolIn, GeneralToolIn
+
+router = APIRouter()
+
+def get_backend() -> MssqlBackend:
+    # build once per process in app factory; kept here to show dependency sig
+    raise RuntimeError("Backend factory should be wired in app.app:create_app")
+
+@router.post("/describe_fields")
+def http_describe_fields(payload: DescribeFieldsIn, request: Request, backend: MssqlBackend = Depends(get_backend)):
+    return describe_fields(request, backend, proc=payload.proc, search=payload.search, tags=payload.tags, page=payload.page)
+
+@router.post("/get_all_apps_value")
+def http_get_all_apps_value(payload: ValueToolIn, request: Request, backend: MssqlBackend = Depends(get_backend)):
+    return get_all_apps_value(request, backend, vast=payload.vast, columns=payload.columns, question=payload.question, time_window=payload.time_window)
+
+@router.post("/get_all_apps_summary")
+def http_get_all_apps_summary(payload: SummaryToolIn, request: Request, backend: MssqlBackend = Depends(get_backend)):
+    return get_all_apps_summary(request, backend, vast=payload.vast, report_month=payload.report_month, columns=payload.columns, question=payload.question)
+
+@router.post("/get_vast_general")
+def http_get_vast_general(payload: GeneralToolIn, request: Request, backend: MssqlBackend = Depends(get_backend)):
+    return get_vast_general(request, backend, vast=payload.vast, columns=payload.columns, question=payload.question)
+
+
+
+
+
+from __future__ import annotations
+import os
+from fastapi import FastAPI
+from app.api.routes import router
+from app.backend.mssql import MssqlBackend
+from app.db.executor import DbExecutor, ConnectionPool, ProcLimiter, _ConnConfig
+from app.utils.config import DbSettings
+from app.composition.openapi import load_registry
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="MCP MS-SQL Tools", version="0.2.0")
+
+    # Build backend once
+    s = DbSettings.from_env()
+    cfg = _ConnConfig(
+        server=s.server, database=s.database, username=s.username, password=s.password,
+        encrypt=s.encrypt, trust_server_cert=s.trust_server_cert,
+        conn_timeout_sec=s.conn_timeout_sec, command_timeout_sec=s.command_timeout_sec,
+    )
+    pool = ConnectionPool(cfg, max_connections=s.max_connections)
+    limiter = ProcLimiter()
+    reg = load_registry()
+    # register per-proc caps (default 5)
+    for name, entry in reg.items():
+        limiter.register(name, entry.get("limits", {}).get("max_concurrency", 5))
+    executor = DbExecutor(pool, limiter, request_timeout_sec=s.request_timeout_sec)
+    backend = MssqlBackend(executor, reg)
+
+    # Dependency injection for routes
+    from fastapi import Depends
+    def backend_factory() -> MssqlBackend:
+        return backend
+    app.dependency_overrides[router.dependencies[0].dependency] = backend_factory if router.dependencies else backend_factory  # safe install
+
+    app.include_router(router)
+    return app
+
+app = create_app()
+
+
+
+from __future__ import annotations
+import os
+from fastmcp import MCP, tool  # ensure fastmcp is installed for your environment
+from starlette.requests import Request as StarletteRequest
+
+from app.api.app import create_app  # reuse backend setup
+from app.mcp.tools import describe_fields, get_all_apps_value, get_all_apps_summary, get_vast_general
+
+mcp = MCP(name="mssql-tools")
+
+# We'll reuse the FastAPI app's backend wiring
+_fastapi_app = create_app()
+_backend = None
+for k, v in _fastapi_app.dependency_overrides.items():
+    # Find the backend factory we injected
+    try:
+        candidate = v()
+        from app.backend.mssql import MssqlBackend
+        if isinstance(candidate, MssqlBackend):
+            _backend = candidate
+            break
+    except Exception:
+        continue
+assert _backend is not None, "Backend not initialized"
+
+@tool(name="describe_fields")
+def t_describe_fields(proc: str, search: str | None = None, tags: list[str] | None = None, page: int | None = None) -> dict:
+    # Create a faux request obj for EID injection path (Inspector doesn't pass headers)
+    scope = {"type": "http", "headers": []}
+    request = StarletteRequest(scope)
+    return describe_fields(request, _backend, proc=proc, search=search, tags=tags, page=page)
+
+@tool(name="get_all_apps_value")
+def t_get_all_apps_value(vast: str | None = None, columns: list[str] | None = None, question: str | None = None, time_window: str | None = None) -> dict:
+    scope = {"type": "http", "headers": []}
+    request = StarletteRequest(scope)
+    return get_all_apps_value(request, _backend, vast=vast, columns=columns, question=question, time_window=time_window)
+
+@tool(name="get_all_apps_summary")
+def t_get_all_apps_summary(vast: str | None = None, report_month: str | None = None, columns: list[str] | None = None, question: str | None = None) -> dict:
+    scope = {"type": "http", "headers": []}
+    request = StarletteRequest(scope)
+    return get_all_apps_summary(request, _backend, vast=vast, report_month=report_month, columns=columns, question=question)
+
+@tool(name="get_vast_general")
+def t_get_vast_general(vast: str | None = None, columns: list[str] | None = None, question: str | None = None) -> dict:
+    scope = {"type": "http", "headers": []}
+    request = StarletteRequest(scope)
+    return get_vast_general(request, _backend, vast=vast, columns=columns, question=question)
+
+if __name__ == "__main__":
+    # Runs an MCP server process accessible to MCP Inspector
+    mcp.run()
+
+
+
+
+
 
