@@ -1,5 +1,20 @@
-npx @modelcontextprotocol/inspector --cli `
-  -e PYTHONPATH="D:\App\WorkingFolder\User\Prototype\MCP-MSQL" `
-  -e DEV_EID="<yourEID>" `
-  "D:\App\WorkingFolder\User\Prototype\MCP-MSQL\.venv\Scripts\python.exe" -m app.mcp.server `
-  --method tools/list
+# app/observability/logging.py
+from __future__ import annotations
+import json, time, uuid, sys
+from contextlib import contextmanager
+from typing import Iterator, Sequence
+
+def new_request_id() -> str:
+    return str(uuid.uuid4())
+
+@contextmanager
+def audit_span(request_id: str, tool: str, proc: str, columns: Sequence[str]) -> Iterator[dict]:
+    start = time.perf_counter()
+    log = {"request_id": request_id, "tool": tool, "proc": proc, "columns": list(columns)}
+    try:
+        yield log
+    finally:
+        log["duration_ms"] = round((time.perf_counter() - start) * 1000, 2)
+        # IMPORTANT: MCP stdio uses stdout for protocol — log to **stderr** only.
+        sys.stderr.write(json.dumps({"audit": log}) + "\n")
+        sys.stderr.flush()
