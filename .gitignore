@@ -1,18 +1,33 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Protocol, Sequence, Mapping, Any
+from typing import Any, Mapping, Sequence
+from app.db.executor import DbExecutor
+from app.backend.base import DataBackend, BoundCall
 
-@dataclass(frozen=True, slots=True)
-class BoundCall:
-    """A normalized call to a named data method (proc/TVF) with safe params."""
-    name: str                    # e.g., "dbo.SPGetAllAppsValueByEID"
-    params: Mapping[str, Any]    # {"EID": "...", "VAST": "...", ...}
-    columns: Sequence[str]       # projection (resolved list; "*" already expanded)
-    row_limit: int               # enforced by backend (<= configured max)
+class MssqlBackend(DataBackend):
+    def __init__(self, executor: DbExecutor, registry_index: dict[str, dict]) -> None:
+        """
+        registry_index: { "dbo.SP...": {"result_columns":[{"name":...}, ...]} }
+        """
+        self._exec = executor
+        self._index = registry_index
 
-class DataBackend(Protocol):
     def describe(self, name: str) -> list[dict]:
-        """Return columns for `name` as dicts: {"name","sql_type","nullable"}."""
+        entry = self._index.get(name)
+        if not entry:
+            raise ValueError(f"Unknown procedure {name}")
+        return entry["result_columns"]
 
     def execute(self, call: BoundCall) -> list[dict]:
-        """Return rows projected to `call.columns`, limited to `row_limit`."""
+        # Run proc, then project columns if needed
+        rows = self._exec.execute_proc(call.name, dict(call.params), max_rows=call.row_limit)
+        if not rows:
+            return rows
+        # Projection (already resolved to a concrete list in the service layer)
+        cols = list(call.columns)
+        if cols and cols != ["*"]:
+            out = []
+            for r in rows:
+                out.append({k: r.get(k) for k in cols})
+            return out
+        return rows
+
