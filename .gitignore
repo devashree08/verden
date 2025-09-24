@@ -1,90 +1,18 @@
-/* Generate C# DTO properties from a stored procedure's first result set
-   SQL Server 2019 using sys.dm_exec_describe_first_result_set_for_object
-   - No brackets around property names
-   - All types rendered as nullable (int? string? DateTime? etc.)
-*/
-DECLARE @ProcName sysname = N'dbo.spGetAllApps';  -- your proc
-DECLARE @ForceAllNullable bit = 1;                -- always add '?' to types
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Protocol, Sequence, Mapping, Any
 
-IF OBJECT_ID('tempdb..#meta') IS NOT NULL DROP TABLE #meta;
-CREATE TABLE #meta (
-    is_hidden bit,
-    column_ordinal int,
-    name sysname,
-    is_nullable bit,
-    system_type_id int,
-    system_type_name nvarchar(256),
-    max_length int,
-    precision tinyint,
-    scale tinyint,
-    collation_name sysname NULL
-);
+@dataclass(frozen=True, slots=True)
+class BoundCall:
+    """A normalized call to a named data method (proc/TVF) with safe params."""
+    name: str                    # e.g., "dbo.SPGetAllAppsValueByEID"
+    params: Mapping[str, Any]    # {"EID": "...", "VAST": "...", ...}
+    columns: Sequence[str]       # projection (resolved list; "*" already expanded)
+    row_limit: int               # enforced by backend (<= configured max)
 
-INSERT INTO #meta
-SELECT *
-FROM sys.dm_exec_describe_first_result_set_for_object(
-         OBJECT_ID(@ProcName),
-         1 -- include_browse_information
-     );
+class DataBackend(Protocol):
+    def describe(self, name: str) -> list[dict]:
+        """Return columns for `name` as dicts: {"name","sql_type","nullable"}."""
 
-WITH base AS (
-    SELECT
-        column_ordinal,
-        name AS ColumnName,
-        LOWER(LEFT(system_type_name, NULLIF(CHARINDEX('(', system_type_name + '(') - 1, -1))) AS base_sql_type,
-        system_type_name
-    FROM #meta
-    WHERE is_hidden = 0
-),
-mapped AS (
-    SELECT
-        column_ordinal, ColumnName, base_sql_type, system_type_name,
-        CASE base_sql_type
-            WHEN 'bigint'           THEN 'long'
-            WHEN 'int'              THEN 'int'
-            WHEN 'smallint'         THEN 'short'
-            WHEN 'tinyint'          THEN 'byte'
-            WHEN 'bit'              THEN 'bool'
-            WHEN 'decimal'          THEN 'decimal'
-            WHEN 'numeric'          THEN 'decimal'
-            WHEN 'money'            THEN 'decimal'
-            WHEN 'smallmoney'       THEN 'decimal'
-            WHEN 'float'            THEN 'double'
-            WHEN 'real'             THEN 'float'
-            WHEN 'datetime'         THEN 'DateTime'
-            WHEN 'smalldatetime'    THEN 'DateTime'
-            WHEN 'datetime2'        THEN 'DateTime'
-            WHEN 'date'             THEN 'DateTime'
-            WHEN 'time'             THEN 'TimeSpan'
-            WHEN 'datetimeoffset'   THEN 'DateTimeOffset'
-            WHEN 'uniqueidentifier' THEN 'Guid'
-            WHEN 'binary'           THEN 'byte[]'
-            WHEN 'varbinary'        THEN 'byte[]'
-            WHEN 'image'            THEN 'byte[]'
-            WHEN 'rowversion'       THEN 'byte[]'
-            WHEN 'timestamp'        THEN 'byte[]'
-            WHEN 'xml'              THEN 'string'
-            WHEN 'char'             THEN 'string'
-            WHEN 'nchar'            THEN 'string'
-            WHEN 'varchar'          THEN 'string'
-            WHEN 'nvarchar'         THEN 'string'
-            WHEN 'text'             THEN 'string'
-            WHEN 'ntext'            THEN 'string'
-            WHEN 'sql_variant'      THEN 'object'
-            WHEN 'geometry'         THEN 'object'
-            WHEN 'geography'        THEN 'object'
-            WHEN 'hierarchyid'      THEN 'object'
-            ELSE 'object'
-        END AS CSharpBaseType
-    FROM base
-)
-SELECT
-    'public '
-    + CSharpBaseType
-    + CASE WHEN @ForceAllNullable = 1 THEN '?' ELSE '' END
-    + ' '
-    + ColumnName               -- no brackets; assumes your column names are C#-safe identifiers
-    + ' { get; set; }' AS DTO_Line
-FROM mapped
-ORDER BY column_ordinal;
-
+    def execute(self, call: BoundCall) -> list[dict]:
+        """Return rows projected to `call.columns`, limited to `row_limit`."""
