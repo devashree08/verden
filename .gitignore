@@ -1,3 +1,42 @@
-curl -H "Content-Type: application/json" -H "X-User-EID: <yourEID>" ^
-     -d "{ \"proc\": \"dbo.SPGetAllAppsValueByEID\" }" ^
-     http://localhost:8080/describe_fields
+# app/api/app.py
+from __future__ import annotations
+import os
+from functools import lru_cache
+from fastapi import FastAPI
+from dotenv import load_dotenv
+
+from app.api.routes import router, get_backend
+from app.backend.mssql import MssqlBackend
+from app.db.executor import DbExecutor, ConnectionPool, ProcLimiter, _ConnConfig
+from app.utils.config import DbSettings
+from app.composition.openapi import load_registry
+
+load_dotenv()  # you already added this
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="MCP MS-SQL Tools", version="0.2.1")
+
+    # Lazy init: build backend on first use (so startup/docs don't block)
+    @lru_cache(maxsize=1)
+    def backend_singleton() -> MssqlBackend:
+        s = DbSettings.from_env()
+        cfg = _ConnConfig(
+            server=s.server, database=s.database, username=s.username, password=s.password,
+            encrypt=s.encrypt, trust_server_cert=s.trust_server_cert,
+            conn_timeout_sec=s.conn_timeout_sec, command_timeout_sec=s.command_timeout_sec,
+        )
+        pool = ConnectionPool(cfg, max_connections=s.max_connections)
+        limiter = ProcLimiter()
+        reg = load_registry()
+        for name, entry in reg.items():
+            limiter.register(name, entry.get("limits", {}).get("max_concurrency", 5))
+        executor = DbExecutor(pool, limiter, request_timeout_sec=s.request_timeout_sec)
+        return MssqlBackend(executor, reg)
+
+    # Override dependency to the lazy singleton
+    app.dependency_overrides[get_backend] = backend_singleton
+
+    app.include_router(router)
+    return app
+
+app = create_app()
