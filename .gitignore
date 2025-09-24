@@ -1,1 +1,3 @@
-/c "cd /d C:\path\to\your\repo && set DEV_EID=yourEID && set DB_SERVER=your-sql-host && set DB_DATABASE=your-db && set DB_USERNAME=svc_reader && set DB_PASSWORD=*** && set RESULT_ROW_LIMIT_DEFAULT=100 && py -3.13 -m app.mcp.server"
+curl -H "Content-Type: application/json" -H "X-User-EID: <yourEID>" ^
+     -d "{ \"proc\": \"dbo.SPGetAllAppsValueByEID\" }" ^
+     http://localhost:8080/describe_fields
