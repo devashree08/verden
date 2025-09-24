@@ -1,18 +1,40 @@
 from __future__ import annotations
-import json, time, uuid
-from contextlib import contextmanager
-from typing import Iterator, Sequence
+from pathlib import Path
+import yaml
 
-def new_request_id() -> str:
-    return str(uuid.uuid4())
+def load_registry() -> dict[str, dict]:
+    out = {}
+    regdir = Path("registry")
+    for p in regdir.glob("*.yml"):
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+        out[data["procedure"]] = data
+    return out
 
-@contextmanager
-def audit_span(request_id: str, tool: str, proc: str, columns: Sequence[str]) -> Iterator[dict]:
-    start = time.perf_counter()
-    log = {"request_id": request_id, "tool": tool, "proc": proc, "columns": list(columns)}
-    try:
-        yield log
-    finally:
-        log["duration_ms"] = round((time.perf_counter() - start) * 1000, 2)
-        # SECURITY: we log no row values or secrets
-        print(json.dumps({"audit": log}))
+def load_atlas() -> dict[str, dict]:
+    out = {}
+    adir = Path("atlas")
+    for p in adir.glob("*.atlas.yml"):
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+        out[data["procedure"]] = {c["name"]: c for c in data.get("columns", [])}
+    return out
+
+def compose_columns_with_descriptions(registry_entry: dict, atlas_map: dict[str, dict]) -> list[dict]:
+    cols = []
+    for c in registry_entry["result_columns"]:
+        name = c["name"]
+        a = atlas_map.get(name, {})
+        merged = {
+            "name": name,
+            "sql_type": c["sql_type"],
+            "nullable": c["nullable"],
+            "description": a.get("description", ""),
+            "tags": a.get("tags", []),
+            "format": a.get("format"),
+            "pattern": a.get("pattern"),
+            "example": a.get("example"),
+            "deprecated": a.get("deprecated", False),
+            "x-needs-review": a.get("needs_review", False),
+        }
+        cols.append(merged)
+    return cols
+
