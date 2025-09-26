@@ -1,14 +1,10 @@
-# pyproject.toml (repo root)
-[tool.ruff]
-line-length = 100
-target-version = "py313"
-extend-select = ["E","F","I","B","UP"]
-exclude = [".venv"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D100","D101","D102","D103"]
-
 [tool.pydocstyle]
 convention = "google"
-add-ignore = ["D105","D107"]
+add-ignore = [
+  "D100",  # missing docstring in public module
+  "D104",  # missing docstring in public package (__init__.py)
+  "D105",  # magic methods optional
+  "D107",  # __init__ optional if class documented elsewhere
+]
+# Only check files outside tests/scripts
 match = "(?!(tests|scripts)/).*\\.py"
