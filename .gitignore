@@ -1,241 +1,150 @@
-"""BigQuery backend: executes parameterized queries mirroring the three MSSQL tools.
+IF OBJECT_ID('dbo.AttributeArtifact_Audit','U') IS NULL
+CREATE TABLE dbo.AttributeArtifact_Audit (
+  AuditID             BIGINT IDENTITY(1,1) PRIMARY KEY,
+  EventType           CHAR(1)       NOT NULL,     -- I/U/D
+  EventAt             DATETIME2(0)  NOT NULL      CONSTRAINT DF_AttrArtAud_EventAt DEFAULT (SYSUTCDATETIME()),
+  Actor               NVARCHAR(200) NULL,         -- from SESSION_CONTEXT('Actor')
 
-Contracts preserved:
-- get_all_apps_value(vast?, columns, question?)
-- get_all_apps_summary(vast?, report_month?, columns, question?)
-- get_vast_general(vast?, columns, question?)
+  -- Keys / context snapshot
+  ArtifactLinkID      INT           NULL,
+  OrgID               INT           NULL,
+  CSF2SubcategoryID   INT           NULL,
+  MaturityLevel       INT           NULL,
+  CSF1SubcategoryID   INT           NULL,
+  AttributeNum        INT           NULL,
+  CustomAttributeNum  INT           NULL,
 
-Security:
-- Enforces EID→VAST scope in-query by referencing BQ `sec_eid_vast_map`.
-- Accepts `eid` as an input (prototype only); later derive from caller identity.
+  -- Optional quick reference
+  Url                 NVARCHAR(2048) NULL,
+  Title               NVARCHAR(300)  NULL,
+  IsActive            BIT            NULL,
 
-Notes:
-- Uses parameterized queries (no string interpolation of values).
-- Projects only whitelisted column names from registry/atlas; unknown names dropped.
-- Never logs row values or EID; logs only metadata via audit_span (stderr).
-"""
+  -- Full diff payload
+  Changes             NVARCHAR(MAX)  NULL         -- JSON array of { field, old, new }
+);
+GO
 
-from __future__ import annotations
+-- For quick drilldowns by link or org/subcat
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AttrArtAud_Link' AND object_id=OBJECT_ID('dbo.AttributeArtifact_Audit'))
+  CREATE INDEX IX_AttrArtAud_Link ON dbo.AttributeArtifact_Audit (ArtifactLinkID, EventAt DESC);
 
-import os
-from typing import Any, Iterable, Sequence
-
-from google.cloud import bigquery
-from google.cloud.bigquery import ScalarQueryParameter, ArrayQueryParameter, QueryJobConfig
-
-from app.observability.logging import audit_span, new_request_id
-from app.utils.validation import normalize_vast_csv_to_ints, normalize_report_month
-from app.registry.loader import load_registry_entry, load_projection_whitelist
-
-
-class BigQueryBackend:
-    """Backend facade bound to configured project/dataset/table names."""
-
-    def __init__(self) -> None:
-        project = _must_env("BQ_PROJECT")
-        location = os.getenv("BQ_LOCATION", "US")
-        dataset = _must_env("BQ_DATASET")
-
-        # Logical table names (can be views or table functions materialized via SELECT)
-        self.tbl_values = os.getenv("BQ_TABLE_VALUES", "apps_values_current")
-        self.tbl_summary = os.getenv("BQ_TABLE_SUMMARY", "apps_values_monthly")
-        self.tbl_general = os.getenv("BQ_TABLE_GENERAL", "apps_vast_general")
-        self.tbl_map = os.getenv("BQ_TABLE_EID_MAP", "sec_eid_vast_map")
-
-        self.fq_values = f"`{project}.{dataset}.{self.tbl_values}`"
-        self.fq_summary = f"`{project}.{dataset}.{self.tbl_summary}`"
-        self.fq_general = f"`{project}.{dataset}.{self.tbl_general}`"
-        self.fq_map = f"`{project}.{dataset}.{self.tbl_map}`"
-
-        self.client = bigquery.Client(project=project, location=location)
-
-        # Row cap (final LIMIT). Still enforce application-side cap on deserialization.
-        self.row_limit_default = int(os.getenv("RESULT_ROW_LIMIT_DEFAULT", "100"))
-
-    # ---------- Public tool methods ----------
-
-    def get_all_apps_value(self, *, eid: str, vast: str | None, columns: Sequence[str] | None) -> dict:
-        proc = "dbo.SPGetAllAppsValueByEID"
-        projection = self._resolve_projection(proc, columns)
-        vast_ids = normalize_vast_csv_to_ints(vast) if vast else None
-        request_id = new_request_id()
-
-        with audit_span(request_id, "get_all_apps_value", proc, projection) as log:
-            rows = self._query_values(eid=eid, vast_ids=vast_ids, projection=projection)
-            log["row_count"] = len(rows)
-            return {
-                "columns_returned": projection,
-                "rows": rows[: self.row_limit_default],
-                "meta": {"request_id": request_id},
-            }
-
-    def get_all_apps_summary(
-        self, *, eid: str, vast: str | None, report_month: str | None, columns: Sequence[str] | None
-    ) -> dict:
-        proc = "dbo.SPGetAllAppsSummaryByEID"
-        projection = self._resolve_projection(proc, columns)
-        vast_ids = normalize_vast_csv_to_ints(vast) if vast else None
-        report_dt = normalize_report_month(report_month)  # "YYYY-MM-01 00:00:00"
-        request_id = new_request_id()
-
-        with audit_span(request_id, "get_all_apps_summary", proc, projection) as log:
-            rows = self._query_summary(eid=eid, vast_ids=vast_ids, report_month=report_dt, projection=projection)
-            log["row_count"] = len(rows)
-            return {
-                "columns_returned": projection,
-                "rows": rows[: self.row_limit_default],
-                "meta": {"request_id": request_id, "report_month": report_dt},
-            }
-
-    def get_vast_general(self, *, eid: str, vast: str | None, columns: Sequence[str] | None) -> dict:
-        proc = "dbo.SPGetVastGeneralByEID"
-        projection = self._resolve_projection(proc, columns)
-        vast_ids = normalize_vast_csv_to_ints(vast) if vast else None
-        request_id = new_request_id()
-
-        with audit_span(request_id, "get_vast_general", proc, projection) as log:
-            rows = self._query_general(eid=eid, vast_ids=vast_ids, projection=projection)
-            log["row_count"] = len(rows)
-            return {
-                "columns_returned": projection,
-                "rows": rows[: self.row_limit_default],
-                "meta": {"request_id": request_id},
-            }
-
-    # ---------- Private helpers ----------
-
-    def _resolve_projection(self, proc: str, requested: Sequence[str] | None) -> list[str]:
-        """
-        Return a safe projection list using registry/atlas.
-        - ["*"] or None -> all known columns from registry (order preserved)
-        - else -> only names that exist in whitelist
-        """
-        registry = load_registry_entry(proc)
-        all_cols = [c["name"] for c in registry["result_columns"]]
-        if not requested or (len(requested) == 1 and requested[0] == "*"):
-            return all_cols
-        whitelist = set(load_projection_whitelist(proc))  # includes only known column names
-        return [c for c in requested if c in whitelist] or all_cols
-
-    def _compose_select_list(self, projection: Sequence[str]) -> str:
-        """Compose BigQuery-safe select list from whitelisted names."""
-        return ", ".join(f"`{c}`" for c in projection)
-
-    def _is_enterprise_predicate(self) -> str:
-        """SQL predicate that is true if EID has enterprise access."""
-        return f"""EXISTS (
-            SELECT 1 FROM {self.fq_map} m_ent
-            WHERE m_ent.eid = @eid AND m_ent.is_enterprise
-            AND (m_ent.valid_from IS NULL OR m_ent.valid_from <= CURRENT_DATE())
-            AND (m_ent.valid_to   IS NULL OR m_ent.valid_to   >= CURRENT_DATE())
-        )"""
-
-    def _vast_allowed_predicate(self, table_alias: str) -> str:
-        """Row-level allow predicate using mapping table OR enterprise override."""
-        return f"""(
-            {self._is_enterprise_predicate()}
-            OR EXISTS (
-                SELECT 1 FROM {self.fq_map} m
-                WHERE m.eid = @eid AND m.vast_id = {table_alias}.VastID
-                AND (m.valid_from IS NULL OR m.valid_from <= CURRENT_DATE())
-                AND (m.valid_to   IS NULL OR m.valid_to   >= CURRENT_DATE())
-            )
-        )"""
-
-    def _vast_requested_predicate(self, table_alias: str) -> str:
-        """Optional filter by requested VAST list if provided."""
-        return f"(@vast_ids IS NULL OR {table_alias}.VastID IN UNNEST(@vast_ids))"
-
-    # ----- Query runners -----
-
-    def _query_values(self, *, eid: str, vast_ids: list[int] | None, projection: Sequence[str]) -> list[dict]:
-        select_list = self._compose_select_list(projection)
-        sql = f"""
-        SELECT {select_list}
-        FROM {self.fq_values} t
-        WHERE {self._vast_requested_predicate('t')}
-          AND {self._vast_allowed_predicate('t')}
-        LIMIT @row_limit
-        """
-        params = _params(
-            eid=eid,
-            vast_ids=vast_ids,
-            row_limit=self.row_limit_default,
-        )
-        return self._run(sql, params)
-
-    def _query_summary(
-        self, *, eid: str, vast_ids: list[int] | None, report_month: str, projection: Sequence[str]
-    ) -> list[dict]:
-        select_list = self._compose_select_list(projection)
-        # report_month is SMALLDATETIME style in SQL; BQ side we match first-of-month at midnight
-        sql = f"""
-        SELECT {select_list}
-        FROM {self.fq_summary} t
-        WHERE {self._vast_requested_predicate('t')}
-          AND {self._vast_allowed_predicate('t')}
-          AND DATE(t.ReportMonth) = DATE(@report_month)   -- normalize to date for equality
-        LIMIT @row_limit
-        """
-        params = _params(
-            eid=eid,
-            vast_ids=vast_ids,
-            row_limit=self.row_limit_default,
-            report_month=report_month,
-        )
-        return self._run(sql, params)
-
-    def _query_general(self, *, eid: str, vast_ids: list[int] | None, projection: Sequence[str]) -> list[dict]:
-        select_list = self._compose_select_list(projection)
-        sql = f"""
-        SELECT {select_list}
-        FROM {self.fq_general} t
-        WHERE {self._vast_requested_predicate('t')}
-          AND {self._vast_allowed_predicate('t')}
-        LIMIT @row_limit
-        """
-        params = _params(
-            eid=eid,
-            vast_ids=vast_ids,
-            row_limit=self.row_limit_default,
-        )
-        return self._run(sql, params)
-
-    def _run(self, sql: str, params: list[bigquery.ScalarQueryParameter]) -> list[dict]:
-        cfg = QueryJobConfig(query_parameters=params)
-        job = self.client.query(sql, job_config=cfg)
-        result = job.result()  # wait
-        field_names = [f.name for f in result.schema]
-        out: list[dict[str, Any]] = []
-        # enforce a final cap at app side too (defense-in-depth)
-        cap = self.row_limit_default
-        for i, row in enumerate(result):
-            if i >= cap:
-                break
-            out.append({name: row.get(name) for name in field_names})
-        return out
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AttrArtAud_OrgSub' AND object_id=OBJECT_ID('dbo.AttributeArtifact_Audit'))
+  CREATE INDEX IX_AttrArtAud_OrgSub ON dbo.AttributeArtifact_Audit (OrgID, CSF2SubcategoryID, EventAt DESC);
+GO
 
 
-# ---------- helpers ----------
+CREATE OR ALTER TRIGGER dbo.tr_AttributeArtifact_Audit
+ON dbo.AttributeArtifact
+AFTER INSERT, UPDATE, DELETE
+AS
+BEGIN
+  SET NOCOUNT ON;
 
-def _must_env(key: str) -> str:
-    val = os.getenv(key)
-    if not val:
-        raise RuntimeError(f"Missing required environment variable: {key}")
-    return val
+  DECLARE @actor NVARCHAR(200) = TRY_CAST(SESSION_CONTEXT(N'Actor') AS NVARCHAR(200));
+  IF (@actor IS NULL OR @actor = N'') SET @actor = ORIGINAL_LOGIN();
+
+  ;WITH paired AS (
+    -- Align deleted vs inserted by ArtifactLinkID (when available) or by full key on pre-insert
+    SELECT
+      COALESCE(i.ArtifactLinkID, d.ArtifactLinkID)       AS ArtifactLinkID,
+      ISNULL(i.OrgID,               d.OrgID)             AS OrgID,
+      ISNULL(i.CSF2SubcategoryID,   d.CSF2SubcategoryID) AS CSF2SubcategoryID,
+      ISNULL(i.MaturityLevel,       d.MaturityLevel)     AS MaturityLevel,
+      ISNULL(i.CSF1SubcategoryID,   d.CSF1SubcategoryID) AS CSF1SubcategoryID,
+      ISNULL(i.AttributeNum,        d.AttributeNum)      AS AttributeNum,
+      ISNULL(i.CustomAttributeNum,  d.CustomAttributeNum)AS CustomAttributeNum,
+
+      d.Url   AS Url_old,   i.Url   AS Url_new,
+      d.Title AS Title_old, i.Title AS Title_new,
+      d.IsActive AS IsActive_old, i.IsActive AS IsActive_new,
+
+      CASE
+        WHEN d.ArtifactLinkID IS NULL THEN 'I'
+        WHEN i.ArtifactLinkID IS NULL THEN 'D'
+        ELSE 'U'
+      END AS EventType
+    FROM inserted i
+    FULL OUTER JOIN deleted d
+      ON i.ArtifactLinkID = d.ArtifactLinkID
+  ),
+  -- One row per field that changed (or exists on I/D)
+  diffs AS (
+    SELECT p.*, 'Url' AS field,
+           TRY_CONVERT(NVARCHAR(MAX), p.Url_old) AS oldVal,
+           TRY_CONVERT(NVARCHAR(MAX), p.Url_new) AS newVal
+    FROM paired p
+    WHERE (p.EventType <> 'U' AND (p.Url_old IS NOT NULL OR p.Url_new IS NOT NULL))
+       OR (p.EventType = 'U' AND ISNULL(p.Url_old, N'') <> ISNULL(p.Url_new, N''))
+
+    UNION ALL
+    SELECT p.*, 'Title',
+           TRY_CONVERT(NVARCHAR(MAX), p.Title_old),
+           TRY_CONVERT(NVARCHAR(MAX), p.Title_new)
+    FROM paired p
+    WHERE (p.EventType <> 'U' AND (p.Title_old IS NOT NULL OR p.Title_new IS NOT NULL))
+       OR (p.EventType = 'U' AND ISNULL(p.Title_old, N'') <> ISNULL(p.Title_new, N''))
+
+    UNION ALL
+    SELECT p.*, 'IsActive',
+           TRY_CONVERT(NVARCHAR(MAX), p.IsActive_old),
+           TRY_CONVERT(NVARCHAR(MAX), p.IsActive_new)
+    FROM paired p
+    WHERE (p.EventType <> 'U' AND (p.IsActive_old IS NOT NULL OR p.IsActive_new IS NOT NULL))
+       OR (p.EventType = 'U' AND ISNULL(p.IsActive_old, 0) <> ISNULL(p.IsActive_new, 0))
+  ),
+  -- Aggregate field diffs into a single JSON array per event
+  per_event AS (
+    SELECT
+      d.ArtifactLinkID,
+      d.OrgID, d.CSF2SubcategoryID, d.MaturityLevel,
+      d.CSF1SubcategoryID, d.AttributeNum, d.CustomAttributeNum,
+      d.EventType,
+
+      -- Snapshots of "after" when available (helps list screens)
+      MAX(d.Url_new)     AS Url_snap,
+      MAX(d.Title_new)   AS Title_snap,
+      MAX(d.IsActive_new)AS IsActive_snap,
+
+      (
+        SELECT
+          field      AS [field],
+          oldVal     AS [old],
+          newVal     AS [new]
+        FROM diffs di
+        WHERE di.ArtifactLinkID = d.ArtifactLinkID
+          AND di.OrgID = d.OrgID
+          AND di.CSF2SubcategoryID = d.CSF2SubcategoryID
+          AND di.MaturityLevel = d.MaturityLevel
+          AND ISNULL(di.CSF1SubcategoryID, -1) = ISNULL(d.CSF1SubcategoryID, -1)
+          AND ISNULL(di.AttributeNum, -1)      = ISNULL(d.AttributeNum, -1)
+          AND ISNULL(di.CustomAttributeNum,-1) = ISNULL(d.CustomAttributeNum, -1)
+          AND di.EventType = d.EventType
+        FOR JSON PATH
+      ) AS ChangesJson
+    FROM diffs d
+    GROUP BY
+      d.ArtifactLinkID, d.OrgID, d.CSF2SubcategoryID, d.MaturityLevel,
+      d.CSF1SubcategoryID, d.AttributeNum, d.CustomAttributeNum, d.EventType
+  )
+  INSERT dbo.AttributeArtifact_Audit
+    (EventType, Actor,
+     ArtifactLinkID, OrgID, CSF2SubcategoryID, MaturityLevel,
+     CSF1SubcategoryID, AttributeNum, CustomAttributeNum,
+     Url, Title, IsActive,
+     Changes)
+  SELECT
+    p.EventType,
+    @actor,
+    p.ArtifactLinkID, p.OrgID, p.CSF2SubcategoryID, p.MaturityLevel,
+    p.CSF1SubcategoryID, p.AttributeNum, p.CustomAttributeNum,
+    /* prefer the "after" snapshot; for DELETE it will be NULL so we could fall back to old via COALESCE */
+    COALESCE(p.Url_snap,     (SELECT TOP 1 Url_old     FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
+    COALESCE(p.Title_snap,   (SELECT TOP 1 Title_old   FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
+    COALESCE(p.IsActive_snap,(SELECT TOP 1 IsActive_old FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
+    ISNULL(p.ChangesJson, N'[]')
+  FROM per_event p;
+END
+GO
 
 
-def _params(*, eid: str, vast_ids: list[int] | None, row_limit: int, report_month: str | None = None) -> list[bigquery.ScalarQueryParameter]:
-    params: list[bigquery.ScalarQueryParameter] = [
-        ScalarQueryParameter("eid", "STRING", eid),
-        ScalarQueryParameter("row_limit", "INT64", row_limit),
-    ]
-    if vast_ids:
-        params.append(ArrayQueryParameter("vast_ids", "INT64", vast_ids))
-    else:
-        # BigQuery treats unbound array differently; pass NULL to trigger the IS NULL predicate branch.
-        params.append(ScalarQueryParameter("vast_ids", "STRING", None))
-    if report_month is not None:
-        # normalize_report_month returns "YYYY-MM-01 00:00:00"; BigQuery can cast this to TIMESTAMP/DATE.
-        params.append(ScalarQueryParameter("report_month", "TIMESTAMP", report_month))
-    return params
+
