@@ -1,47 +1,72 @@
-APP_BACKEND=mssql
-RESULT_ROW_LIMIT_DEFAULT=100
-LOG_LEVEL=INFO
-EID_HEADER_NAME=X-User-EID
+# Config keys
 
-# Dev path (HTTP): you’ll pass X-User-EID from Postman/Inspector, so DEV_EID can be blank.
-# For MCP stdio tests (local), set DEV_EID=<yourEID>.
-DEV_EID=
+This service follows 12-factor config. All values are read from environment variables at process start. Secrets must come from **Secret Manager** in Cloud Run; inline secrets are allowed **only** for local dev.
 
-# Prototype auth (HTTP MCP)
-REQUIRE_API_KEY=true
-API_KEY_HEADER_NAME=X-API-Key
-API_KEYS_JSON_SECRET=           # prefer Secret Manager in Cloud Run
-API_KEYS_JSON=                  # OR local-only: {"keys":[{"label":"dev","key":"REPLACE_ME"}]}
+## Common
 
-# MSSQL (if using on-prem DB locally)
-DB_SERVER=REPLACE_ME
-DB_DATABASE=REPLACE_ME
-DB_USERNAME=REPLACE_ME
-DB_PASSWORD=REPLACE_ME
-DB_ENCRYPT=false
-DB_TRUST_SERVER_CERT=true
-DB_CONN_TIMEOUT_SEC=5
-DB_COMMAND_TIMEOUT_SEC=30
-DB_REQUEST_TIMEOUT_SEC=30
-DB_MAX_CONNECTIONS=5
+| Key                       | Required | Default | Notes |
+|--------------------------|----------|---------|------|
+| `APP_BACKEND`            | yes      | —       | `mssql` or `bigquery`. Selects the data backend implementation. |
+| `RESULT_ROW_LIMIT_DEFAULT` | no     | `100`   | Hard cap per call. Agent can still request subsets via `columns`. |
+| `LOG_LEVEL`              | no       | `INFO`  | `DEBUG` for local debugging. Logs go to **stderr** (MCP stdio safety). |
+| `REQUEST_ID_HEADER`      | no       | `X-Request-ID` | If present on HTTP requests, it’s propagated to logs. |
+| `EID_HEADER_NAME`        | no       | `X-User-EID` | HTTP only. For stdio, use `DEV_EID`. Server never echoes EID. |
+| `DEV_EID`                | dev-only | —       | Used for MCP stdio or local scripts when no headers exist. **Do not set in prod.** |
 
-# BigQuery (phase 2.5 if you flip APP_BACKEND=bigquery)
-BQ_PROJECT=REPLACE_ME
-BQ_LOCATION=US
-BQ_DATASET=REPLACE_ME
-BQ_TABLE_VALUES=apps_values_current
-BQ_TABLE_SUMMARY=apps_values_monthly
-BQ_TABLE_GENERAL=apps_vast_general
-BQ_TABLE_EID_MAP=sec_eid_vast_map
-# GOOGLE_APPLICATION_CREDENTIALS=
+## Prototype auth (MCP over HTTP)
 
-# MCP HTTP (local run)
-MCP_HTTP_HOST=0.0.0.0
-MCP_HTTP_PORT=8081
+| Key                     | Required | Default | Notes |
+|------------------------|----------|---------|------|
+| `REQUIRE_API_KEY`      | no       | `true`  | If `true`, every MCP HTTP request must include a valid API key header. |
+| `API_KEY_HEADER_NAME`  | no       | `X-API-Key` | Header that clients send. |
+| `API_KEYS_JSON_SECRET` | prod     | —       | **Preferred.** Secret Manager resource: `projects/<PROJECT_ID>/secrets/<NAME>/versions/<N|latest>`. JSON format: `{"keys":[{"label":"team-foo","key":"<random>"}]}`. |
+| `API_KEYS_JSON`        | dev-only | —       | Inline allowlist for local dev/testing. Never use in prod. Same JSON shape as above. |
 
-GLOBAL_RATE_LIMIT_RPS=50
-MAX_REQUEST_BODY_BYTES=1048576
+## MSSQL backend
 
-# Ops-only
-GCP_PROJECT=REPLACE_ME
-ARTIFACT_REGISTRY_REPO=us-docker.pkg.dev/REPLACE_ME/mcp
+| Key                       | Required if `APP_BACKEND=mssql` | Default | Notes |
+|--------------------------|----------------------------------|---------|------|
+| `DB_SERVER`              | yes                              | —       | Host or `host,port`. |
+| `DB_DATABASE`            | yes                              | —       | Database name. |
+| `DB_USERNAME`            | yes                              | —       | Least-privileged account with `EXEC` on the 3 procs. |
+| `DB_PASSWORD`            | yes                              | —       | Store in Secret Manager in prod. |
+| `DB_ENCRYPT`             | no                               | `false` | Set `true` if required by your SQL policy. |
+| `DB_TRUST_SERVER_CERT`   | no                               | `true`  | `true` for your current dev setup; comply with corp policy in prod. |
+| `DB_CONN_TIMEOUT_SEC`    | no                               | `5`     | ODBC connect timeout. |
+| `DB_COMMAND_TIMEOUT_SEC` | no                               | `30`    | Per command timeout. |
+| `DB_REQUEST_TIMEOUT_SEC` | no                               | `30`    | End-to-end request budget in the executor. |
+| `DB_MAX_CONNECTIONS`     | no                               | `5`     | Pool size; aligns with per-proc concurrency caps. |
+
+## BigQuery backend
+
+| Key                | Required if `APP_BACKEND=bigquery` | Default | Notes |
+|-------------------|-------------------------------------|---------|------|
+| `BQ_PROJECT`      | yes                                 | —       | **Yes, you should set your GCP project ID here.** |
+| `BQ_LOCATION`     | no                                  | `US`    | Region for datasets/jobs (e.g., `US` or `EU`). |
+| `BQ_DATASET`      | yes                                 | —       | Dataset containing your modeled tables/views/functions. |
+| `BQ_TABLE_VALUES` | yes                                 | `apps_values_current` | Logical name for current-month snapshot table/view. |
+| `BQ_TABLE_SUMMARY`| yes                                 | `apps_values_monthly` | Logical name for monthly snapshot table/view. |
+| `BQ_TABLE_GENERAL`| yes                                 | `apps_vast_general`   | Logical name for compliance/flags table/view. |
+| `BQ_TABLE_EID_MAP`| yes                                 | `sec_eid_vast_map`    | EID→VAST mapping table. Enforced in every query. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | dev-only | — | For local runs if you’re not using `gcloud auth application-default login`. In Cloud Run, use **Workload Identity** (no file). |
+
+## MCP HTTP transport
+
+| Key              | Required | Default | Notes |
+|------------------|----------|---------|------|
+| `MCP_HTTP_HOST`  | no       | `0.0.0.0` | Bind address for local/VM runs. Cloud Run ignores this. |
+| `MCP_HTTP_PORT`  | no       | `8081`    | Local port; Cloud Run sets `$PORT`. |
+
+## Safety limits
+
+| Key                     | Required | Default | Notes |
+|-------------------------|----------|---------|------|
+| `GLOBAL_RATE_LIMIT_RPS` | no       | `50`    | App-side best-effort cap; infra limits live in Cloud Run. |
+| `MAX_REQUEST_BODY_BYTES`| no       | `1048576` | Reject oversized payloads early. |
+
+## Ops (non-runtime)
+
+| Key                    | Required | Default | Notes |
+|------------------------|----------|---------|------|
+| `GCP_PROJECT`          | no       | —       | Used by deploy scripts only. |
+| `ARTIFACT_REGISTRY_REPO` | no     | —       | e.g., `us-docker.pkg.dev/<PROJECT>/mcp`. |
