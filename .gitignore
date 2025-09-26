@@ -1,38 +1,3 @@
-IF OBJECT_ID('dbo.AttributeArtifact_Audit','U') IS NULL
-CREATE TABLE dbo.AttributeArtifact_Audit (
-  AuditID             BIGINT IDENTITY(1,1) PRIMARY KEY,
-  EventType           CHAR(1)       NOT NULL,     -- I/U/D
-  EventAt             DATETIME2(0)  NOT NULL      CONSTRAINT DF_AttrArtAud_EventAt DEFAULT (SYSUTCDATETIME()),
-  Actor               NVARCHAR(200) NULL,         -- from SESSION_CONTEXT('Actor')
-
-  -- Keys / context snapshot
-  ArtifactLinkID      INT           NULL,
-  OrgID               INT           NULL,
-  CSF2SubcategoryID   INT           NULL,
-  MaturityLevel       INT           NULL,
-  CSF1SubcategoryID   INT           NULL,
-  AttributeNum        INT           NULL,
-  CustomAttributeNum  INT           NULL,
-
-  -- Optional quick reference
-  Url                 NVARCHAR(2048) NULL,
-  Title               NVARCHAR(300)  NULL,
-  IsActive            BIT            NULL,
-
-  -- Full diff payload
-  Changes             NVARCHAR(MAX)  NULL         -- JSON array of { field, old, new }
-);
-GO
-
--- For quick drilldowns by link or org/subcat
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AttrArtAud_Link' AND object_id=OBJECT_ID('dbo.AttributeArtifact_Audit'))
-  CREATE INDEX IX_AttrArtAud_Link ON dbo.AttributeArtifact_Audit (ArtifactLinkID, EventAt DESC);
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_AttrArtAud_OrgSub' AND object_id=OBJECT_ID('dbo.AttributeArtifact_Audit'))
-  CREATE INDEX IX_AttrArtAud_OrgSub ON dbo.AttributeArtifact_Audit (OrgID, CSF2SubcategoryID, EventAt DESC);
-GO
-
-
 CREATE OR ALTER TRIGGER dbo.tr_AttributeArtifact_Audit
 ON dbo.AttributeArtifact
 AFTER INSERT, UPDATE, DELETE
@@ -40,11 +5,7 @@ AS
 BEGIN
   SET NOCOUNT ON;
 
-  DECLARE @actor NVARCHAR(200) = TRY_CAST(SESSION_CONTEXT(N'Actor') AS NVARCHAR(200));
-  IF (@actor IS NULL OR @actor = N'') SET @actor = ORIGINAL_LOGIN();
-
   ;WITH paired AS (
-    -- Align deleted vs inserted by ArtifactLinkID (when available) or by full key on pre-insert
     SELECT
       COALESCE(i.ArtifactLinkID, d.ArtifactLinkID)       AS ArtifactLinkID,
       ISNULL(i.OrgID,               d.OrgID)             AS OrgID,
@@ -54,9 +15,13 @@ BEGIN
       ISNULL(i.AttributeNum,        d.AttributeNum)      AS AttributeNum,
       ISNULL(i.CustomAttributeNum,  d.CustomAttributeNum)AS CustomAttributeNum,
 
-      d.Url   AS Url_old,   i.Url   AS Url_new,
-      d.Title AS Title_old, i.Title AS Title_new,
+      d.Url     AS Url_old,     i.Url     AS Url_new,
+      d.Title   AS Title_old,   i.Title   AS Title_new,
       d.IsActive AS IsActive_old, i.IsActive AS IsActive_new,
+
+      -- Actor pulled from row-level columns you already set in your procs.
+      -- If you don't have UpdatedBy, this COALESCE still resolves via CreatedBy.
+      COALESCE(i.UpdatedBy, i.CreatedBy, d.UpdatedBy, d.CreatedBy) AS Actor,
 
       CASE
         WHEN d.ArtifactLinkID IS NULL THEN 'I'
@@ -67,49 +32,45 @@ BEGIN
     FULL OUTER JOIN deleted d
       ON i.ArtifactLinkID = d.ArtifactLinkID
   ),
-  -- One row per field that changed (or exists on I/D)
   diffs AS (
     SELECT p.*, 'Url' AS field,
-           TRY_CONVERT(NVARCHAR(MAX), p.Url_old) AS oldVal,
-           TRY_CONVERT(NVARCHAR(MAX), p.Url_new) AS newVal
+           CONVERT(NVARCHAR(MAX), p.Url_old) AS oldVal,
+           CONVERT(NVARCHAR(MAX), p.Url_new) AS newVal
     FROM paired p
     WHERE (p.EventType <> 'U' AND (p.Url_old IS NOT NULL OR p.Url_new IS NOT NULL))
-       OR (p.EventType = 'U' AND ISNULL(p.Url_old, N'') <> ISNULL(p.Url_new, N''))
+       OR (p.EventType = 'U' AND ISNULL(p.Url_old, '') <> ISNULL(p.Url_new, ''))
 
     UNION ALL
     SELECT p.*, 'Title',
-           TRY_CONVERT(NVARCHAR(MAX), p.Title_old),
-           TRY_CONVERT(NVARCHAR(MAX), p.Title_new)
+           CONVERT(NVARCHAR(MAX), p.Title_old),
+           CONVERT(NVARCHAR(MAX), p.Title_new)
     FROM paired p
     WHERE (p.EventType <> 'U' AND (p.Title_old IS NOT NULL OR p.Title_new IS NOT NULL))
-       OR (p.EventType = 'U' AND ISNULL(p.Title_old, N'') <> ISNULL(p.Title_new, N''))
+       OR (p.EventType = 'U' AND ISNULL(p.Title_old, '') <> ISNULL(p.Title_new, ''))
 
     UNION ALL
     SELECT p.*, 'IsActive',
-           TRY_CONVERT(NVARCHAR(MAX), p.IsActive_old),
-           TRY_CONVERT(NVARCHAR(MAX), p.IsActive_new)
+           CONVERT(NVARCHAR(MAX), p.IsActive_old),
+           CONVERT(NVARCHAR(MAX), p.IsActive_new)
     FROM paired p
     WHERE (p.EventType <> 'U' AND (p.IsActive_old IS NOT NULL OR p.IsActive_new IS NOT NULL))
        OR (p.EventType = 'U' AND ISNULL(p.IsActive_old, 0) <> ISNULL(p.IsActive_new, 0))
   ),
-  -- Aggregate field diffs into a single JSON array per event
   per_event AS (
     SELECT
       d.ArtifactLinkID,
       d.OrgID, d.CSF2SubcategoryID, d.MaturityLevel,
       d.CSF1SubcategoryID, d.AttributeNum, d.CustomAttributeNum,
       d.EventType,
-
-      -- Snapshots of "after" when available (helps list screens)
-      MAX(d.Url_new)     AS Url_snap,
-      MAX(d.Title_new)   AS Title_snap,
-      MAX(d.IsActive_new)AS IsActive_snap,
-
+      MAX(d.Actor)        AS Actor,               -- same per event
+      MAX(d.Url_new)      AS Url_snap,
+      MAX(d.Title_new)    AS Title_snap,
+      MAX(CAST(d.IsActive_new AS TINYINT)) AS IsActive_snap_int,
       (
         SELECT
-          field      AS [field],
-          oldVal     AS [old],
-          newVal     AS [new]
+          field AS [field],
+          oldVal AS [old],
+          newVal AS [new]
         FROM diffs di
         WHERE di.ArtifactLinkID = d.ArtifactLinkID
           AND di.OrgID = d.OrgID
@@ -127,24 +88,32 @@ BEGIN
       d.CSF1SubcategoryID, d.AttributeNum, d.CustomAttributeNum, d.EventType
   )
   INSERT dbo.AttributeArtifact_Audit
-    (EventType, Actor,
+    (EventType, EventAt, Actor,
      ArtifactLinkID, OrgID, CSF2SubcategoryID, MaturityLevel,
      CSF1SubcategoryID, AttributeNum, CustomAttributeNum,
-     Url, Title, IsActive,
-     Changes)
+     Url, Title, IsActive, Changes)
   SELECT
     p.EventType,
-    @actor,
+    SYSUTCDATETIME(),
+    p.Actor,
+
     p.ArtifactLinkID, p.OrgID, p.CSF2SubcategoryID, p.MaturityLevel,
     p.CSF1SubcategoryID, p.AttributeNum, p.CustomAttributeNum,
-    /* prefer the "after" snapshot; for DELETE it will be NULL so we could fall back to old via COALESCE */
-    COALESCE(p.Url_snap,     (SELECT TOP 1 Url_old     FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
-    COALESCE(p.Title_snap,   (SELECT TOP 1 Title_old   FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
-    COALESCE(p.IsActive_snap,(SELECT TOP 1 IsActive_old FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
-    ISNULL(p.ChangesJson, N'[]')
+
+    -- Prefer "after" values; for deletes fall back to "before".
+    COALESCE(p.Url_snap,   (SELECT TOP 1 Url_old     FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
+    COALESCE(p.Title_snap, (SELECT TOP 1 Title_old   FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
+    CAST(
+      COALESCE(
+        p.IsActive_snap_int,
+        (SELECT TOP 1 CAST(d.IsActive_old AS TINYINT)
+           FROM diffs d
+          WHERE d.ArtifactLinkID = p.ArtifactLinkID
+            AND d.EventType      = p.EventType)
+      ) AS BIT
+    ) AS IsActive,
+
+    ISNULL(p.ChangesJson, '[]')
   FROM per_event p;
 END
 GO
-
-
-
