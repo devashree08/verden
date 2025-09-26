@@ -1,98 +1,47 @@
-############################
-# COMMON / APP SETTINGS
-############################
-
-# App mode: choose which backend to use. Valid: mssql | bigquery
 APP_BACKEND=mssql
-
-# Result shaping
 RESULT_ROW_LIMIT_DEFAULT=100
-
-# Observability
-LOG_LEVEL=INFO                  # DEBUG|INFO|WARNING|ERROR
-REQUEST_ID_HEADER=X-Request-ID  # optional incoming request-id header, if present
-
-# EID handling (HTTP only). For local dev, see DEV_EID below.
+LOG_LEVEL=INFO
 EID_HEADER_NAME=X-User-EID
 
-############################
-# DEV / LOCAL ONLY
-############################
-
-# Used ONLY for local runs or MCP stdio (no HTTP headers available).
-# Do NOT set in prod. In HTTP path, the header takes precedence.
+# Dev path (HTTP): you’ll pass X-User-EID from Postman/Inspector, so DEV_EID can be blank.
+# For MCP stdio tests (local), set DEV_EID=<yourEID>.
 DEV_EID=
 
-############################
-# PROTOTYPE AUTH (MCP over HTTP)
-############################
-
-# Require an API key for every MCP HTTP request. For prototype, set true.
+# Prototype auth (HTTP MCP)
 REQUIRE_API_KEY=true
-
-# Header name the clients must send
 API_KEY_HEADER_NAME=X-API-Key
+API_KEYS_JSON_SECRET=           # prefer Secret Manager in Cloud Run
+API_KEYS_JSON=                  # OR local-only: {"keys":[{"label":"dev","key":"REPLACE_ME"}]}
 
-# One of the following must be provided (server prefers Secret over inline):
-# 1) Secret Manager resource id (recommended for Cloud Run):
-#    projects/<PROJECT_ID>/secrets/<SECRET_NAME>/versions/<VERSION|latest>
-API_KEYS_JSON_SECRET=
-# 2) Local/dev inline JSON allowlist (NOT for prod). Shape:
-#    {"keys":[{"label":"team-foo","key":"<32-40-char-random>"}]}
-API_KEYS_JSON=
-
-############################
-# BACKEND: MSSQL (on-prem)
-############################
-
-DB_SERVER=
-DB_DATABASE=
-DB_USERNAME=
-DB_PASSWORD=
-DB_ENCRYPT=false               # "true" if your SQL requires it
+# MSSQL (if using on-prem DB locally)
+DB_SERVER=REPLACE_ME
+DB_DATABASE=REPLACE_ME
+DB_USERNAME=REPLACE_ME
+DB_PASSWORD=REPLACE_ME
+DB_ENCRYPT=false
 DB_TRUST_SERVER_CERT=true
 DB_CONN_TIMEOUT_SEC=5
 DB_COMMAND_TIMEOUT_SEC=30
 DB_REQUEST_TIMEOUT_SEC=30
 DB_MAX_CONNECTIONS=5
 
-############################
-# BACKEND: BIGQUERY (GCP)
-############################
-
-# Required if APP_BACKEND=bigquery
-BQ_PROJECT=
-BQ_LOCATION=US                # e.g., US or EU
-BQ_DATASET=
-# Logical table names (views or table functions will map to these contracts)
+# BigQuery (phase 2.5 if you flip APP_BACKEND=bigquery)
+BQ_PROJECT=REPLACE_ME
+BQ_LOCATION=US
+BQ_DATASET=REPLACE_ME
 BQ_TABLE_VALUES=apps_values_current
 BQ_TABLE_SUMMARY=apps_values_monthly
 BQ_TABLE_GENERAL=apps_vast_general
 BQ_TABLE_EID_MAP=sec_eid_vast_map
+# GOOGLE_APPLICATION_CREDENTIALS=
 
-# Auth: for Cloud Run use Workload Identity (no var needed).
-# For local dev, ADC will use your gcloud auth or a service-account JSON:
-# GOOGLE_APPLICATION_CREDENTIALS=path\to\sa.json
-
-############################
-# MCP HTTP TRANSPORT
-############################
-
-# Bind address/port when running MCP over HTTP locally (Cloud Run ignores port)
+# MCP HTTP (local run)
 MCP_HTTP_HOST=0.0.0.0
 MCP_HTTP_PORT=8081
 
-############################
-# HARD LIMITS / SAFETY
-############################
-
-# Global request rate cap (app-side, best-effort; infra rate limits live in Cloud Run)
 GLOBAL_RATE_LIMIT_RPS=50
-MAX_REQUEST_BODY_BYTES=1048576    # 1 MiB
+MAX_REQUEST_BODY_BYTES=1048576
 
-############################
-# GCP RUNTIME (non-code, for ops)
-############################
-# Used by scripts/ops only (not read by app at runtime)
-GCP_PROJECT=
-ARTIFACT_REGISTRY_REPO=
+# Ops-only
+GCP_PROJECT=REPLACE_ME
+ARTIFACT_REGISTRY_REPO=us-docker.pkg.dev/REPLACE_ME/mcp
