@@ -1,18 +1,14 @@
-from app.api.app import create_app
-from fastapi.testclient import TestClient
+# pyproject.toml (repo root)
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-select = ["E","F","I","B","UP"]
+exclude = [".venv"]
 
-def test_openapi_json_loads():
-    app = create_app()  # lazy backend: won't hit DB
-    client = TestClient(app)
-    r = client.get("/openapi.json")
-    assert r.status_code == 200
-    data = r.json()
-    assert "openapi" in data
-    assert "paths" in data
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D100","D101","D102","D103"]
 
-def test_docs_loads():
-    app = create_app()
-    client = TestClient(app)
-    r = client.get("/docs")
-    assert r.status_code == 200
-    assert "Swagger UI" in r.text
+[tool.pydocstyle]
+convention = "google"
+add-ignore = ["D105","D107"]
+match = "(?!(tests|scripts)/).*\\.py"
