@@ -1,40 +1,237 @@
-// src/features/attributeMapping/components/molecules/AttributeStatsBar.jsx
-import * as React from 'react';
-import { Paper, Stack, Chip, Tooltip, Typography } from '@mui/material';
-import { statsChipSx } from '../../utils/chipStyles';
+view: csf2_attribute_mapping_view {
+  derived_table: {
+    sql: SELECT * FROM [dbo].[CSF2_AttributeMapping_View] ;;
+  }
 
-export default function AttributeStatsBar({ rows = [] }) {
-  const { ml3, ml4, total } = React.useMemo(() => {
-    let m3 = 0, m4 = 0;
-    for (const r of rows) {
-      const isCustom = !!(r.customAttributeDefinition || r.customAttributeNum != null);
-      const isBaselineKept = !isCustom && (r.selectionStatus || '') === 'Keep';
-      const ml = Number(r.maturityLevel);
-      if (ml === 3 && (isCustom || isBaselineKept)) m3++;
-      if (ml === 4 && (isCustom || isBaselineKept)) m4++;
-    }
-    return { ml3: m3, ml4: m4, total: m3 + m4 };
-  }, [rows]);
+  # -------------------------
+  # Baseline measures
+  # -------------------------
+  measure: rows { type: count drill_fields: [detail*] }
 
-  return (
-    <Paper variant="outlined" sx={{ p: 1, borderRadius: 2, mb: 1 }}>
-      <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-        <Typography variant="overline" sx={{ color: 'text.secondary', mr: 0.5 }}>
-          Attribute Stats
-        </Typography>
+  # Rows that would show in "Final view" (baseline !Remove + all custom)
+  measure: rows_final {
+    type: count
+    filters: [is_final_row: "yes"]
+    drill_fields: [detail*]
+  }
 
-        <Tooltip title="ML3 total = kept baseline ML3 + custom ML3">
-          <Chip size="small" label={`ML3: ${ml3}`} sx={(t) => statsChipSx(t, 'ml3')} />
-        </Tooltip>
+  # ML totals (kept baseline + custom) — matches your UI stats bar
+  measure: ml3_total {
+    type: count
+    filters: [maturity_level: "3", is_final_row: "yes"]
+    drill_fields: [detail*]
+  }
+  measure: ml4_total {
+    type: count
+    filters: [maturity_level: "4", is_final_row: "yes"]
+    drill_fields: [detail*]
+  }
+  measure: ml_total {
+    type: number
+    sql: ${ml3_total} + ${ml4_total} ;;
+    value_format_name: decimal_0
+    drill_fields: [detail*]
+  }
 
-        <Tooltip title="ML4 total = kept baseline ML4 + custom ML4">
-          <Chip size="small" label={`ML4: ${ml4}`} sx={(t) => statsChipSx(t, 'ml4')} />
-        </Tooltip>
+  # Baseline-kept splits (QA/audit friendly)
+  measure: ml3_baseline_kept { type: count filters: [maturity_level: "3", is_baseline_kept: "yes"] }
+  measure: ml4_baseline_kept { type: count filters: [maturity_level: "4", is_baseline_kept: "yes"] }
 
-        <Tooltip title="Total = ML3 total + ML4 total">
-          <Chip size="small" label={`Total: ${total}`} sx={(t) => statsChipSx(t, 'total')} />
-        </Tooltip>
-      </Stack>
-    </Paper>
-  );
+  # Custom splits
+  measure: ml3_custom { type: count filters: [maturity_level: "3", is_custom: "yes"] }
+  measure: ml4_custom { type: count filters: [maturity_level: "4", is_custom: "yes"] }
+
+  # Percent kept (baseline only)
+  measure: pct_baseline_kept {
+    type: number
+    sql:
+      CASE
+        WHEN NULLIF(COUNT(CASE WHEN ${is_custom} THEN 1 END), 0) IS NULL
+          THEN CASE
+                 WHEN COUNT(CASE WHEN NOT ${is_custom} THEN 1 END) = 0 THEN NULL
+                 ELSE CAST(COUNT(CASE WHEN ${is_baseline_kept} THEN 1 END) AS FLOAT)
+                      / CAST(COUNT(CASE WHEN NOT ${is_custom} THEN 1 END) AS FLOAT)
+               END
+        ELSE CASE
+               WHEN COUNT(CASE WHEN NOT ${is_custom} THEN 1 END) = 0 THEN NULL
+               ELSE CAST(COUNT(CASE WHEN ${is_baseline_kept} THEN 1 END) AS FLOAT)
+                    / CAST(COUNT(CASE WHEN NOT ${is_custom} THEN 1 END) AS FLOAT)
+             END
+      END ;;
+    value_format_name: percent_0
+  }
+
+  # Completion measures
+  measure: subcats_completed {
+    type: count_distinct
+    sql: CASE WHEN ${completed} THEN ${csf2_subcategory_id} END ;;
+    drill_fields: [detail*]
+  }
+  measure: subcats_total {
+    type: count_distinct
+    sql: ${csf2_subcategory_id} ;;
+  }
+  measure: completion_rate {
+    type: number
+    sql:
+      CASE WHEN ${subcats_total} = 0 THEN NULL
+           ELSE CAST(${subcats_completed} AS FLOAT) / CAST(${subcats_total} AS FLOAT)
+      END ;;
+    value_format_name: percent_0
+  }
+
+  # -------------------------
+  # Core columns (with typo fixes)
+  # -------------------------
+  dimension: org_id         { type: number sql: ${TABLE}.OrgID ;; group_label: "Org" }
+  dimension: org_name       { type: string sql: ${TABLE}.OrgName ;; group_label: "Org" }
+
+  dimension: function_id    { type: number sql: ${TABLE}.FunctionID ;; group_label: "Function" }
+  dimension: function_name  { type: string sql: ${TABLE}.FunctionName ;; group_label: "Function" }
+  dimension: function_language { type: string sql: ${TABLE}.FunctionLanguage ;; group_label: "Function" }
+
+  dimension: category_id    { type: number sql: ${TABLE}.CategoryID ;; group_label: "Category" }
+  dimension: category_name  { type: string sql: ${TABLE}.CategoryName ;; group_label: "Category" }
+  dimension: category_language { type: string sql: ${TABLE}.CategoryLanguage ;; group_label: "Category" }
+
+  dimension: csf2_subcategory_id   { type: number sql: ${TABLE}.CSF2SubcategoryID ;; group_label: "Subcategory" }
+  dimension: csf2_subcategory_name { type: string sql: ${TABLE}.CSF2SubcategoryName ;; group_label: "Subcategory" }
+  dimension: csf2_subcategory_language { type: string sql: ${TABLE}.CSF2SubcategoryLanguage ;; group_label: "Subcategory" }
+
+  dimension: change_summary         { type: string sql: ${TABLE}.ChangeSummary ;; }
+  dimension: implementation_examples{ type: string sql: ${TABLE}.ImplementationExamples ;; }
+
+  dimension: csf1_subcategory_id   { type: number sql: ${TABLE}.CSF1SubcategoryID ;; }
+  dimension: csf1_subcategory_name { type: string sql: ${TABLE}.CSF1SubcategoryName ;; }
+  dimension: csf1_subcategory_language { type: string sql: ${TABLE}.CSF1SubcategoryLanguage ;; }
+
+  dimension: ent_subcat_attr       { type: string sql: ${TABLE}.Ent_Subcat_Attr ;; }
+
+  dimension: maturity_level        { type: number sql: ${TABLE}.MaturityLevel ;; group_label: "Attribute" }
+  dimension: attribute_num         { type: number sql: ${TABLE}.AttributeNum ;; group_label: "Attribute" }
+  dimension: attribute_definition  { type: string sql: ${TABLE}.AttributeDefinition ;; group_label: "Attribute" }  # fixed typo
+
+  # Renamed (cannot start with a number)
+  dimension: assessor_score_2024   { type: string sql: ${TABLE}."2024AssessorScore" ;; group_label: "Attribute" }
+
+  dimension: selection_status      { type: string sql: ${TABLE}.SelectionStatus ;; }
+  dimension: selection_attestation { type: string sql: ${TABLE}.SelectionAttestation ;; }
+
+  dimension: custom_attribute_num          { type: number sql: ${TABLE}.CustomAttributeNum ;; }
+  dimension: custom_attribute_definition   { type: string sql: ${TABLE}.CustomAttributeDefinition ;; }
+  dimension: custom_attribute_attestation  { type: string sql: ${TABLE}.CustomAttributeAttestation ;; }
+
+  dimension: subcat_owner      { type: string sql: ${TABLE}.SubcatOwner ;; }
+  dimension: subcat_custodian  { type: string sql: ${TABLE}.SubcatCustodian ;; }
+
+  # Completed is a flag -> yesno; fixed ReopenedByName typo
+  dimension: completed         { type: yesno sql: ${TABLE}.Completed ;; }
+  dimension: completed_by_name { type: string sql: ${TABLE}.CompletedByName ;; }
+  dimension: completed_at      { type: time   sql: ${TABLE}.CompletedAt ;; }
+
+  dimension: reopened_by_name  { type: string sql: ${TABLE}.ReopenedByName ;; }
+  dimension: reopened_at       { type: time   sql: ${TABLE}.ReopenedAt ;; }
+
+  dimension: note              { type: string sql: ${TABLE}.Note ;; }
+
+  # -------------------------
+  # Derived building blocks
+  # -------------------------
+  # Baseline vs Custom row
+  dimension: is_custom {
+    type: yesno
+    sql: CASE WHEN ${custom_attribute_num} IS NOT NULL
+              OR ${custom_attribute_definition} IS NOT NULL THEN 1 ELSE 0 END ;;
+    group_label: "Flags"
+  }
+
+  # Baseline kept (excludes Remove/NULL)
+  dimension: is_baseline_kept {
+    type: yesno
+    sql: CASE WHEN ${is_custom} THEN 0
+              WHEN ${selection_status} = 'Keep' THEN 1
+              ELSE 0 END ;;
+    group_label: "Flags"
+  }
+
+  # “Final view” row (what UI shows when hiding Remove)
+  dimension: is_final_row {
+    type: yesno
+    sql: CASE WHEN ${is_custom} THEN 1
+              WHEN ${selection_status} = 'Remove' THEN 0
+              ELSE 1 END ;;
+    group_label: "Flags"
+  }
+
+  # ML label (nice for pivots)
+  dimension: ml_label {
+    type: string
+    sql: CASE ${maturity_level} WHEN 3 THEN 'ML3' WHEN 4 THEN 'ML4' ELSE 'Other' END ;;
+    group_label: "Attribute"
+  }
+
+  # Owner / Custodian counts (comma-separated list -> count entries)
+  dimension: owner_count {
+    type: number
+    sql:
+      CASE
+        WHEN ${subcat_owner} IS NULL OR ${subcat_owner} = '' THEN 0
+        ELSE (LEN(${subcat_owner}) - LEN(REPLACE(${subcat_owner}, ',', ''))) + 1
+      END ;;
+  }
+  dimension: custodian_count {
+    type: number
+    sql:
+      CASE
+        WHEN ${subcat_custodian} IS NULL OR ${subcat_custodian} = '' THEN 0
+        ELSE (LEN(${subcat_custodian}) - LEN(REPLACE(${subcat_custodian}, ',', ''))) + 1
+      END ;;
+  }
+
+  # Completion state (human-friendly)
+  dimension: completion_state {
+    type: string
+    sql:
+      CASE
+        WHEN ${completed} THEN 'Completed'
+        WHEN ${reopened_at} IS NOT NULL THEN 'Reopened'
+        ELSE 'Not complete'
+      END ;;
+  }
+
+  # Date groups for completed/reopened
+  dimension_group: completed_at_dt {
+    type: time
+    timeframes: [raw, date, week, month, quarter, year]
+    sql: ${completed_at} ;;
+    group_label: "Completion"
+  }
+  dimension_group: reopened_at_dt {
+    type: time
+    timeframes: [raw, date, week, month, quarter, year]
+    sql: ${reopened_at} ;;
+    group_label: "Completion"
+  }
+
+  # -------------------------
+  # Drill set
+  # -------------------------
+  set: detail {
+    fields: [
+      org_id, org_name,
+      function_id, function_name, function_language,
+      category_id, category_name, category_language,
+      csf2_subcategory_id, csf2_subcategory_name, csf2_subcategory_language,
+      change_summary, implementation_examples,
+      csf1_subcategory_id, csf1_subcategory_name, csf1_subcategory_language,
+      ent_subcat_attr,
+      maturity_level, ml_label,
+      attribute_num, attribute_definition, assessor_score_2024,
+      selection_status, selection_attestation,
+      custom_attribute_num, custom_attribute_definition, custom_attribute_attestation,
+      is_custom, is_baseline_kept, is_final_row,
+      subcat_owner, subcat_custodian, owner_count, custodian_count,
+      completion_state, completed_by_name, completed_at, reopened_by_name, reopened_at, note
+    ]
+  }
 }
