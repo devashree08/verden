@@ -1,119 +1,41 @@
-CREATE OR ALTER TRIGGER dbo.tr_AttributeArtifact_Audit
-ON dbo.AttributeArtifact
-AFTER INSERT, UPDATE, DELETE
-AS
-BEGIN
-  SET NOCOUNT ON;
+import * as React from 'react';
+import { Paper, Stack, Chip, Tooltip, Typography } from '@mui/material';
+import { statsChipSx } from '../../utils/chipStyles';
 
-  ;WITH paired AS (
-    SELECT
-      COALESCE(i.ArtifactLinkID, d.ArtifactLinkID)       AS ArtifactLinkID,
-      ISNULL(i.OrgID,               d.OrgID)             AS OrgID,
-      ISNULL(i.CSF2SubcategoryID,   d.CSF2SubcategoryID) AS CSF2SubcategoryID,
-      ISNULL(i.MaturityLevel,       d.MaturityLevel)     AS MaturityLevel,
-      ISNULL(i.CSF1SubcategoryID,   d.CSF1SubcategoryID) AS CSF1SubcategoryID,
-      ISNULL(i.AttributeNum,        d.AttributeNum)      AS AttributeNum,
-      ISNULL(i.CustomAttributeNum,  d.CustomAttributeNum)AS CustomAttributeNum,
+export default function AttributeStatsBar({ rows = [] }) {
+  const { ml3, ml4, total } = React.useMemo(() => {
+    let m3 = 0, m4 = 0;
+    for (const r of rows) {
+      const isCustom = !!(r.customAttributeDefinition || r.customAttributeNum != null);
+      const isBaselineKept = !isCustom && (r.selectionStatus || '') === 'Keep';
+      const ml = Number(r.maturityLevel);
+      if (ml === 3 && (isCustom || isBaselineKept)) m3++;
+      if (ml === 4 && (isCustom || isBaselineKept)) m4++;
+    }
+    return { ml3: m3, ml4: m4, total: m3 + m4 };
+  }, [rows]);
 
-      d.Url     AS Url_old,     i.Url     AS Url_new,
-      d.Title   AS Title_old,   i.Title   AS Title_new,
-      d.IsActive AS IsActive_old, i.IsActive AS IsActive_new,
+  if (ml3 === 0 && ml4 === 0) return null;
 
-      -- Actor pulled from row-level columns you already set in your procs.
-      -- If you don't have UpdatedBy, this COALESCE still resolves via CreatedBy.
-      COALESCE(i.UpdatedBy, i.CreatedBy, d.UpdatedBy, d.CreatedBy) AS Actor,
+  return (
+    <Paper variant="outlined" sx={{ p: 1, borderRadius: 2, mb: 1 }}>
+      <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+        <Typography variant="overline" sx={{ color: 'text.secondary', mr: 0.5 }}>
+          Attribute Stats
+        </Typography>
 
-      CASE
-        WHEN d.ArtifactLinkID IS NULL THEN 'I'
-        WHEN i.ArtifactLinkID IS NULL THEN 'D'
-        ELSE 'U'
-      END AS EventType
-    FROM inserted i
-    FULL OUTER JOIN deleted d
-      ON i.ArtifactLinkID = d.ArtifactLinkID
-  ),
-  diffs AS (
-    SELECT p.*, 'Url' AS field,
-           CONVERT(NVARCHAR(MAX), p.Url_old) AS oldVal,
-           CONVERT(NVARCHAR(MAX), p.Url_new) AS newVal
-    FROM paired p
-    WHERE (p.EventType <> 'U' AND (p.Url_old IS NOT NULL OR p.Url_new IS NOT NULL))
-       OR (p.EventType = 'U' AND ISNULL(p.Url_old, '') <> ISNULL(p.Url_new, ''))
+        <Tooltip title="ML3 total = kept baseline ML3 + custom ML3">
+          <Chip size="small" label={`ML3: ${ml3}`} sx={(t) => statsChipSx(t, 'ml3')} />
+        </Tooltip>
 
-    UNION ALL
-    SELECT p.*, 'Title',
-           CONVERT(NVARCHAR(MAX), p.Title_old),
-           CONVERT(NVARCHAR(MAX), p.Title_new)
-    FROM paired p
-    WHERE (p.EventType <> 'U' AND (p.Title_old IS NOT NULL OR p.Title_new IS NOT NULL))
-       OR (p.EventType = 'U' AND ISNULL(p.Title_old, '') <> ISNULL(p.Title_new, ''))
+        <Tooltip title="ML4 total = kept baseline ML4 + custom ML4">
+          <Chip size="small" label={`ML4: ${ml4}`} sx={(t) => statsChipSx(t, 'ml4')} />
+        </Tooltip>
 
-    UNION ALL
-    SELECT p.*, 'IsActive',
-           CONVERT(NVARCHAR(MAX), p.IsActive_old),
-           CONVERT(NVARCHAR(MAX), p.IsActive_new)
-    FROM paired p
-    WHERE (p.EventType <> 'U' AND (p.IsActive_old IS NOT NULL OR p.IsActive_new IS NOT NULL))
-       OR (p.EventType = 'U' AND ISNULL(p.IsActive_old, 0) <> ISNULL(p.IsActive_new, 0))
-  ),
-  per_event AS (
-    SELECT
-      d.ArtifactLinkID,
-      d.OrgID, d.CSF2SubcategoryID, d.MaturityLevel,
-      d.CSF1SubcategoryID, d.AttributeNum, d.CustomAttributeNum,
-      d.EventType,
-      MAX(d.Actor)        AS Actor,               -- same per event
-      MAX(d.Url_new)      AS Url_snap,
-      MAX(d.Title_new)    AS Title_snap,
-      MAX(CAST(d.IsActive_new AS TINYINT)) AS IsActive_snap_int,
-      (
-        SELECT
-          field AS [field],
-          oldVal AS [old],
-          newVal AS [new]
-        FROM diffs di
-        WHERE di.ArtifactLinkID = d.ArtifactLinkID
-          AND di.OrgID = d.OrgID
-          AND di.CSF2SubcategoryID = d.CSF2SubcategoryID
-          AND di.MaturityLevel = d.MaturityLevel
-          AND ISNULL(di.CSF1SubcategoryID, -1) = ISNULL(d.CSF1SubcategoryID, -1)
-          AND ISNULL(di.AttributeNum, -1)      = ISNULL(d.AttributeNum, -1)
-          AND ISNULL(di.CustomAttributeNum,-1) = ISNULL(d.CustomAttributeNum, -1)
-          AND di.EventType = d.EventType
-        FOR JSON PATH
-      ) AS ChangesJson
-    FROM diffs d
-    GROUP BY
-      d.ArtifactLinkID, d.OrgID, d.CSF2SubcategoryID, d.MaturityLevel,
-      d.CSF1SubcategoryID, d.AttributeNum, d.CustomAttributeNum, d.EventType
-  )
-  INSERT dbo.AttributeArtifact_Audit
-    (EventType, EventAt, Actor,
-     ArtifactLinkID, OrgID, CSF2SubcategoryID, MaturityLevel,
-     CSF1SubcategoryID, AttributeNum, CustomAttributeNum,
-     Url, Title, IsActive, Changes)
-  SELECT
-    p.EventType,
-    SYSUTCDATETIME(),
-    p.Actor,
-
-    p.ArtifactLinkID, p.OrgID, p.CSF2SubcategoryID, p.MaturityLevel,
-    p.CSF1SubcategoryID, p.AttributeNum, p.CustomAttributeNum,
-
-    -- Prefer "after" values; for deletes fall back to "before".
-    COALESCE(p.Url_snap,   (SELECT TOP 1 Url_old     FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
-    COALESCE(p.Title_snap, (SELECT TOP 1 Title_old   FROM diffs d WHERE d.ArtifactLinkID=p.ArtifactLinkID AND d.EventType=p.EventType)),
-    CAST(
-      COALESCE(
-        p.IsActive_snap_int,
-        (SELECT TOP 1 CAST(d.IsActive_old AS TINYINT)
-           FROM diffs d
-          WHERE d.ArtifactLinkID = p.ArtifactLinkID
-            AND d.EventType      = p.EventType)
-      ) AS BIT
-    ) AS IsActive,
-
-    ISNULL(p.ChangesJson, '[]')
-  FROM per_event p;
-END
-GO
+        <Tooltip title="Total = ML3 total + ML4 total">
+          <Chip size="small" label={`Total: ${total}`} sx={(t) => statsChipSx(t, 'total')} />
+        </Tooltip>
+      </Stack>
+    </Paper>
+  );
+}
