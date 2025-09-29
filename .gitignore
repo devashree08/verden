@@ -1,15 +1,202 @@
-IF @ScopeNorm = 'No'
-BEGIN
-  SET @MaturityProjectionNorm = NULL;
-  SET @ProfileTypeNorm = NULL;
-END
-ELSE IF @ScopeNorm = 'Shared'
-BEGIN
-  SET @ProfileTypeNorm = 'Shared';
-END
-ELSE IF @ScopeNorm = 'Yes'
-BEGIN
-  -- When in-scope, Shared profile is not allowed
-  IF @ProfileTypeNorm = 'Shared'
-    THROW 50004, 'Invalid ProfileType for Scope=Yes. Allowed: Provider/Consumer.', 1;
-END
+#!/usr/bin/env python3
+"""
+SQL Server -> BigQuery ETL (full replace), simple & opinionated.
+
+- ALWAYS normalizes column names by stripping non-alphanumerics
+  (e.g., "Tier 2 Manager" -> "Tier2Manager", "spi/pii application" -> "spipiiapplication").
+- ALWAYS applies atlas descriptions (atlas names normalized the same way for matching).
+- Minimal dtype coercion: attempt numeric conversion for object columns; else leave as string.
+- Optional partitioning support only if you pass --partition (no automatic coercion).
+
+Required env:
+  DB_SERVER, DB_DATABASE, DB_USERNAME, DB_PASSWORD
+  BQ_PROJECT, BQ_DATASET
+Optional:
+  BQ_LOCATION (default "US")
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import re
+import time
+from typing import Iterable, List, Dict
+
+import pandas as pd
+import pyodbc
+from google.cloud import bigquery
+import yaml
+
+# Load .env if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# ---------- helpers ----------
+
+def env_required(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        print(f"ERROR: missing required env var {name}", file=sys.stderr)
+        sys.exit(2)
+    return v
+
+def connect_mssql(server: str, database: str, username: str, password: str,
+                  encrypt: bool=False, trust_server_cert: bool=True, timeout_sec: int=5) -> pyodbc.Connection:
+    driver = "{ODBC Driver 18 for SQL Server}"
+    enc = "yes" if encrypt else "no"
+    tsc = "yes" if trust_server_cert else "no"
+    conn_str = (
+        f"DRIVER={driver};SERVER={server};DATABASE={database};UID={username};PWD={password};"
+        f"Encrypt={enc};TrustServerCertificate={tsc};Connection Timeout={timeout_sec};"
+    )
+    return pyodbc.connect(conn_str)
+
+def iter_df_chunks(cursor: pyodbc.Cursor, sql: str, arraysize: int=20000) -> Iterable[pd.DataFrame]:
+    cursor.execute(sql)
+    cols = [c[0] for c in cursor.description]
+    while True:
+        rows = cursor.fetchmany(arraysize)
+        if not rows:
+            break
+        yield pd.DataFrame.from_records(rows, columns=cols)
+
+# normalize names (match atlas/proc style)
+_norm = re.compile(r"[^0-9A-Za-z]+")
+def norm_name(name: str) -> str:
+    return _norm.sub("", name or "")
+
+def normalize_columns(df: pd.DataFrame) -> None:
+    df.rename(columns={c: norm_name(c) for c in df.columns}, inplace=True)
+    # resolve accidental collisions by suffixing
+    if len(set(df.columns)) != len(df.columns):
+        seen: Dict[str,int] = {}
+        new_cols: List[str] = []
+        for c in df.columns:
+            seen[c] = seen.get(c, 0) + 1
+            new_cols.append(c if seen[c] == 1 else f"{c}_{seen[c]}")
+        df.columns = new_cols
+        print("WARN: column collisions resolved by suffixing.", file=sys.stderr)
+
+def simple_numeric_coercion(df: pd.DataFrame) -> None:
+    """Try to convert object columns to numeric; otherwise leave as-is (STRING in BQ)."""
+    for col in df.columns:
+        if pd.api.types.is_object_dtype(df[col].dtype):
+            df[col] = pd.to_numeric(df[col], errors="ignore")
+
+def apply_atlas_descriptions(bq: bigquery.Client, full_table: str, atlas_path: str) -> None:
+    if not os.path.exists(atlas_path):
+        print(f"ERROR: atlas not found: {atlas_path}", file=sys.stderr); sys.exit(2)
+    atlas = yaml.safe_load(open(atlas_path, "r", encoding="utf-8")) or {}
+    cols = atlas.get("columns") or []
+    desc_by_norm = {}
+    for c in cols:
+        if isinstance(c, dict) and c.get("name"):
+            desc_by_norm[norm_name(str(c["name"]))] = (c.get("description") or "").strip()
+
+    table = bq.get_table(full_table)
+    changed = 0
+    new_schema: List[bigquery.SchemaField] = []
+    for f in table.schema:
+        new_desc = desc_by_norm.get(norm_name(f.name), f.description)
+        if (new_desc or "") != (f.description or ""):
+            changed += 1
+        new_schema.append(bigquery.SchemaField(f.name, f.field_type, mode=f.mode, description=new_desc))
+    if changed:
+        table.schema = new_schema
+        bq.update_table(table, ["schema"])
+        print(f"Applied {changed} atlas descriptions to {full_table}", file=sys.stderr)
+    else:
+        print(f"No description changes needed on {full_table}", file=sys.stderr)
+
+# ---------- main ----------
+
+def main() -> int:
+    ap = argparse.ArgumentParser("MSSQL -> BigQuery ETL (full replace) — simple, opinionated.")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--sql", help='SQL to run on MSSQL (e.g., "SELECT ..." or "EXEC dbo.SP...")')
+    src.add_argument("--source-table", help="If set, uses SELECT * FROM <table>.")
+    ap.add_argument("--dest-table", required=True, help="BigQuery table id (e.g., all_apps_values)")
+    ap.add_argument("--atlas", required=True, help="Path to atlas *.atlas.yml")
+
+    # Optional partitioning: if you pass --partition, we set time partitioning on --partition-col.
+    # We do NOT coerce types; BigQuery expects DATE/DATETIME. Omit this flag if unsure.
+    ap.add_argument("--partition", action="store_true", help="Enable time partitioning on --partition-col.")
+    ap.add_argument("--partition-col", default="ReportMonth", help="Partition column (DATE/DATETIME).")
+
+    args = ap.parse_args()
+
+    sql = args.sql or f"SELECT * FROM {args.source_table}"
+
+    # env
+    server   = env_required("DB_SERVER")
+    database = env_required("DB_DATABASE")
+    username = env_required("DB_USERNAME")
+    password = env_required("DB_PASSWORD")
+    encrypt  = os.getenv("DB_ENCRYPT", "false").lower() == "true"
+    trust    = os.getenv("DB_TRUST_SERVER_CERT", "true").lower() == "true"
+    timeout  = int(os.getenv("DB_CONN_TIMEOUT_SEC", "5"))
+
+    project  = env_required("BQ_PROJECT")
+    dataset  = env_required("BQ_DATASET")
+    location = os.getenv("BQ_LOCATION", "US")
+    full_table = f"{project}.{dataset}.{args.dest_table}"
+
+    t0 = time.time()
+    print(f"ETL start: MSSQL -> {full_table}", file=sys.stderr)
+
+    # read SQL
+    with connect_mssql(server, database, username, password, encrypt, trust, timeout) as conn:
+        cur = conn.cursor()
+        parts: List[pd.DataFrame] = []
+        total = 0
+        for i, chunk in enumerate(iter_df_chunks(cur, sql), start=1):
+            normalize_columns(chunk)          # always normalize names
+            parts.append(chunk)
+            total += len(chunk.index)
+            print(f" - fetched chunk {i}: {len(chunk.index)} rows", file=sys.stderr)
+    df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    print(f"Fetched rows: {total}", file=sys.stderr)
+
+    # minimal dtype coercion for numeric-looking object columns
+    simple_numeric_coercion(df)
+
+    # BQ client and ensure dataset
+    bq = bigquery.Client(project=project)
+    ds_ref = bigquery.Dataset(f"{project}.{dataset}")
+    try:
+        bq.get_dataset(ds_ref)
+    except Exception:
+        ds_ref.location = location
+        bq.create_dataset(ds_ref, exists_ok=True)
+        print(f"Dataset ensured: {project}.{dataset}", file=sys.stderr)
+
+    # Load (truncate)
+    job_config = bigquery.LoadJobConfig(write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
+
+    # Optional: partitioning (you opted-in explicitly)
+    if args.partition:
+        job_config.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY,
+            field=args.partition_col,
+        )
+
+    job = bq.load_table_from_dataframe(df, full_table, job_config=job_config)
+    job.result()
+
+    table = bq.get_table(full_table)
+    print(f"Loaded {table.num_rows} rows into {full_table} (fields={len(table.schema)}) in {round(time.time()-t0,2)}s",
+          file=sys.stderr)
+
+    # ALWAYS apply atlas descriptions
+    apply_atlas_descriptions(bq, full_table, args.atlas)
+
+    print("ETL complete.", file=sys.stderr)
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
