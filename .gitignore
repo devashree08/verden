@@ -1,52 +1,41 @@
-def _series_is_all_dates(s: pd.Series) -> bool:
-    s = s.dropna()
-    if s.empty:
-        return True  # allow empty column to be typed as DATE
-    return all(isinstance(v, date) and not isinstance(v, datetime) for v in s)
-
-def _series_is_all_datetimes(s: pd.Series) -> bool:
-    s = s.dropna()
-    if s.empty:
+def _is_numeric_like(val) -> bool:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
         return False
-    return all(isinstance(v, datetime) for v in s)
+    if isinstance(val, (int, float, Decimal)):
+        return True
+    if isinstance(val, str):
+        v = val.strip()
+        if v == "":
+            return False
+        try:
+            Decimal(v)
+            return True
+        except InvalidOperation:
+            return False
+    return False
 
-def infer_bq_schema(df: pd.DataFrame, report_month_col: str = "ReportMonth") -> List[bigquery.SchemaField]:
-    """
-    Map pandas dtypes to BigQuery types (explicit beats autodetect).
-    - ints -> INT64
-    - floats -> FLOAT64
-    - bools -> BOOL
-    - datetime64[ns] -> DATETIME
-    - object containing datetime.date -> DATE
-    - object containing datetime.datetime -> DATETIME
-    - everything else -> STRING
-    Also: if column name equals report_month_col, force DATE.
-    """
-    fields: List[bigquery.SchemaField] = []
-    for name in df.columns:
-        s = df[name]
-        kind = "STRING"
+def _series_all_numeric_like(s: pd.Series) -> bool:
+    # sample up to 500 non-null values to keep it fast
+    sample = (x for x in s.dropna().values[:500])
+    return all(_is_numeric_like(v) for v in sample)
 
-        # Hard rule: ReportMonth should be DATE
-        if name == report_month_col:
-            kind = "DATE"
-        else:
-            dt = s.dtype
-            if pd.api.types.is_integer_dtype(dt):
-                kind = "INT64"
-            elif pd.api.types.is_float_dtype(dt):
-                kind = "FLOAT64"
-            elif pd.api.types.is_bool_dtype(dt):
-                kind = "BOOL"
-            elif pd.api.types.is_datetime64_any_dtype(dt):
-                kind = "DATETIME"
-            elif pd.api.types.is_object_dtype(dt):
-                if _series_is_all_dates(s):
-                    kind = "DATE"
-                elif _series_is_all_datetimes(s):
-                    kind = "DATETIME"
-                else:
-                    kind = "STRING"
+def _coerce_series_to_decimal(s: pd.Series) -> pd.Series:
+    def conv(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        if isinstance(v, Decimal):
+            return v
+        if isinstance(v, (int, float)):
+            return Decimal(str(v))
+        if isinstance(v, str):
+            v2 = v.strip()
+            if v2 == "":
+                return None
+            return Decimal(v2)
+        # anything else -> try string route or mark as None
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return None
+    return s.apply(conv)
 
-        fields.append(bigquery.SchemaField(name, kind))
-    return fields
