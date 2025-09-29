@@ -1,41 +1,31 @@
-def _is_numeric_like(val) -> bool:
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return False
-    if isinstance(val, (int, float, Decimal)):
-        return True
-    if isinstance(val, str):
-        v = val.strip()
-        if v == "":
-            return False
-        try:
-            Decimal(v)
-            return True
-        except InvalidOperation:
-            return False
-    return False
-
-def _series_all_numeric_like(s: pd.Series) -> bool:
-    # sample up to 500 non-null values to keep it fast
-    sample = (x for x in s.dropna().values[:500])
-    return all(_is_numeric_like(v) for v in sample)
-
-def _coerce_series_to_decimal(s: pd.Series) -> pd.Series:
-    def conv(v):
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return None
-        if isinstance(v, Decimal):
-            return v
-        if isinstance(v, (int, float)):
-            return Decimal(str(v))
-        if isinstance(v, str):
-            v2 = v.strip()
-            if v2 == "":
-                return None
-            return Decimal(v2)
-        # anything else -> try string route or mark as None
-        try:
-            return Decimal(str(v))
-        except Exception:
-            return None
-    return s.apply(conv)
+def infer_bq_schema(df: pd.DataFrame) -> List[bigquery.SchemaField]:
+    """
+    Simple mapping with NUMERIC support:
+      - object series holding Decimal (or numeric-like) -> NUMERIC
+      - ints -> INT64
+      - floats -> FLOAT64
+      - bools -> BOOL
+      - datetime64 -> DATETIME
+      - else -> STRING
+    """
+    fields: List[bigquery.SchemaField] = []
+    for name, dtype in df.dtypes.items():
+        kind = "STRING"
+        if pd.api.types.is_integer_dtype(dtype):
+            kind = "INT64"
+        elif pd.api.types.is_float_dtype(dtype):
+            kind = "FLOAT64"
+        elif pd.api.types.is_bool_dtype(dtype):
+            kind = "BOOL"
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            kind = "DATETIME"
+        elif pd.api.types.is_object_dtype(dtype):
+            # decide between NUMERIC vs STRING
+            s = df[name]
+            if _series_all_numeric_like(s):
+                kind = "NUMERIC"
+            else:
+                kind = "STRING"
+        fields.append(bigquery.SchemaField(name, kind))
+    return fields
 
