@@ -29,3 +29,12 @@ def infer_bq_schema(df: pd.DataFrame) -> List[bigquery.SchemaField]:
         fields.append(bigquery.SchemaField(name, kind))
     return fields
 
+
+# Coerce numeric-like object columns to Decimal so PyArrow can emit NUMERIC cleanly
+for col in df.columns:
+    if pd.api.types.is_object_dtype(df[col].dtype):
+        s = df[col]
+        if _series_all_numeric_like(s):
+            df[col] = _coerce_series_to_decimal(s)
+
+
