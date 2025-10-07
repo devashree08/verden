@@ -5,7 +5,7 @@ Small, readable **Model Context Protocol (MCP) HTTP server** you can clone for n
 - **Fallback**: **BigQuery** snapshot tables
 - **Auth**: Keycloak OIDC (validate JWT, use `email` claim)
 - **Transport**: MCP over **HTTP** (works with MCP Inspector)
-- **Tooling**: Python 3.13.7, FastMCP 2.12.3, uv, ruff
+- **Tooling**: Python 3.13.7, FastMCP, uv, ruff
 - **Runtime**: Dockerfile → Artifact Registry → Cloud Run
 
 > Goal (Phase-1): run this MCP server on Cloud Run. Keep code simple, boring, and enterprise-ready.
@@ -14,35 +14,35 @@ Small, readable **Model Context Protocol (MCP) HTTP server** you can clone for n
 
 ## How it works (end-to-end)
 
-- **Single endpoint**: MCP over HTTP uses **one path** (e.g., `/mcp/`). Tools are *not* separate REST routes.
-- **Discovery → tool selection**: Clients (e.g., MCP Inspector, agents) hit `/mcp/`, read tool **descriptions** and **JSON Schemas**, then call a tool by name on the same endpoint.
-- **Auth**: Requests include `Authorization: Bearer <JWT>` (Keycloak). Server verifies `iss/aud/exp/nbf`, extracts `email`, and **requires** the input `email` equals the token’s `email` (Phase-1 policy).
+- **Single endpoint**: MCP over HTTP uses **one path** (e.g., `/mcp/`). Tools are *not* separate REST routes. (Some clients use Server-Sent Events at `/mcp/sse`.)
+- **Discovery → tool selection**: Clients (MCP Inspector/agents) hit `/mcp/`, read tool **descriptions** + **JSON Schemas**, then call a tool by name on the same endpoint.
+- **Auth**: Requests include `Authorization: Bearer <JWT>` (Keycloak). Server verifies `iss/aud/exp/nbf`, extracts `email`, and **requires** the input `email` equals the token’s `email` (Phase-1).
 - **Data access** (adapter switch):
   - `DB_BACKEND=mssql` → run stored procs via **pyodbc + ODBC Driver 18**.
   - `DB_BACKEND=bigquery` → run SELECTs on exported BQ tables with the same filters.
-- **Output shape** (all tools):  
+- **Output shape** (all tools):
   ```json
   { "rows": [ { /* columns (300–400) */ } ] }
   ```
-- **Field dictionaries**: `/resources/describe_fields/<tool>` serves a YAML/JSON list of columns/types/descriptions so clients/devs understand large schemas without bloating tool I/O.
+- **Field dictionaries**: `/resources/describe_fields/<tool>` serves YAML/JSON column docs so clients/devs understand large schemas without bloating tool I/O.
 
 ---
 
 ## Tools (1 file = 1 tool)
 
 1) **get_all_apps_value_by_user** → `dbo.SPGetAllAppsValueByUser`  
-   Use for **current month (daily snapshot)**.
-   - Inputs: `email` (required), `vast` (CSV or array), `limit` (default 1000, max 15000), `offset` (default 0)
+   Use for **current month (daily snapshot)**.  
+   Inputs: `email` (required), `vast` (CSV or array), `limit` (default 1000, max 15000), `offset` (default 0)
 
 2) **get_all_apps_summary_by_user** → `dbo.SPGetAllAppsSummaryByUser`  
-   Use for **historical monthly snapshots** (e.g., “Feb 2024”).
-   - Inputs: `email`, `vast`, `report_month` (accepts `YYYY-MM` or NL like “February 2024”; normalized to `YYYY-MM-01 00:00:00`), `limit`, `offset`
+   Use for **historical monthly snapshots** (e.g., “Feb 2024”).  
+   Inputs: `email`, `vast`, `report_month` (accepts `YYYY-MM` or “Month YYYY”; normalized to `YYYY-MM-01 00:00:00`), `limit`, `offset`
 
 3) **get_vast_general_by_user** → `dbo.SPGetVastGeneralByUser`  
-   Use for **compliance/general** (includes decommissioned).
-   - Inputs: `email`, `vast`, `limit`, `offset`
+   Use for **compliance/general** (includes decommissioned).  
+   Inputs: `email`, `vast`, `limit`, `offset`
 
-**Shared normalization**:
+**Shared normalization**
 - `vast`: accept CSV **or** array; normalize internally to CSV (empty ⇒ omit filter).
 - `report_month`: parse NL or `YYYY-MM` → literal `YYYY-MM-01 00:00:00` (no timezone math).
 
@@ -65,12 +65,12 @@ scripts/     # one-offs (e.g., generate field dictionaries)
 ops/         # Dockerfile + deploy notes (Cloud Run)
 tests/       # smoke tests/checklists (auth + tool contracts)
 .env.example # local placeholders only (no secrets)
-pyproject.toml       # uv-managed deps (pins FastMCP 2.12.3, etc.)
+pyproject.toml       # uv-managed deps (resolved via uv.lock)
 ruff.toml            # lint + docstring rules
 README.md            # this file
 ```
 
-**Ownership**:
+**Ownership**
 - `framework/` is tiny and reusable across projects (plumbing).
 - `server/` is where you spend time (tools/resources/prompts).
 - `ops/` holds the **single** Dockerfile and Cloud Run notes.
@@ -86,14 +86,18 @@ README.md            # this file
 - **Docker** to containerize for Cloud Run
 - Later in CI/CD: **Cloud Build**, **Artifact Registry**, **Cloud Run** (org policy may enforce CMEK)
 
+> We set `pyproject.toml` → `[tool.uv] package = false` so `uv sync` does **not** attempt to build/install this repo as a package (flat app layout).
+
 ---
 
 ## Local dev (Windows / VS Code)
 
-> You can create files & lint now. Running the server comes in the next step after we add the entrypoint.
-
 ```bash
-# Install deps (creates .venv under the repo)
+# (Optional) lock exact versions for reproducibility
+uv lock
+git add uv.lock
+
+# Install deps (uses uv.lock if present)
 uv sync
 
 # Lint
@@ -108,7 +112,7 @@ When the entrypoint is added:
 # Then point MCP Inspector to: http://localhost:8080/mcp/
 ```
 
-> If `uv init` created a `src/` directory, delete it. We’re building an app, not a pip package, and we’ve standardized the structure above.
+> If `uv init` created a `src/` directory, delete it. We’re building an app, not a pip package.
 
 ---
 
@@ -119,14 +123,14 @@ When the entrypoint is added:
 - **Secrets** (examples):  
   `SQLSERVER_HOST`, `SQLSERVER_DATABASE`, `SQLSERVER_USERNAME`, `SQLSERVER_PASSWORD`.
 
-**Cloud Run** maps Secret Manager → **env vars** at deploy (e.g., `--set-secrets=SQLSERVER_PASSWORD=...:latest`).  
+Cloud Run maps Secret Manager → **env vars** at deploy (e.g., `--set-secrets=SQLSERVER_PASSWORD=...:latest`).  
 The app **does not call Secret Manager** directly; it just reads env vars.
 
 ---
 
 ## GCP deployment (overview)
 
-1) **Build** container from `ops/Dockerfile` (Cloud Build or local) → push to **Artifact Registry**.  
+1) **Build** image from `ops/Dockerfile` (Cloud Build or local) → push to **Artifact Registry**.  
 2) **Deploy** to **Cloud Run** with:
    - **Networking**: **Direct VPC egress** (preferred) `--network --subnet --vpc-egress=all-traffic`, or **Serverless VPC Access** connector if required.
    - **Secrets**: `--set-secrets=...` maps SQL creds to env vars.
@@ -148,16 +152,16 @@ The app **does not call Secret Manager** directly; it just reads env vars.
 
 ---
 
-## Python dependencies (pinned)
+## Python dependencies
 
-- `fastmcp==2.12.3` — MCP server (HTTP)
-- `pyodbc==5.1.0` — SQL Server ODBC 18
-- `pyjwt[crypto]==2.9.0` — JWT validation
-- `requests==2.32.3` — OIDC discovery (well-known → JWKS)
-- `pydantic==2.8.2` — light validation
-- `python-dateutil==2.9.0.post0` — parse “Feb 2024” → `YYYY-MM-01 00:00:00`
-- `ruamel.yaml==0.18.6` — field dictionaries
-- `google-cloud-bigquery==3.25.0` — fallback adapter
+- `fastmcp` — MCP server (HTTP)
+- `pyodbc` — SQL Server ODBC 18
+- `pyjwt[crypto]` — JWT validation
+- `requests` — OIDC discovery (well-known → JWKS)
+- `pydantic` — light validation
+- `python-dateutil` — parse “Feb 2024” → `YYYY-MM-01 00:00:00`
+- `ruamel.yaml` — field dictionaries
+- `google-cloud-bigquery` — fallback adapter
 
 ---
 
