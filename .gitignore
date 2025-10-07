@@ -1,4 +1,8 @@
-# Deploy Notes (to use once security approves)
-- Build with Cloud Build -> Artifact Registry (CMEK)
-- Deploy to Cloud Run (CMEK) with Direct VPC egress or Serverless VPC connector
-- Map secrets to env, set non-secret env knobs
+# Local-only placeholders (no real secrets)
+DB_BACKEND=mssql
+OIDC_ISSUER_URI=https://keycloak-cde.acme.com/realm/acme-cde
+OIDC_ALLOWED_AUDIENCE=account
+# ENCRYPT/TRUST flags for MSSQL driver
+ENCRYPT=false
+TRUST_SERVER_CERTIFICATE=true
+
