@@ -1,163 +1,31 @@
-Description
-1) What we’re doing
-
-We’re deploying an MCP HTTP server to Cloud Run (region us-east4) that queries on-prem SQL Server (primary) with BigQuery fallback. Org policy requires CMEK across services, so we need a single CMEK key and correct service-agent IAM for:
-
-Cloud Run (service)
-
-Artifact Registry (container images)
-
-Secret Manager (SQL credentials)
-
-Please also enable required APIs and (optionally) pre-authorize Cloud Build for future builds.
-
-2) Environment
-
-Project ID: <PROJECT_ID>
-
-Project Number: <PROJECT_NUMBER>
-
-Region: us-east4
-
-Cloud Run service name (planned): j9cv-VCSChatbot-mcp
-
-Artifact Registry repo (planned): j9cv-VCSChatbot-mcp-repo (Docker, us-east4)
-
-3) Request — KMS (CMEK) provisioning
-
-Create a symmetric ENCRYPT_DECRYPT key we can reuse across Cloud Run, Artifact Registry, and Secret Manager:
-
-KeyRing: run-cmek-kr
-
-Key: run-cmek
-
-Location: us-east4
-
-Full resource (example):
-projects/<PROJECT_ID>/locations/us-east4/keyRings/run-cmek-kr/cryptoKeys/run-cmek
-
-If your team prefers an existing enterprise key ring/key, that’s fine — please share the final key resource name.
-
-4) Request — grant KMS permissions to service-managed agents
-
-Please grant roles/cloudkms.cryptoKeyEncrypterDecrypter on the CMEK key to each service agent below (all in our project):
-
-Service	Service-managed agent (needs KMS on the key)
-Cloud Run	service-<PROJECT_NUMBER>@serverless-robot-prod.iam.gserviceaccount.com
-Artifact Registry	service-<PROJECT_NUMBER>@gcp-sa-artifactregistry.iam.gserviceaccount.com
-Secret Manager	service-<PROJECT_NUMBER>@gcp-sa-secretmanager.iam.gserviceaccount.com
-
-Note: Our runtime service account will only need Secret Manager accessor on specific secrets (no KMS role). Secret Manager performs KMS decrypt on behalf of callers.
-
-5) (Optional, future-proof) Pre-authorize common services that often require CMEK
-
-If your policy allows, please also grant Encrypter/Decrypter on the same key to:
-
-Future service	Service-managed agent
-Cloud Build (for CMEK-protected artifacts/logs if enforced later)	service-<PROJECT_NUMBER>@gcp-sa-cloudbuild.iam.gserviceaccount.com
-Cloud Logging buckets (if CMEK-protected log buckets are required later)	We’ll open a separate ticket if/when needed
-Eventarc / Pub/Sub / Scheduler	Not needed now; will file if required
-
-(If your organization prefers per-service keys, we can follow that; this request assumes one key reused across these services.)
-
-6) Request — enable required APIs (project <PROJECT_ID>)
-
-Must-have now:
-
-cloudkms.googleapis.com (KMS)
-
-run.googleapis.com (Cloud Run)
-
-artifactregistry.googleapis.com (Artifact Registry)
-
-secretmanager.googleapis.com (Secret Manager)
-
-compute.googleapis.com (for networking & Direct VPC egress)
-
-If we must use a VPC connector instead of Direct VPC egress:
-
-vpcaccess.googleapis.com (Serverless VPC Access)
-
-Optional (future builds/tests):
-
-cloudbuild.googleapis.com (Cloud Build)
-
-7) Secret Manager — CMEK & replication policy
-
-We’ll create four SQL secrets with user-managed replication to us-east4 and back them with the same CMEK:
-
-SQLSERVER_HOST, SQLSERVER_DATABASE, SQLSERVER_USERNAME, SQLSERVER_PASSWORD
-
-Please confirm policy permits:
-
-Region: us-east4
-
-Replication: user-managed (region-pinned)
-
-KMS: the key above
-
-Access: we will bind our runtime service account with roles/secretmanager.secretAccessor on those specific secrets.
-
-8) Networking (FYI / no action unless you enforce it)
-
-We prefer Direct VPC egress from Cloud Run. If your environment mandates Serverless VPC Access, please confirm connector requirements (dedicated /28, PRIVATE purpose) and any firewall allow-lists needed for outbound to on-prem SQL.
-
-9) Acceptance criteria
-
-A CMEK key exists at projects/<PROJECT_ID>/locations/us-east4/keyRings/run-cmek-kr/cryptoKeys/run-cmek, or another provided key name.
-
-KMS IAM on that key includes:
-
-service-<PROJECT_NUMBER>@serverless-robot-prod.iam.gserviceaccount.com → EncrypterDecrypter
-
-service-<PROJECT_NUMBER>@gcp-sa-artifactregistry.iam.gserviceaccount.com → EncrypterDecrypter
-
-service-<PROJECT_NUMBER>@gcp-sa-secretmanager.iam.gserviceaccount.com → EncrypterDecrypter
-
-(Optional) service-<PROJECT_NUMBER>@gcp-sa-cloudbuild.iam.gserviceaccount.com → EncrypterDecrypter
-
-APIs enabled in <PROJECT_ID>: KMS, Cloud Run, Artifact Registry, Secret Manager, Compute (and VPC Access if required).
-
-We can create:
-
-a CMEK-protected Artifact Registry repo in us-east4,
-
-CMEK-protected secrets in Secret Manager (us-east4), and
-
-a CMEK-backed Cloud Run service in us-east4 (deployment will pass --kms-key).
-
-10) Rollback / blast radius
-
-Granting KMS roles is safe and reversible; removing a principal from the key IAM immediately blocks its decrypt/encrypt usage by that service.
-
-No data migration requested here; all encryption will occur upon creation of new resources in our project.
-
-11) Contacts
-
-Requester / App owner: <Your Name> (<email>)
-
-Cloud Run runtime SA (planned): <RUNTIME_SA>@<PROJECT_ID>.iam.gserviceaccount.com
-
-Target deploy window: ASAP / specify dates
-
-Change type: Non-prod → Prod (single project)
-
-Attachments / values to confirm
-
-Please confirm or fill these fields before approving:
-
-<PROJECT_ID> = ________
-
-<PROJECT_NUMBER> = ________
-
-Final CMEK resource name (if you supply an existing key): projects/.../locations/us-east4/keyRings/.../cryptoKeys/...
-
-Networking posture: Direct VPC egress allowed? If not, name of Serverless VPC Access connector to use.
-
-Notes for security reviewers (why one key)
-
-Using one CMEK across Cloud Run, Artifact Registry, and Secret Manager keeps ops simple and cost low.
-
-Each Google product uses its own service-managed agent to call KMS; that’s why each agent needs Encrypter/Decrypter on the same key.
-
-Our application runtime does not need KMS roles to read secrets; Secret Manager performs the decrypt and returns plaintext if the caller has secret access.
+[project]
+name = "mcp-enterprise"
+version = "0.1.0"
+description = "Reusable MCP HTTP server framework + project layer"
+requires-python = ">=3.13"
+readme = "README.md"
+dependencies = [
+  "fastmcp==2.12.3",
+  "pyodbc==5.1.0",
+  "pyjwt[crypto]==2.9.0",
+  "requests==2.32.3",
+  "pydantic==2.8.2",
+  "python-dateutil==2.9.0.post0",
+  "ruamel.yaml==0.18.6",
+  "google-cloud-bigquery==3.25.0",
+]
+
+[tool.uv]
+# Dev tools installed via uv sync
+dev-dependencies = [
+  "ruff==0.6.9",
+  "pytest==8.3.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "D"]  # basic errors, imports, and pydocstyle
+ignore = ["D203", "D213"]      # allow Google's one-liners/summary style
