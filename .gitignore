@@ -1,4 +1,4 @@
-# Runtime Config (Server Layer)
-- Non-secret env knobs (e.g., DB_BACKEND, OIDC_ISSUER_URI, OIDC_ALLOWED_AUDIENCE).
-- Secrets are provided at deploy time via Secret Manager -> env (Cloud Run).
-- Local `.env` is for placeholders only. Never commit real secrets.
+# Deploy Notes (to use once security approves)
+- Build with Cloud Build -> Artifact Registry (CMEK)
+- Deploy to Cloud Run (CMEK) with Direct VPC egress or Serverless VPC connector
+- Map secrets to env, set non-secret env knobs
