@@ -1,31 +1,4 @@
-[project]
-name = "mcp-enterprise"
-version = "0.1.0"
-description = "Reusable MCP HTTP server framework + project layer"
-requires-python = ">=3.13"
-readme = "README.md"
-dependencies = [
-  "fastmcp==2.12.3",
-  "pyodbc==5.1.0",
-  "pyjwt[crypto]==2.9.0",
-  "requests==2.32.3",
-  "pydantic==2.8.2",
-  "python-dateutil==2.9.0.post0",
-  "ruamel.yaml==0.18.6",
-  "google-cloud-bigquery==3.25.0",
-]
-
-[tool.uv]
-# Dev tools installed via uv sync
-dev-dependencies = [
-  "ruff==0.6.9",
-  "pytest==8.3.2",
-]
-
-[tool.ruff]
-line-length = 100
-target-version = "py313"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "D"]  # basic errors, imports, and pydocstyle
-ignore = ["D203", "D213"]      # allow Google's one-liners/summary style
+# Runtime Config (Server Layer)
+- Non-secret env knobs (e.g., DB_BACKEND, OIDC_ISSUER_URI, OIDC_ALLOWED_AUDIENCE).
+- Secrets are provided at deploy time via Secret Manager -> env (Cloud Run).
+- Local `.env` is for placeholders only. Never commit real secrets.
