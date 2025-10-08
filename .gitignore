@@ -1,16 +1,7 @@
-"""
-Server bootstrap: assemble FastMCP, register auth + middleware, and (later) register tools/resources.
-
-Run locally:
-    uv run python -m framework.core.bootstrap
-Then connect MCP Inspector to http://localhost:8080/mcp/
-"""
-
 from __future__ import annotations
 import logging
 
 from fastmcp import FastMCP
-from fastmcp.server.transport import Transport  # enum-like strings for run()
 
 from .config import SERVICE_NAME, HOST, PORT, HTTP_PATH
 from .logging import setup_logging
@@ -18,24 +9,30 @@ from ..auth.oidc import build_jwt_verifier, EmailClaimMiddleware
 
 
 def create_server() -> FastMCP:
+    """
+    Build the FastMCP server instance with JWT auth and our email-claim middleware.
+    Tools/resources are imported here (later) so decorator registration runs.
+    """
     setup_logging()
     log = logging.getLogger(__name__)
 
-    # 1) Construct server with JWT auth
+    # 1) Auth: Keycloak OIDC via FastMCP's JWT verifier
     auth_provider = build_jwt_verifier()
+
+    # 2) Server
     mcp = FastMCP(name=SERVICE_NAME, auth=auth_provider)
 
-    # 2) Add our small policy middleware (email claim -> context state)
+    # 3) Middleware: require `email` claim and publish it to request context
     mcp.add_middleware(EmailClaimMiddleware())
 
-    # 3) (Later) import tools/resources so decorators register them on this server.
-    #    Keep imports inside function to avoid side-effects during tooling (ruff, pytest).
+    # 4) (Later) import tools/resources so decorators register with this server
     try:
-        # Example: from server.tools import sample_echo_tool  # noqa: F401
-        # For now we don’t import your SQL tools until Step 4.
+        # Example (when we add them):
+        # from server.tools import sample_echo_tool  # noqa: F401
+        # from server.resources import describe_fields  # noqa: F401
         pass
     except Exception as exc:  # pragma: no cover
-        log.exception("Tool registration failed: %s", exc)
+        log.exception("Tool/resource registration failed: %s", exc)
         raise
 
     return mcp
@@ -43,16 +40,14 @@ def create_server() -> FastMCP:
 
 def main() -> None:
     mcp = create_server()
-    # HTTP transport with a single endpoint path (default `/mcp/`)
-    # Clients discover/list/call tools over this one path.
+    # HTTP transport on a single base path (clients use /mcp/ for discovery + calls)
     mcp.run(
-        transport=Transport.HTTP,   # same as transport="http"
+        transport="http",   # string per FastMCP; no server-side transport import needed
         host=HOST,
         port=PORT,
-        path=HTTP_PATH,
+        path=HTTP_PATH,     # e.g., "/mcp/"
     )
 
 
 if __name__ == "__main__":
     main()
-
