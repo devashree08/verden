@@ -1,30 +1,61 @@
+"""
+Keycloak OIDC for MCP (enterprise-grade, minimal config).
+
+- Validates Authorization: Bearer <JWT> via FastMCP's JWTVerifier
+- Requires an email-style identifier ('email' | 'upn' | 'preferred_username')
+- Publishes normalized email to request context state as "email"
+"""
+
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Union
+import logging
+from typing import Optional
 
 from fastmcp import Context
-from framework.core.registry import mcp
-from framework.schemas.outputs import ROWS_OUTPUT
+from fastmcp.server.auth.providers.jwt import JWTVerifier
+from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.middleware import Middleware
 
-@mcp.tool(
-    name="sample_echo",
-    description="Echo normalized inputs and caller identity for debugging.",
-    output_schema=ROWS_OUTPUT,
+from ..core.config import (
+    OIDC_JWKS_URI,
+    OIDC_ISSUER_URI,
+    OIDC_ALLOWED_AUDIENCE,
 )
-async def sample_echo(
-    vast: Optional[Union[str, List[Union[int, str]]]] = None,
-    limit: int = 1000,
-    offset: int = 0,
-    ctx: Context = Context.depends(),   # ← dependency-injected context (current pattern)
-) -> Dict[str, List[Dict[str, Any]]]:
-    email = (ctx.get_state("email") or "").lower()
-    return {
-        "rows": [
-            {
-                "email": email,
-                "vast": vast,
-                "limit": limit,
-                "offset": offset,
-                "note": "Reference tool; copy this pattern for real tools.",
-            }
-        ]
-    }
+
+log = logging.getLogger(__name__)
+
+
+def build_jwt_verifier() -> JWTVerifier:
+    if not (OIDC_JWKS_URI and OIDC_ISSUER_URI and OIDC_ALLOWED_AUDIENCE):
+        raise RuntimeError(
+            "JWT auth misconfigured: OIDC_JWKS_URI, OIDC_ISSUER_URI, and OIDC_ALLOWED_AUDIENCE are required"
+        )
+    return JWTVerifier(
+        jwks_uri=OIDC_JWKS_URI,
+        issuer=OIDC_ISSUER_URI,
+        audience=OIDC_ALLOWED_AUDIENCE,
+    )
+
+
+class EmailClaimMiddleware(Middleware):
+    """
+    Enforce presence of an email-style identity and expose it to tools via context.
+    """
+
+    async def on_request(self, ctx: Context, call_next):
+        # Correct way to access the verified token in current FastMCP:
+        token = get_access_token()
+        if token is None:
+            return await ctx.error("Unauthorized: missing or invalid access token", status=401)
+
+        claims = token.claims or {}
+        raw_email: Optional[str] = (
+            claims.get("email")
+            or claims.get("upn")
+            or claims.get("preferred_username")
+        )
+
+        if not raw_email:
+            return await ctx.error("Forbidden: email claim missing", status=403)
+
+        ctx.set_state("email", raw_email.strip().lower())
+        return await call_next()
