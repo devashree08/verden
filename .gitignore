@@ -1,93 +1,65 @@
 """
-Tool: get_vast_general_by_user  -> dbo.SPGetVastGeneralByUser
-- General/compliance data for VASTs (includes decommissioned)
-- Pydantic validation & normalization for inputs
+Resource: fields://{tool_name}
+
+Loads a YAML field dictionary from server/resources/fields/{tool_name}.yaml
+and returns it as JSON. No DB calls, no complexity.
+
+Valid tool_name values:
+  - get_all_apps_value_by_user
+  - get_all_apps_summary_by_user
+  - get_vast_general_by_user
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Union
+from pathlib import Path
+from typing import Any, Dict
 
 from fastmcp import Context
-from pydantic import BaseModel, Field, field_validator
+from ruamel.yaml import YAML
 
 from framework.core.registry import mcp
-from framework.core.config import DB_BACKEND
-from framework.schemas.outputs import ROWS_OUTPUT
+
+# Resolve repo root relative to this file; avoids CWD surprises
+_FIELDS_DIR = Path(__file__).resolve().parent / "fields"
+
+# One-to-one mapping (explicit to avoid path traversal)
+_TOOL_TO_FILE = {
+    "get_all_apps_value_by_user": _FIELDS_DIR / "allapps_value.yaml",
+    "get_all_apps_summary_by_user": _FIELDS_DIR / "allapps_summary.yaml",
+    "get_vast_general_by_user": _FIELDS_DIR / "vast_general.yaml",
+}
 
 
-class _WithPaging(BaseModel):
-    limit: int = Field(
-        default=1000,
-        description="Max rows to return (1–15000).",
-        ge=1,
-        le=15000,
-        examples=[100, 1000, 5000],
-    )
-    offset: int = Field(
-        default=0,
-        description="Row offset for pagination (>= 0).",
-        ge=0,
-        examples=[0, 100, 1000],
-    )
-
-    @field_validator("limit")
-    @classmethod
-    def cap_limit(cls, v: int) -> int:
-        return max(1, min(v, 15_000))
-
-    @field_validator("offset")
-    @classmethod
-    def non_negative_offset(cls, v: int) -> int:
-        return max(0, v)
+def _load_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Field dictionary not found: {path.name}")
+    yaml = YAML(typ="safe")
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.load(f) or {}
 
 
-class VastGeneralParams(_WithPaging):
-    vast: Optional[Union[str, List[Union[int, str]]]] = Field(
-        default=None,
-        description="VAST IDs to filter. Accepts CSV string ('101,202') or array (['101','202']). Omit for all allowed VASTs.",
-        examples=["101,202", ["101", "202"]],
-    )
+@mcp.resource("fields://{tool_name}")
+async def describe_fields(tool_name: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Return the field dictionary JSON for the given tool name.
 
-    @field_validator("vast", mode="before")
-    @classmethod
-    def normalize_vast(cls, v: Any) -> Optional[str]:
-        if v is None:
-            return None
-        if isinstance(v, str):
-            s = v.strip()
-            return s or None
-        if isinstance(v, (list, tuple)):
-            parts: List[str] = []
-            for item in v:
-                if item is None:
-                    continue
-                s = str(item).strip()
-                if s:
-                    parts.append(s)
-            return ",".join(parts) or None
-        s = str(v).strip()
-        return s or None
+    Example URIs:
+      fields://get_all_apps_value_by_user
+      fields://get_all_apps_summary_by_user
+      fields://get_vast_general_by_user
+    """
+    path = _TOOL_TO_FILE.get(tool_name)
+    if path is None:
+        # Keep error safe & clear for agents
+        return {
+            "error": "unknown_tool",
+            "message": f"Unsupported tool name '{tool_name}'.",
+            "supported": list(_TOOL_TO_FILE.keys()),
+        }
 
-
-@mcp.tool(
-    name="get_vast_general_by_user",
-    description=(
-        "Return general/compliance attributes (SOX, PCI, rankings, etc.) "
-        "for the caller's accessible VASTs. Includes decommissioned."
-    ),
-    output_schema=ROWS_OUTPUT,
-)
-async def get_vast_general_by_user(
-    params: VastGeneralParams,
-    ctx: Context,
-) -> Dict[str, List[Dict[str, Any]]]:
-    email = (ctx.get_state("email") or "").lower()
-
-    if DB_BACKEND == "mssql":
-        from framework.adapters.mssql import call_sp_vast_general as run_query
-        rows = run_query(email=email, vast=params.vast, limit=params.limit, offset=params.offset)
-    else:
-        from framework.adapters.bigquery import query_vast_general as run_query
-        rows = run_query(email=email, vast=params.vast, limit=params.limit, offset=params.offset)
-
-    return {"rows": rows}
+    data = _load_yaml(path)
+    # Add minimal runtime metadata (helpful for debugging)
+    data.setdefault("_meta", {})
+    data["_meta"]["served_by"] = "fields-resource"
+    data["_meta"]["tool_name"] = tool_name
+    return data
