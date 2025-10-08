@@ -25,15 +25,23 @@ from ..core.config import (
 
 log = logging.getLogger(__name__)
 
-
-# Reference tables (same dataset). If your org uses different names, update here once.
+# Reference tables in the same dataset (per your export)
 _REF_WORKERS = "ref_aaas_workers_outbound"
 _REF_EID_VAST = "ref_eid_vast_map"
 
 
 def _client() -> bigquery.Client:
-    # If BQ_PROJECT_ID is empty, bigquery.Client() will use default project from credentials.
+    # If BQ_PROJECT_ID is empty, the client will use default project from ADC
     return bigquery.Client(project=BQ_PROJECT_ID or None)
+
+
+def _fq(client: bigquery.Client, table: str) -> str:
+    """
+    Fully-qualified table name: `project.dataset.table`
+    Uses BQ_PROJECT_ID if set; otherwise client.project
+    """
+    project = BQ_PROJECT_ID or client.project
+    return f"`{project}.{BQ_DATASET}.{table}`"
 
 
 def _normalize_vast_csv(vast: Optional[Union[str, List[Union[int, str]]]]) -> Optional[str]:
@@ -46,12 +54,18 @@ def _normalize_vast_csv(vast: Optional[Union[str, List[Union[int, str]]]]) -> Op
     for v in vast:
         if v is None:
             continue
-        tokens.append(str(v).strip())
-    csv = ",".join(t for t in tokens if t)
+        t = str(v).strip()
+        if t:
+            tokens.append(t)
+    csv = ",".join(tokens)
     return csv or None
 
 
 def _normalize_report_month_literal(report_month: Optional[Union[str, datetime]]) -> Optional[str]:
+    """
+    Normalize to 'YYYY-MM-01 00:00:00' (matches the DB/BQ export literal).
+    Accepts: None | 'YYYY-MM' | 'Month YYYY' | datetime
+    """
     if report_month is None:
         return None
     if isinstance(report_month, datetime):
@@ -72,6 +86,15 @@ def _normalize_report_month_literal(report_month: Optional[Union[str, datetime]]
         return None
 
 
+def _bq_type(v: Any) -> str:
+    if isinstance(v, bool):
+        return "BOOL"
+    if isinstance(v, int):
+        return "INT64"
+    # strings or None → STRING
+    return "STRING"
+
+
 def _run_query(sql: str, params: Dict[str, Any], timeout: int = 90) -> List[Dict[str, Any]]:
     client = _client()
     job_config = bigquery.QueryJobConfig(
@@ -87,48 +110,45 @@ def _run_query(sql: str, params: Dict[str, Any], timeout: int = 90) -> List[Dict
     return rows
 
 
-def _bq_type(v: Any) -> str:
-    if isinstance(v, bool):
-        return "BOOL"
-    if isinstance(v, int):
-        return "INT64"
-    # ReportMonth literal is a string literal in DB format
-    return "STRING"
-
-
-def _email_to_eid_cte() -> str:
-    ds = BQ_DATASET
+def _email_to_eid_cte(client: bigquery.Client) -> str:
+    workers = _fq(client, _REF_WORKERS)
     return f"""
 WITH email_to_eid AS (
   SELECT CAST(MIN(w.identityeid) AS STRING) AS eid
-  FROM `{BQ_PROJECT_ID}.{ds}.{_REF_WORKERS}` AS w
+  FROM {workers} AS w
   WHERE LOWER(TRIM(w.emailaddressinternal)) = LOWER(TRIM(@email))
 ),
 allowed_vasts AS (
   SELECT DISTINCT ev.vast_id
-  FROM `{BQ_PROJECT_ID}.{ds}.{_REF_EID_VAST}` AS ev
+  FROM {_fq(client, _REF_EID_VAST)} AS ev
   JOIN email_to_eid e ON ev.eid = e.eid
 )
 """
 
 
 def _vast_filter_sql(column_name: str) -> str:
-    # If @vast_csv is provided, restrict to both allowed_vasts and provided set
+    # SAFE_CAST guards against invalid inputs in @vast_csv
     return f"""
 AND (
   @vast_csv IS NULL
   OR {column_name} IN UNNEST(
       ARRAY(
-        SELECT CAST(TRIM(x) AS INT64)
+        SELECT SAFE_CAST(TRIM(x) AS INT64)
         FROM UNNEST(SPLIT(@vast_csv, ',')) AS x
-        WHERE TRIM(x) != ''
+        WHERE TRIM(x) != '' AND SAFE_CAST(TRIM(x) AS INT64) IS NOT NULL
       )
     )
 )
-AND (
-  {column_name} IN (SELECT vast_id FROM allowed_vasts)
-)
+AND {column_name} IN (SELECT vast_id FROM allowed_vasts)
 """
+
+
+def _sanitize_paging(limit: int, offset: int) -> tuple[int, int]:
+    if limit is None or limit <= 0:
+        limit = 1
+    if offset is None or offset < 0:
+        offset = 0
+    return int(limit), int(offset)
 
 
 def query_allapps_value(
@@ -140,19 +160,21 @@ def query_allapps_value(
 ) -> List[Dict[str, Any]]:
     """
     Fallback for SPGetAllAppsValueByUser (current month snapshot).
-    The table already contains only current-month rows (per your export).
     """
+    client = _client()
     vast_csv = _normalize_vast_csv(vast)
+    limit, offset = _sanitize_paging(limit, offset)
+
     sql = f"""
-{_email_to_eid_cte()}
+{_email_to_eid_cte(client)}
 SELECT *
-FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE_ALLAPPS_VALUE}`
+FROM {_fq(client, BQ_TABLE_ALLAPPS_VALUE)}
 WHERE TRUE
 {_vast_filter_sql("VastID")}
 ORDER BY VastID
 LIMIT @limit OFFSET @offset
 """
-    params = {"email": email, "vast_csv": vast_csv, "limit": int(limit), "offset": int(offset)}
+    params = {"email": email, "vast_csv": vast_csv, "limit": limit, "offset": offset}
     return _run_query(sql, params)
 
 
@@ -165,17 +187,20 @@ def query_allapps_summary(
     offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Fallback for SPGetAllAppsSummaryByUser (historical monthly snapshots)
-    If @report_month is provided, filter to that literal 'YYYY-MM-01 00:00:00'.
+    Fallback for SPGetAllAppsSummaryByUser (historical monthly snapshots).
+    If @report_month is provided, filter to 'YYYY-MM-01 00:00:00'.
     """
+    client = _client()
     vast_csv = _normalize_vast_csv(vast)
     report_literal = _normalize_report_month_literal(report_month)
+    limit, offset = _sanitize_paging(limit, offset)
+
     filter_rm = "AND ReportMonth = @report_month" if report_literal else ""
 
     sql = f"""
-{_email_to_eid_cte()}
+{_email_to_eid_cte(client)}
 SELECT *
-FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE_ALLAPPS_SUMMARY}`
+FROM {_fq(client, BQ_TABLE_ALLAPPS_SUMMARY)}
 WHERE TRUE
 {_vast_filter_sql("VastID")}
 {filter_rm}
@@ -186,8 +211,8 @@ LIMIT @limit OFFSET @offset
         "email": email,
         "vast_csv": vast_csv,
         "report_month": report_literal,
-        "limit": int(limit),
-        "offset": int(offset),
+        "limit": limit,
+        "offset": offset,
     }
     return _run_query(sql, params)
 
@@ -202,15 +227,18 @@ def query_vast_general(
     """
     Fallback for SPGetVastGeneralByUser (compliance/general; includes decommissioned).
     """
+    client = _client()
     vast_csv = _normalize_vast_csv(vast)
+    limit, offset = _sanitize_paging(limit, offset)
+
     sql = f"""
-{_email_to_eid_cte()}
+{_email_to_eid_cte(client)}
 SELECT *
-FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE_VAST_GENERAL}`
+FROM {_fq(client, BQ_TABLE_VAST_GENERAL)}
 WHERE TRUE
 {_vast_filter_sql("VastID")}
 ORDER BY VastID
 LIMIT @limit OFFSET @offset
 """
-    params = {"email": email, "vast_csv": vast_csv, "limit": int(limit), "offset": int(offset)}
+    params = {"email": email, "vast_csv": vast_csv, "limit": limit, "offset": offset}
     return _run_query(sql, params)
