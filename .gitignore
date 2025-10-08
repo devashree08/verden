@@ -1,18 +1,14 @@
 """
-Tool: get_all_apps_summary_by_user  -> dbo.SPGetAllAppsSummaryByUser
-- Historical monthly snapshots (current month until freeze)
-- Optional VAST filter
-- Optional report_month ('YYYY-MM' or 'Month YYYY' → 'YYYY-MM-01 00:00:00')
+Tool: get_vast_general_by_user  -> dbo.SPGetVastGeneralByUser
+- General/compliance data for VASTs (includes decommissioned)
 - Pydantic validation & normalization for inputs
 """
 
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Union
-from datetime import datetime
 
 from fastmcp import Context
 from pydantic import BaseModel, field_validator
-from dateutil import parser as dtparse
 
 from framework.core.registry import mcp
 from framework.core.config import DB_BACKEND
@@ -34,26 +30,8 @@ class _WithPaging(BaseModel):
         return max(0, v)
 
 
-def _normalize_month_literal(v: Any) -> Optional[str]:
-    if v is None:
-        return None
-    s = str(v).strip()
-    if not s:
-        return None
-    try:
-        if len(s) == 7 and s[4] == "-":  # YYYY-MM
-            year = int(s[0:4]); month = int(s[5:7])
-            dt = datetime(year, month, 1)
-        else:
-            dt = dtparse.parse(s).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
-
-
-class AllAppsSummaryParams(_WithPaging):
+class VastGeneralParams(_WithPaging):
     vast: Optional[Union[str, List[Union[int, str]]]] = None
-    report_month: Optional[str] = None
 
     @field_validator("vast", mode="before")
     @classmethod
@@ -75,43 +53,26 @@ class AllAppsSummaryParams(_WithPaging):
         s = str(v).strip()
         return s or None
 
-    @field_validator("report_month", mode="before")
-    @classmethod
-    def normalize_month(cls, v: Any) -> Optional[str]:
-        return _normalize_month_literal(v)
-
 
 @mcp.tool(
-    name="get_all_apps_summary_by_user",
+    name="get_vast_general_by_user",
     description=(
-        "Return historical monthly summaries for the caller's accessible VASTs. "
-        "Supports an optional month filter (e.g., '2024-02' or 'February 2024')."
+        "Return general/compliance attributes (SOX, PCI, rankings, etc.) "
+        "for the caller's accessible VASTs. Includes decommissioned."
     ),
     output_schema=ROWS_OUTPUT,
 )
-async def get_all_apps_summary_by_user(
-    params: AllAppsSummaryParams,
+async def get_vast_general_by_user(
+    params: VastGeneralParams,
     ctx: Context,
 ) -> Dict[str, List[Dict[str, Any]]]:
     email = (ctx.get_state("email") or "").lower()
 
     if DB_BACKEND == "mssql":
-        from framework.adapters.mssql import call_sp_allapps_summary as run_query
-        rows = run_query(
-            email=email,
-            vast=params.vast,
-            report_month=params.report_month,
-            limit=params.limit,
-            offset=params.offset,
-        )
+        from framework.adapters.mssql import call_sp_vast_general as run_query
+        rows = run_query(email=email, vast=params.vast, limit=params.limit, offset=params.offset)
     else:
-        from framework.adapters.bigquery import query_allapps_summary as run_query
-        rows = run_query(
-            email=email,
-            vast=params.vast,
-            report_month=params.report_month,
-            limit=params.limit,
-            offset=params.offset,
-        )
+        from framework.adapters.bigquery import query_vast_general as run_query
+        rows = run_query(email=email, vast=params.vast, limit=params.limit, offset=params.offset)
 
     return {"rows": rows}
