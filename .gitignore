@@ -1,62 +1,53 @@
-"""Database adapters: MSSQL primary, BigQuery fallback."""
-# Import lazily in code where used to avoid import-time side effects.
-# from .mssql import MsSqlAdapter
-# from .bigquery import BigQueryAdapter
+"""
+Sample reference TOOL for developers.
 
-__all__ = []  # keep empty; adapters are imported explicitly where needed
+- Shows @mcp.tool usage
+- Reads caller email from request context (set by EmailClaimMiddleware)
+- Uses our standard output shape: { "rows": [ ... ] }
+"""
+
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Union
+
+from fastmcp import mcp, Context
+from framework.schemas.outputs import ROWS_OUTPUT
 
 
-
-"""JSON Schema dicts for tool inputs/outputs (single source of truth)."""
-from .inputs import (
-    COMMON_DEFS,
-    GET_ALL_APPS_VALUE_BY_USER,
-    GET_ALL_APPS_SUMMARY_BY_USER,
-    GET_VAST_GENERAL_BY_USER,
+@mcp.tool(
+    name="sample_echo",
+    description=(
+        "Echo back normalized inputs for debugging/demo. "
+        "Demonstrates context access (caller email) and the standard {rows:[...]} output."
+    ),
+    output_schema=ROWS_OUTPUT,  # advertise our unified output shape
 )
-from .outputs import ROWS_OUTPUT
+async def sample_echo(
+    ctx: Context,
+    vast: Optional[Union[str, List[Union[int, str]]]] = None,
+    limit: int = 1000,
+    offset: int = 0,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Args:
+        ctx: FastMCP request context (provides access token, state, headers).
+        vast: Optional VAST IDs (CSV string or array). We don't normalize here—just echo.
+        limit: Row limit (ignored in this sample).
+        offset: Row offset (ignored in this sample).
 
-__all__ = [
-    "COMMON_DEFS",
-    "GET_ALL_APPS_VALUE_BY_USER",
-    "GET_ALL_APPS_SUMMARY_BY_USER",
-    "GET_VAST_GENERAL_BY_USER",
-    "ROWS_OUTPUT",
-]
+    Returns:
+        { "rows": [ { "email": <caller>, "vast": <as-passed>, "limit": X, "offset": Y } ] }
+    """
+    # Caller identity provided by our EmailClaimMiddleware (Step 3).
+    email = (ctx.get_state("email") or "").lower()
 
-
-
-
-"""Project layer: tools, resources, prompts."""
-__all__ = ["tools", "resources", "prompts"]
-
-
-
-"""Tool entrypoints (one file per tool)."""
-# Import tools here ONLY when you want side-effect registration via decorators.
-# Example (later):
-# from .sample_echo_tool import echo  # noqa: F401
-# from .get_all_apps_value_by_user import get_all_apps_value_by_user  # noqa: F401
-
-__all__ = []
-
-"""Prompt definitions for agents (optional)."""
-__all__ = []
-
-
-"""Resources (e.g., describe_fields) and static field dictionaries."""
-# Example (later):
-# from .describe_fields import describe_fields  # noqa: F401
-
-__all__ = []
-
-
-"""Tool entrypoints (one file per tool)."""
-# Import tools here ONLY when you want side-effect registration via decorators.
-# Example (later):
-# from .sample_echo_tool import echo  # noqa: F401
-# from .get_all_apps_value_by_user import get_all_apps_value_by_user  # noqa: F401
-
-__all__ = []
-
-
+    return {
+        "rows": [
+            {
+                "email": email,
+                "vast": vast,
+                "limit": limit,
+                "offset": offset,
+                "note": "This is a reference tool; copy the pattern for real tools.",
+            }
+        ]
+    }
