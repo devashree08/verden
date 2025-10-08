@@ -1,8 +1,8 @@
 schema_version: 1
-tool: get_all_apps_value_by_user
-temporal_scope: current
+tool: get_all_apps_summary_by_user
+temporal_scope: monthly_snapshot
 last_updated: 2025-10-08
-notes: "Daily snapshot of current month; vulnerability/asset counts by VAST."
+notes: "Historical monthly snapshots (frozen at month-end); combines general + counts."
 
 fields:
   - name: VastID
@@ -11,26 +11,27 @@ fields:
     bq_type: INT64
     description: "Unique identifier of the VAST."
     canonical_source: get_vast_general_by_user
-    temporal_scope: current
-    also_available_in: [get_all_apps_summary_by_user]
+    temporal_scope: monthly_snapshot
+    also_available_in: [get_all_apps_value_by_user]
+    nullable: false
+
+  - name: ReportMonth
+    type: datetime
+    mssql_type: datetime
+    bq_type: DATETIME
+    description: "Snapshot month (literal 'YYYY-MM-01 00:00:00')."
+    canonical_source: get_all_apps_summary_by_user
+    temporal_scope: monthly_snapshot
+    also_available_in: []
     nullable: false
 
   - name: CriticalVulnCount
     type: int
     mssql_type: int
     bq_type: INT64
-    description: "Number of open critical vulnerabilities for the VAST (current month snapshot)."
-    canonical_source: get_all_apps_value_by_user
-    temporal_scope: current
-    also_available_in: [get_all_apps_summary_by_user]
+    description: "Number of open critical vulnerabilities for the VAST at snapshot month."
+    canonical_source: get_all_apps_summary_by_user
+    temporal_scope: monthly_snapshot
+    also_available_in: [get_all_apps_value_by_user]
     nullable: true
 
-  - name: HighVulnCount
-    type: int
-    mssql_type: int
-    bq_type: INT64
-    description: "Number of open high-severity vulnerabilities for the VAST (current month snapshot)."
-    canonical_source: get_all_apps_value_by_user
-    temporal_scope: current
-    also_available_in: [get_all_apps_summary_by_user]
-    nullable: true
