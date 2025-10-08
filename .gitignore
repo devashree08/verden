@@ -1,29 +1,53 @@
 """
-Sample reference RESOURCE for developers.
+Sample reference PROMPT for developers.
 
-- Shows @mcp.resource usage
-- Returns a tiny static doc developers can expand or replace
+- Shows @mcp.prompt usage
+- Useful for giving the agent canned guidance (escalation, style, glossary, etc.)
 """
 
 from __future__ import annotations
-from typing import Any, Dict
-
 from fastmcp import mcp
 
 
-@mcp.resource("doc://sample")
-async def sample_doc() -> Dict[str, Any]:
+@mcp.prompt(name="sample_escalation_prompt", description="Simple escalation guidance for testing.")
+async def sample_escalation_prompt() -> str:
     """
     Returns:
-        A small JSON-ish document. In real code, you might pull structured text,
-        JSON, or load YAML and convert to JSON for the client.
+        A short, plain-text prompt string. Clients can read and use it when composing messages.
     """
-    return {
-        "title": "Sample Developer Doc",
-        "purpose": "Demonstrate how to expose read-only resources over MCP.",
-        "see_also": [
-            "resources/describe_fields.py (field dictionaries)",
-            "tools/sample_echo_tool.py",
-            "prompts/sample_prompt.py",
-        ],
-    }
+    return (
+        "If the user asks for actions beyond their access, explain the limitation clearly. "
+        "Offer safe alternatives (e.g., contact owner, request access). "
+        "Avoid leaking internal identifiers unless necessary for triage."
+    )
+
+
+
+
+"""Tool entrypoints (one file per tool)."""
+
+# Side-effect imports so decorator registration happens on module import
+from .sample_echo_tool import sample_echo  # noqa: F401
+
+__all__ = ["sample_echo"]
+
+
+
+
+"""Resources (e.g., describe_fields) and static field dictionaries."""
+
+# Side-effect imports so decorator registration happens on module import
+from .sample_resource import sample_doc  # noqa: F401
+
+__all__ = ["sample_doc"]
+
+
+    # 4) (Later) import tools/resources so decorators register with this server
+    try:
+        # Reference examples (Step 7A)
+        import server.tools  # noqa: F401  (triggers sample tool registration)
+        import server.resources  # noqa: F401  (triggers sample resource registration)
+        import server.prompts  # noqa: F401  (prompts are discoverable too)
+    except Exception as exc:  # pragma: no cover
+        log.exception("Tool/resource registration failed: %s", exc)
+        raise
