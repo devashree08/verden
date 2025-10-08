@@ -1,53 +1,23 @@
-from __future__ import annotations
-import logging
+APP_LOG_LEVEL=INFO
+DB_PRIMARY=mssql
 
-from fastmcp import FastMCP
+# OIDC
+OIDC_ISSUER_URI=https://keycloak.example.com/realms/yourrealm
+OIDC_JWKS_URI=https://keycloak.example.com/realms/yourrealm/protocol/openid-connect/certs
+OIDC_ALLOWED_AUDIENCE=mcp-service
+OIDC_CLIENT_ID=mcp-service
 
-from .config import SERVICE_NAME, HOST, PORT, HTTP_PATH
-from .logging import setup_logging
-from ..auth.oidc import build_jwt_verifier, EmailClaimMiddleware
+# SQL Server
+SQLSERVER_HOST=sql.internal.corp
+SQLSERVER_PORT=1433
+SQLSERVER_DATABASE=YourDb
+SQLSERVER_USERNAME=mcp_app
+SQLSERVER_PASSWORD=REDACTED
+ALLOW_INSECURE_SQL_ENCRYPTION=true
 
-
-def create_server() -> FastMCP:
-    """
-    Build the FastMCP server instance with JWT auth and our email-claim middleware.
-    Tools/resources are imported here (later) so decorator registration runs.
-    """
-    setup_logging()
-    log = logging.getLogger(__name__)
-
-    # 1) Auth: Keycloak OIDC via FastMCP's JWT verifier
-    auth_provider = build_jwt_verifier()
-
-    # 2) Server
-    mcp = FastMCP(name=SERVICE_NAME, auth=auth_provider)
-
-    # 3) Middleware: require `email` claim and publish it to request context
-    mcp.add_middleware(EmailClaimMiddleware())
-
-    # 4) (Later) import tools/resources so decorators register with this server
-    try:
-        # Example (when we add them):
-        # from server.tools import sample_echo_tool  # noqa: F401
-        # from server.resources import describe_fields  # noqa: F401
-        pass
-    except Exception as exc:  # pragma: no cover
-        log.exception("Tool/resource registration failed: %s", exc)
-        raise
-
-    return mcp
-
-
-def main() -> None:
-    mcp = create_server()
-    # HTTP transport on a single base path (clients use /mcp/ for discovery + calls)
-    mcp.run(
-        transport="http",   # string per FastMCP; no server-side transport import needed
-        host=HOST,
-        port=PORT,
-        path=HTTP_PATH,     # e.g., "/mcp/"
-    )
-
-
-if __name__ == "__main__":
-    main()
+# BigQuery (fallback)
+BQ_PROJECT_ID=your-gcp-project
+BQ_DATASET=security
+BQ_TABLE_ALLAPPS_VALUE=allapps_value
+BQ_TABLE_ALLAPPS_SUMMARY=allapps_summary
+BQ_TABLE_VAST_GENERAL=vast_general
