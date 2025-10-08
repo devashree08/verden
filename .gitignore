@@ -1,86 +1,18 @@
-"""
-Centralized config (read from environment). Keep it boring and explicit.
-No secrets are hardcoded; Cloud Run injects env/Secrets, and local dev can use .env.
-"""
-
-from __future__ import annotations
-import os
-from typing import Final
-
-# --- Service identity / HTTP ---
-SERVICE_NAME: Final[str] = os.getenv("SERVICE_NAME", "j9cv-VCSChatbot-mcp")
-HOST: Final[str] = os.getenv("HOST", "0.0.0.0")
-PORT: Final[int] = int(os.getenv("PORT", "8080"))
-HTTP_PATH: Final[str] = os.getenv("HTTP_PATH", "/mcp/")  # MCP HTTP base path
-
-# --- Logging ---
-LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO").upper()
-
-# --- Backend selection ---
-# mssql | bigquery  (we’ll switch adapters based on this)
-DB_BACKEND: Final[str] = os.getenv("DB_BACKEND", "mssql").lower()
-
-# --- OIDC / Keycloak ---
-# Example issuer: https://keycloak.example.com/realms/yourrealm
-OIDC_ISSUER_URI: Final[str] = os.getenv("OIDC_ISSUER_URI", "")
-OIDC_JWKS_URI: Final[str] = os.getenv("OIDC_JWKS_URI", "")
-OIDC_ALLOWED_AUDIENCE: Final[str] = os.getenv("OIDC_ALLOWED_AUDIENCE", "mcp-service")
-OIDC_CLIENT_ID: Final[str] = os.getenv("OIDC_CLIENT_ID", "mcp-service")
-
-# Auth policy knobs
-JWKS_CACHE_TTL: Final[int] = int(os.getenv("JWKS_CACHE_TTL", "900"))          # seconds
-CLOCK_SKEW_TOLERANCE: Final[int] = int(os.getenv("CLOCK_SKEW_TOLERANCE", "120"))  # seconds
-REQUIRE_EMAIL_CLAIM: Final[bool] = os.getenv("REQUIRE_EMAIL_CLAIM", "true").lower() == "true"
-
-# Optional allowlist if you run multiple realms (leave empty to disable)
-ALLOWED_ISSUERS: Final[list[str]] = [s for s in os.getenv("ALLOWED_ISSUERS", "").split(",") if s]
-
-# --- SQL Server (primary) ---
-SQLSERVER_HOST: Final[str] = os.getenv("SQLSERVER_HOST", "")
-SQLSERVER_PORT: Final[int] = int(os.getenv("SQLSERVER_PORT", "1433"))
-SQLSERVER_DATABASE: Final[str] = os.getenv("SQLSERVER_DATABASE", "")
-SQLSERVER_USERNAME: Final[str] = os.getenv("SQLSERVER_USERNAME", "")
-SQLSERVER_PASSWORD: Final[str] = os.getenv("SQLSERVER_PASSWORD", "")
-
-# Encryption policy (your org allows insecure to reach on-prem)
-# If true: use Encrypt=no;TrustServerCertificate=yes (ODBC 18)
-ALLOW_INSECURE_SQL_ENCRYPTION: Final[bool] = os.getenv("ALLOW_INSECURE_SQL_ENCRYPTION", "true").lower() == "true"
-
-# --- BigQuery (fallback) ---
-BQ_PROJECT_ID: Final[str] = os.getenv("BQ_PROJECT_ID", "")
-BQ_DATASET: Final[str] = os.getenv("BQ_DATASET", "")
-BQ_TABLE_ALLAPPS_VALUE: Final[str] = os.getenv("BQ_TABLE_ALLAPPS_VALUE", "allapps_value")
-BQ_TABLE_ALLAPPS_SUMMARY: Final[str] = os.getenv("BQ_TABLE_ALLAPPS_SUMMARY", "allapps_summary")
-BQ_TABLE_VAST_GENERAL: Final[str] = os.getenv("BQ_TABLE_VAST_GENERAL", "vast_general")
-
-
-
-
-
-# Logging / runtime
+# Logging / switching
 LOG_LEVEL=INFO
-DB_BACKEND=mssql
-HOST=0.0.0.0
-PORT=8080
-HTTP_PATH=/mcp/
-SERVICE_NAME=j9cv-VCSChatbot-mcp
+DB_BACKEND=mssql   # mssql | bigquery
 
-# OIDC (Keycloak)
+# OIDC (Keycloak) – public metadata, not secrets
 OIDC_ISSUER_URI=https://keycloak.example.com/realms/yourrealm
 OIDC_JWKS_URI=https://keycloak.example.com/realms/yourrealm/protocol/openid-connect/certs
 OIDC_ALLOWED_AUDIENCE=mcp-service
-OIDC_CLIENT_ID=mcp-service
-JWKS_CACHE_TTL=900
-CLOCK_SKEW_TOLERANCE=120
-REQUIRE_EMAIL_CLAIM=true
-# ALLOWED_ISSUERS=   # optional comma-separated allowlist; leave empty to disable
 
 # SQL Server (primary)
 SQLSERVER_HOST=sql.internal.corp
 SQLSERVER_PORT=1433
 SQLSERVER_DATABASE=YourDb
-SQLSERVER_USERNAME=mcp_app
-SQLSERVER_PASSWORD=REDACTED
+SQLSERVER_USERNAME=REDACTED   # store real value in Secret Manager
+SQLSERVER_PASSWORD=REDACTED   # store real value in Secret Manager
 ALLOW_INSECURE_SQL_ENCRYPTION=true
 
 # BigQuery (fallback)
@@ -89,6 +21,3 @@ BQ_DATASET=security
 BQ_TABLE_ALLAPPS_VALUE=allapps_value
 BQ_TABLE_ALLAPPS_SUMMARY=allapps_summary
 BQ_TABLE_VAST_GENERAL=vast_general
-
-
-
