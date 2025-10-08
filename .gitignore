@@ -1,6 +1,7 @@
 """
-Tool: get_vast_general_by_user  -> dbo.SPGetVastGeneralByUser
-- General/compliance data for VASTs (includes decommissioned)
+Tool: get_all_apps_value_by_user  -> dbo.SPGetAllAppsValueByUser
+- Current-month, daily snapshot
+- Optional VAST filter (CSV or list)
 - Pydantic validation & normalization for inputs
 """
 
@@ -8,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Union
 
 from fastmcp import Context
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from framework.core.registry import mcp
 from framework.core.config import DB_BACKEND
@@ -16,8 +17,19 @@ from framework.schemas.outputs import ROWS_OUTPUT
 
 
 class _WithPaging(BaseModel):
-    limit: int = 1000
-    offset: int = 0
+    limit: int = Field(
+        default=1000,
+        description="Max rows to return (1–15000).",
+        ge=1,
+        le=15000,
+        examples=[100, 1000, 5000],
+    )
+    offset: int = Field(
+        default=0,
+        description="Row offset for pagination (>= 0).",
+        ge=0,
+        examples=[0, 100, 1000],
+    )
 
     @field_validator("limit")
     @classmethod
@@ -30,8 +42,12 @@ class _WithPaging(BaseModel):
         return max(0, v)
 
 
-class VastGeneralParams(_WithPaging):
-    vast: Optional[Union[str, List[Union[int, str]]]] = None
+class AllAppsValueParams(_WithPaging):
+    vast: Optional[Union[str, List[Union[int, str]]]] = Field(
+        default=None,
+        description="VAST IDs to filter. Accepts CSV string ('101,202') or array (['101','202']). Omit for all allowed VASTs.",
+        examples=["101,202", ["101", "202"]],
+    )
 
     @field_validator("vast", mode="before")
     @classmethod
@@ -55,24 +71,25 @@ class VastGeneralParams(_WithPaging):
 
 
 @mcp.tool(
-    name="get_vast_general_by_user",
+    name="get_all_apps_value_by_user",
     description=(
-        "Return general/compliance attributes (SOX, PCI, rankings, etc.) "
-        "for the caller's accessible VASTs. Includes decommissioned."
+        "Return current-month application vulnerability counts for the caller's accessible VASTs. "
+        "Optionally filter by VAST IDs."
     ),
     output_schema=ROWS_OUTPUT,
 )
-async def get_vast_general_by_user(
-    params: VastGeneralParams,
+async def get_all_apps_value_by_user(
+    params: AllAppsValueParams,
     ctx: Context,
 ) -> Dict[str, List[Dict[str, Any]]]:
     email = (ctx.get_state("email") or "").lower()
 
     if DB_BACKEND == "mssql":
-        from framework.adapters.mssql import call_sp_vast_general as run_query
+        from framework.adapters.mssql import call_sp_allapps_value as run_query
         rows = run_query(email=email, vast=params.vast, limit=params.limit, offset=params.offset)
     else:
-        from framework.adapters.bigquery import query_vast_general as run_query
+        from framework.adapters.bigquery import query_allapps_value as run_query
         rows = run_query(email=email, vast=params.vast, limit=params.limit, offset=params.offset)
 
     return {"rows": rows}
+
