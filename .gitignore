@@ -1,82 +1,58 @@
 """
-Authentication wiring for Keycloak OIDC using FastMCP's built-in JWT verifier,
-plus a small middleware that enforces `email` claim and publishes it to context state.
+Server bootstrap: assemble FastMCP, register auth + middleware, and (later) register tools/resources.
 
-Why this approach?
-- We let FastMCP validate Bearer tokens against JWKS/issuer/audience (battle-tested).
-- We add one small policy layer for our app (email required + optional issuer allowlist).
-Docs:
-- Authentication providers & JWTVerifier: gofastmcp.com/servers/auth/authentication
-- Middleware & context state: gofastmcp.com/servers/middleware and /servers/context
+Run locally:
+    uv run python -m framework.core.bootstrap
+Then connect MCP Inspector to http://localhost:8080/mcp/
 """
 
 from __future__ import annotations
 import logging
-from typing import Optional
 
-from fastmcp.server.auth.providers.jwt import JWTVerifier
-from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp import FastMCP
+from fastmcp.server.transport import Transport  # enum-like strings for run()
 
-from ..core.config import (
-    OIDC_JWKS_URI,
-    OIDC_ISSUER_URI,
-    OIDC_ALLOWED_AUDIENCE,
-    REQUIRE_EMAIL_CLAIM,
-    ALLOWED_ISSUERS,
-)
-
-log = logging.getLogger(__name__)
+from .config import SERVICE_NAME, HOST, PORT, HTTP_PATH
+from .logging import setup_logging
+from ..auth.oidc import build_jwt_verifier, EmailClaimMiddleware
 
 
-def build_jwt_verifier() -> JWTVerifier:
-    """
-    Configure FastMCP's JWT verifier for Keycloak tokens.
-    The provider reads Authorization: Bearer <JWT> from HTTP requests automatically.
-    """
-    if not (OIDC_JWKS_URI and OIDC_ISSUER_URI and OIDC_ALLOWED_AUDIENCE):
-        raise RuntimeError("JWT auth misconfigured: OIDC_JWKS_URI, OIDC_ISSUER_URI, OIDC_ALLOWED_AUDIENCE are required")
+def create_server() -> FastMCP:
+    setup_logging()
+    log = logging.getLogger(__name__)
 
-    return JWTVerifier(
-        jwks_uri=OIDC_JWKS_URI,
-        issuer=OIDC_ISSUER_URI,
-        audience=OIDC_ALLOWED_AUDIENCE,
+    # 1) Construct server with JWT auth
+    auth_provider = build_jwt_verifier()
+    mcp = FastMCP(name=SERVICE_NAME, auth=auth_provider)
+
+    # 2) Add our small policy middleware (email claim -> context state)
+    mcp.add_middleware(EmailClaimMiddleware())
+
+    # 3) (Later) import tools/resources so decorators register them on this server.
+    #    Keep imports inside function to avoid side-effects during tooling (ruff, pytest).
+    try:
+        # Example: from server.tools import sample_echo_tool  # noqa: F401
+        # For now we don’t import your SQL tools until Step 4.
+        pass
+    except Exception as exc:  # pragma: no cover
+        log.exception("Tool registration failed: %s", exc)
+        raise
+
+    return mcp
+
+
+def main() -> None:
+    mcp = create_server()
+    # HTTP transport with a single endpoint path (default `/mcp/`)
+    # Clients discover/list/call tools over this one path.
+    mcp.run(
+        transport=Transport.HTTP,   # same as transport="http"
+        host=HOST,
+        port=PORT,
+        path=HTTP_PATH,
     )
 
 
-class EmailClaimMiddleware(Middleware):
-    """
-    Enforce presence of `email` claim and expose it to tools via context state.
-
-    Flow:
-      - Token already validated by JWTVerifier (sig/iss/aud/exp).
-      - Extract claims from context (fastmcp stores them in access token metadata).
-      - Optionally enforce issuer allowlist and `email` presence.
-      - Save normalized email for tools under key: "email".
-    """
-
-    async def on_request(self, context: MiddlewareContext, call_next):
-        # FastMCP exposes token info via context.fastmcp_context dependencies.
-        # We'll read it from the auth provider (already parsed).
-        token = context.fastmcp_context.get_access_token()  # returns None if unauthenticated
-        if token is None:
-            return await context.fastmcp_context.error("Unauthorized: missing access token", status=401)
-
-        claims = token.claims or {}
-        iss: Optional[str] = claims.get("iss")
-        email: Optional[str] = claims.get("email") or claims.get("upn") or claims.get("preferred_username")
-
-        # Optional issuer allowlist (defense-in-depth if multiple realms exist)
-        if ALLOWED_ISSUERS and iss not in ALLOWED_ISSUERS:
-            log.warning("Token issuer not allowed", extra={"extra": {"iss": iss}})
-            return await context.fastmcp_context.error("Forbidden: issuer not allowed", status=403)
-
-        # Require an email-style identifier (your stored procs expect @Email NVARCHAR)
-        if REQUIRE_EMAIL_CLAIM and not email:
-            return await context.fastmcp_context.error("Forbidden: email claim missing", status=403)
-
-        # Normalize and publish to context state for tools
-        if email:
-            context.fastmcp_context.set_state("email", email.strip().lower())
-
-        return await call_next()
+if __name__ == "__main__":
+    main()
 
