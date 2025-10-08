@@ -1,3 +1,11 @@
+"""
+Keycloak OIDC for MCP (enterprise-grade, minimal config).
+
+- Validates Authorization: Bearer <JWT> via FastMCP's JWTVerifier
+- Requires an email-style identifier ('email' | 'upn' | 'preferred_username')
+- Publishes normalized email into request context state as "email" for tools
+"""
+
 from __future__ import annotations
 import logging
 from typing import Optional
@@ -30,12 +38,11 @@ def build_jwt_verifier() -> JWTVerifier:
 class EmailClaimMiddleware(Middleware):
     """
     Extract the caller's email from verified JWT claims and stash in request state.
-
     Tools can then read it with:  ctx.get_state("email")
     """
 
+    # ---- Primary request hook (where we enforce/attach email) ----
     async def on_request(self, context: MiddlewareContext, call_next):
-        # Access the verified token via dependency helper (server-side)
         token = get_access_token()
         if token is None:
             return await context.fastmcp_context.error("Unauthorized: missing or invalid access token", status=401)
@@ -46,11 +53,20 @@ class EmailClaimMiddleware(Middleware):
             or claims.get("upn")
             or claims.get("preferred_username")
         )
-
         if not raw_email:
             return await context.fastmcp_context.error("Forbidden: email claim missing", status=403)
 
-        # Correct place to store state for tools: the *FastMCP* context
+        # Store for tools
         context.fastmcp_context.set_state("email", raw_email.strip().lower())
 
+        return await call_next()
+
+    # ---- Pass-through stubs for list phases (avoid signature mismatches) ----
+    async def on_list_tools(self, context: MiddlewareContext, call_next):
+        return await call_next()
+
+    async def on_list_resources(self, context: MiddlewareContext, call_next):
+        return await call_next()
+
+    async def on_list_prompts(self, context: MiddlewareContext, call_next):
         return await call_next()
