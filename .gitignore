@@ -1,154 +1,21 @@
-"""
-Single FastMCP instance for the whole app.
+from fastmcp.server.dependencies import get_access_token  # add this import at top
 
-All tools/resources/prompts should import `mcp` from here and use decorators:
+class EmailClaimMiddleware(Middleware):
+    async def on_request(self, context: MiddlewareContext, call_next):
+        # Get the verified access token (or None)
+        token = get_access_token()  # correct way in current FastMCP
+        if token is None:
+            return await context.fastmcp_context.error("Unauthorized: missing or invalid access token", status=401)
 
-    from framework.core.registry import mcp
-    @mcp.tool
-    async def my_tool(...): ...
+        claims = token.claims or {}
+        raw_email = (
+            claims.get("email")
+            or claims.get("upn")
+            or claims.get("preferred_username")
+        )
 
-Bootstrap will import this same `mcp` and call `mcp.run(...)`.
-"""
+        if not raw_email:
+            return await context.fastmcp_context.error("Forbidden: email claim missing", status=403)
 
-from __future__ import annotations
-from fastmcp import FastMCP
-from ..auth.oidc import build_jwt_verifier
-
-# Construct the server with auth
-mcp = FastMCP(name="MCP Enterprise Server", auth=build_jwt_verifier())
-
-
-
-from __future__ import annotations
-
-# Load .env before any config usage
-from dotenv import load_dotenv, find_dotenv  # type: ignore
-load_dotenv(find_dotenv(usecwd=True), override=False)
-
-import logging
-from .config import SERVICE_NAME, HOST, PORT, HTTP_PATH, LOG_LEVEL
-from .logging import setup_logging
-from .registry import mcp                           # <-- use shared instance
-from ..auth.oidc import EmailClaimMiddleware       # build_jwt_verifier already used in registry
-
-def create_server():
-    setup_logging()
-    log = logging.getLogger(__name__)
-    # Add middleware policy
-    mcp.add_middleware(EmailClaimMiddleware())
-
-    try:
-        # Import modules so decorators execute and register with `mcp`
-        import server.tools       # noqa: F401
-        import server.resources   # noqa: F401
-        import server.prompts     # noqa: F401
-    except Exception as exc:
-        log.exception("Tool/resource registration failed: %s", exc)
-        raise
-
-    return mcp
-
-def main() -> None:
-    create_server()
-    mcp.run(
-        transport="http",   # HTTP transport per docs
-        host=HOST,
-        port=PORT,
-        path=HTTP_PATH,
-    )
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-"""
-Sample reference TOOL.
-
-- Uses @mcp.tool on the shared FastMCP instance
-- Reads caller email from request context (set by middleware)
-- Returns our standard { "rows": [...] } shape
-"""
-
-from __future__ import annotations
-from typing import Any, Dict, List, Optional, Union
-
-from fastmcp import Context                                # <- correct Context import
-from framework.core.registry import mcp                    # <- shared instance
-from framework.schemas.outputs import ROWS_OUTPUT
-
-@mcp.tool(
-    name="sample_echo",
-    description="Echo normalized inputs and caller identity for debugging.",
-    output_schema=ROWS_OUTPUT,
-)
-async def sample_echo(
-    vast: Optional[Union[str, List[Union[int, str]]]] = None,
-    limit: int = 1000,
-    offset: int = 0,
-    ctx: Context | None = None,                           # <- context injection
-) -> Dict[str, List[Dict[str, Any]]]:
-    email = (ctx.get_state("email") if ctx else None) or ""
-    return {
-        "rows": [
-            {
-                "email": email.lower(),
-                "vast": vast,
-                "limit": limit,
-                "offset": offset,
-                "note": "Reference tool; copy this pattern for real tools.",
-            }
-        ]
-    }
-
-
-
-
-
-
-
-"""
-Sample reference RESOURCE (read-only).
-"""
-
-from __future__ import annotations
-from typing import Any, Dict
-
-from fastmcp import Context
-from framework.core.registry import mcp
-
-@mcp.resource("doc://sample")
-async def sample_doc(ctx: Context | None = None) -> Dict[str, Any]:
-    return {
-        "title": "Sample Developer Doc",
-        "purpose": "Demonstrates @mcp.resource usage on a shared server instance.",
-        "see_also": [
-            "resources/describe_fields.py",
-            "tools/sample_echo_tool.py",
-            "prompts/sample_prompt.py",
-        ],
-    }
-
-
-
-
-"""
-Sample reference PROMPT (reusable text).
-"""
-
-from __future__ import annotations
-from fastmcp import Context
-from framework.core.registry import mcp
-
-@mcp.prompt(name="sample_escalation_prompt", description="Simple escalation guidance for testing.")
-async def sample_escalation_prompt(ctx: Context | None = None) -> str:
-    return (
-        "If the user asks for actions beyond their access, explain the limitation clearly. "
-        "Offer safe alternatives (e.g., contact owner, request access). "
-        "Avoid leaking internal identifiers unless necessary for triage."
-    )
-
-
-
-
+        context.fastmcp_context.set_state("email", raw_email.strip().lower())
+        return await call_next()
