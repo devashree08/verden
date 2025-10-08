@@ -1,53 +1,203 @@
-# framework/auth/oidc.py
+"""
+MSSQL adapter (primary path).
+
+- Connects via ODBC 18 using SQL auth (user/password).
+- Calls stored procedures with @Email, @VAST (CSV), @ReportMonth (if applicable).
+- Returns rows as List[Dict[str, Any]].
+- Applies client-side pagination (limit/offset) after fetching.
+"""
 
 from __future__ import annotations
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+import contextlib
+import pyodbc
 import logging
-from typing import Optional
-
-from fastmcp.server.auth.providers.jwt import JWTVerifier
-from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.server.dependencies import get_access_token
+from datetime import datetime
+from dateutil import parser as dtparse
 
 from ..core.config import (
-    OIDC_JWKS_URI,
-    OIDC_ISSUER_URI,
-    OIDC_ALLOWED_AUDIENCE,
+    SQLSERVER_HOST,
+    SQLSERVER_PORT,
+    SQLSERVER_DATABASE,
+    SQLSERVER_USERNAME,
+    SQLSERVER_PASSWORD,
+    ALLOW_INSECURE_SQL_ENCRYPTION,
 )
 
 log = logging.getLogger(__name__)
 
+# Conservative timeouts (seconds)
+_CONNECT_TIMEOUT = 10
+_COMMAND_TIMEOUT = 90
 
-def build_jwt_verifier() -> JWTVerifier:
-    if not (OIDC_JWKS_URI and OIDC_ISSUER_URI and OIDC_ALLOWED_AUDIENCE):
-        raise RuntimeError(
-            "JWT auth misconfigured: OIDC_JWKS_URI, OIDC_ISSUER_URI, and OIDC_ALLOWED_AUDIENCE are required"
-        )
-    return JWTVerifier(
-        jwks_uri=OIDC_JWKS_URI,
-        issuer=OIDC_ISSUER_URI,
-        audience=OIDC_ALLOWED_AUDIENCE,
+
+def _conn_str() -> str:
+    """
+    Build ODBC Driver 18 connection string.
+    Notes:
+      - Encrypt=no;TrustServerCertificate=yes is allowed by ALLOW_INSECURE_SQL_ENCRYPTION.
+      - For secure channels later: set Encrypt=yes;TrustServerCertificate=no.
+    """
+    enc = "no" if ALLOW_INSECURE_SQL_ENCRYPTION else "yes"
+    trust = "yes" if ALLOW_INSECURE_SQL_ENCRYPTION else "no"
+    return (
+        f"Driver={{ODBC Driver 18 for SQL Server}};"
+        f"Server=tcp:{SQLSERVER_HOST},{SQLSERVER_PORT};"
+        f"Database={SQLSERVER_DATABASE};"
+        f"Uid={SQLSERVER_USERNAME};"
+        f"Pwd={SQLSERVER_PASSWORD};"
+        f"Encrypt={enc};"
+        f"TrustServerCertificate={trust};"
+        f"Connection Timeout={_CONNECT_TIMEOUT};"
     )
 
 
-class EmailClaimMiddleware(Middleware):
-    """Extract caller email from verified JWT and stash in request state."""
+@contextlib.contextmanager
+def _connect():
+    cn = pyodbc.connect(_conn_str())
+    try:
+        yield cn
+    finally:
+        with contextlib.suppress(Exception):
+            cn.close()
 
-    async def on_request(self, context: MiddlewareContext, call_next):
-        token = get_access_token()
-        if token is None:
-            return await context.fastmcp_context.error("Unauthorized: missing or invalid access token", status=401)
 
-        claims = token.claims or {}
-        raw_email: Optional[str] = (
-            claims.get("email")
-            or claims.get("upn")
-            or claims.get("preferred_username")
+def _rows_to_dicts(cursor: pyodbc.Cursor, rows: Iterable[Sequence[Any]]) -> List[Dict[str, Any]]:
+    cols = [c[0] for c in cursor.description] if cursor.description else []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append({cols[i]: r[i] for i in range(len(cols))})
+    return out
+
+
+def _normalize_vast_csv(vast: Optional[Union[str, List[Union[int, str]]]]) -> Optional[str]:
+    if vast is None:
+        return None
+    if isinstance(vast, str):
+        s = vast.strip()
+        return s if s else None
+    # list/tuple -> CSV
+    tokens = []
+    for v in vast:
+        if v is None:
+            continue
+        tokens.append(str(v).strip())
+    csv = ",".join(t for t in tokens if t)
+    return csv or None
+
+
+def _normalize_report_month_literal(report_month: Optional[Union[str, datetime]]) -> Optional[str]:
+    """
+    Normalize to the literal format the DB stores: 'YYYY-MM-01 00:00:00'
+    Accepts:
+      - None
+      - 'YYYY-MM'
+      - 'Month YYYY' (e.g., 'February 2024')
+      - datetime
+    """
+    if report_month is None:
+        return None
+    if isinstance(report_month, datetime):
+        return report_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+    s = str(report_month).strip()
+    if not s:
+        return None
+    try:
+        # Try YYYY-MM first (cheap path)
+        if len(s) == 7 and s[4] == "-":
+            year = int(s[0:4])
+            month = int(s[5:7])
+            dt = datetime(year, month, 1)
+        else:
+            dt = dtparse.parse(s)
+            dt = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        # If parsing fails, return None (tools can decide to error if needed)
+        return None
+
+
+def _apply_pagination(rows: List[Dict[str, Any]], limit: int, offset: int) -> List[Dict[str, Any]]:
+    if offset < 0:
+        offset = 0
+    if limit <= 0:
+        return []
+    return rows[offset: offset + limit]
+
+
+def call_sp_allapps_value(
+    *,
+    email: str,
+    vast: Optional[Union[str, List[Union[int, str]]]] = None,
+    limit: int = 1000,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    dbo.SPGetAllAppsValueByUser @Email, @VAST
+    (Current month daily snapshot)
+    """
+    vast_csv = _normalize_vast_csv(vast)
+
+    with _connect() as cn:
+        cursor = cn.cursor()
+        cursor.timeout = _COMMAND_TIMEOUT
+        # exec with named parameters for clarity
+        cursor.execute(
+            "EXEC dbo.SPGetAllAppsValueByUser @Email=?, @VAST=?",
+            (email, vast_csv),
         )
-        if not raw_email:
-            return await context.fastmcp_context.error("Forbidden: email claim missing", status=403)
+        rows = cursor.fetchall()
+        data = _rows_to_dicts(cursor, rows)
+        return _apply_pagination(data, limit, offset)
 
-        # Put normalized email into FastMCP Context state for tools
-        context.fastmcp_context.set_state("email", raw_email.strip().lower())
 
-        # IMPORTANT: pass the context along
-        return await call_next(context)
+def call_sp_allapps_summary(
+    *,
+    email: str,
+    vast: Optional[Union[str, List[Union[int, str]]]] = None,
+    report_month: Optional[Union[str, datetime]] = None,
+    limit: int = 1000,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    dbo.SPGetAllAppsSummaryByUser @Email, @VAST, @ReportMonth
+    (Historical monthly snapshots; optional @ReportMonth)
+    """
+    vast_csv = _normalize_vast_csv(vast)
+    report_literal = _normalize_report_month_literal(report_month)
+
+    with _connect() as cn:
+        cursor = cn.cursor()
+        cursor.timeout = _COMMAND_TIMEOUT
+        cursor.execute(
+            "EXEC dbo.SPGetAllAppsSummaryByUser @Email=?, @VAST=?, @ReportMonth=?",
+            (email, vast_csv, report_literal),
+        )
+        rows = cursor.fetchall()
+        data = _rows_to_dicts(cursor, rows)
+        return _apply_pagination(data, limit, offset)
+
+
+def call_sp_vast_general(
+    *,
+    email: str,
+    vast: Optional[Union[str, List[Union[int, str]]]] = None,
+    limit: int = 1000,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    dbo.SPGetVastGeneralByUser @Email, @VAST
+    (General/compliance details; includes decommissioned)
+    """
+    vast_csv = _normalize_vast_csv(vast)
+
+    with _connect() as cn:
+        cursor = cn.cursor()
+        cursor.timeout = _COMMAND_TIMEOUT
+        cursor.execute(
+            "EXEC dbo.SPGetVastGeneralByUser @Email=?, @VAST=?",
+            (email, vast_csv),
+        )
+        rows = cursor.fetchall()
+        data = _rows_to_dicts(cursor, rows)
+        return _apply_pagination(data, limit, offset)
