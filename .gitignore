@@ -1,7 +1,8 @@
 """
-Tool: get_all_apps_value_by_user  -> dbo.SPGetAllAppsValueByUser
-- Current-month, daily snapshot
-- Optional VAST filter (CSV or array)
+Tool: get_all_apps_summary_by_user  -> dbo.SPGetAllAppsSummaryByUser
+- Historical monthly snapshots
+- Optional VAST filter
+- Optional report_month ('YYYY-MM' or 'Month YYYY' -> 'YYYY-MM-01 00:00:00')
 """
 
 from __future__ import annotations
@@ -10,21 +11,22 @@ from typing import Any, Dict, List, Optional, Union
 from fastmcp import Context
 from framework.core.registry import mcp
 from framework.core.config import DB_BACKEND
-from framework.schemas.inputs import GET_ALL_APPS_VALUE_BY_USER
+from framework.schemas.inputs import GET_ALL_APPS_SUMMARY_BY_USER
 from framework.schemas.outputs import ROWS_OUTPUT
 
 
 @mcp.tool(
-    name="get_all_apps_value_by_user",
+    name="get_all_apps_summary_by_user",
     description=(
-        "Return current-month application vulnerability counts for the caller's accessible VASTs. "
-        "Optionally filter by VAST IDs."
+        "Return historical monthly summary for the caller's accessible VASTs. "
+        "Supports an optional month filter (e.g., '2024-02' or 'February 2024')."
     ),
-    input_schema=GET_ALL_APPS_VALUE_BY_USER,
+    input_schema=GET_ALL_APPS_SUMMARY_BY_USER,
     output_schema=ROWS_OUTPUT,
 )
-async def get_all_apps_value_by_user(
+async def get_all_apps_summary_by_user(
     vast: Optional[Union[str, List[Union[int, str]]]] = None,
+    report_month: Optional[Union[str]] = None,
     limit: int = 1000,
     offset: int = 0,
     ctx: Context = Context.depends(),
@@ -32,10 +34,10 @@ async def get_all_apps_value_by_user(
     email = (ctx.get_state("email") or "").lower()
 
     if DB_BACKEND == "mssql":
-        from framework.adapters.mssql import call_sp_allapps_value as run_query
-        rows = run_query(email=email, vast=vast, limit=limit, offset=offset)
+        from framework.adapters.mssql import call_sp_allapps_summary as run_query
+        rows = run_query(email=email, vast=vast, report_month=report_month, limit=limit, offset=offset)
     else:
-        from framework.adapters.bigquery import query_allapps_value as run_query
-        rows = run_query(email=email, vast=vast, limit=limit, offset=offset)
+        from framework.adapters.bigquery import query_allapps_summary as run_query
+        rows = run_query(email=email, vast=vast, report_month=report_month, limit=limit, offset=offset)
 
     return {"rows": rows}
