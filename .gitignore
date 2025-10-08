@@ -1,156 +1,30 @@
 """
-Input JSON Schemas for MCP tools (single source of truth).
-
-Important:
-- Clients NEVER send `email`. The server extracts it from the OIDC JWT.
-- `vast` may be CSV ("101,202") or an array ([101, 202]); we normalize to CSV.
-- `report_month` accepts "YYYY-MM" or "Month YYYY" (e.g., "February 2024");
-  we normalize to the literal "YYYY-MM-01 00:00:00" (no timezone math).
-- Pagination: limit default 1000, cap 15000; offset default 0.
+Centralized, boring config access. No secrets here—Cloud Run injects them as env vars.
+Other modules import from here so we don’t sprinkle os.getenv everywhere.
 """
 
-# Common $defs reused by all schemas. Keep inline to avoid extra files.
-COMMON_DEFS = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "urn:schemas:mcp:common",
-    "$defs": {
-        "vastCsv": {
-            "type": "string",
-            "title": "VAST IDs (CSV)",
-            "description": "Comma-separated VAST IDs, e.g., '101,202,303'. Whitespace allowed.",
-            "pattern": r"^\s*\d+\s*(\s*,\s*\d+\s*)*$",
-            "examples": ["101,202,303"],
-        },
-        "vastArray": {
-            "type": "array",
-            "title": "VAST IDs (Array)",
-            "description": "Array of VAST IDs; will be normalized to CSV internally.",
-            "items": {
-                "oneOf": [
-                    {"type": "integer", "minimum": 0},
-                    {"type": "string", "pattern": r"^\d+$"},
-                ]
-            },
-            "examples": [[101, 202, 303]],
-        },
-        "vast": {
-            "title": "VAST IDs",
-            "description": (
-                "Optional filter to specific VAST IDs. Accepts CSV string or array. "
-                "If omitted or empty, no VAST filter is applied."
-            ),
-            "oneOf": [{"$ref": "#/$defs/vastCsv"}, {"$ref": "#/$defs/vastArray"}],
-        },
-        "limit": {
-            "type": "integer",
-            "title": "Limit",
-            "minimum": 1,
-            "maximum": 15000,
-            "default": 1000,
-            "description": "Maximum rows to return (1–15000). Default 1000.",
-        },
-        "offset": {
-            "type": "integer",
-            "title": "Offset",
-            "minimum": 0,
-            "default": 0,
-            "description": "Rows to skip before returning results. Default 0.",
-        },
-        "reportMonth": {
-            "type": "string",
-            "title": "Report Month",
-            "description": (
-                "Target month to query. Accepts 'YYYY-MM' (e.g., '2024-02') or natural language like "
-                "'February 2024'. Normalized to 'YYYY-MM-01 00:00:00' before querying."
-            ),
-            "examples": ["2024-02", "February 2024", "2024-02-01 00:00:00"],
-        },
-    },
-}
+from __future__ import annotations
+import os
+from typing import Final
 
-GET_ALL_APPS_VALUE_BY_USER = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "get_all_apps_value_by_user Input",
-    "type": "object",
-    "additionalProperties": False,
-    "description": (
-        "Current month (daily snapshot) rows for the caller. "
-        "Email is extracted from the bearer token; clients must not supply it."
-    ),
-    "properties": {
-        "vast": {"$ref": "urn:schemas:mcp:common#/$defs/vast"},
-        "limit": {"$ref": "urn:schemas:mcp:common#/$defs/limit"},
-        "offset": {"$ref": "urn:schemas:mcp:common#/$defs/offset"},
-    },
-}
 
-GET_ALL_APPS_SUMMARY_BY_USER = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "get_all_apps_summary_by_user Input",
-    "type": "object",
-    "additionalProperties": False,
-    "description": (
-        "Monthly snapshot rows for the caller; includes historical months. "
-        "Email is extracted from the bearer token."
-    ),
-    "properties": {
-        "vast": {"$ref": "urn:schemas:mcp:common#/$defs/vast"},
-        "report_month": {"$ref": "urn:schemas:mcp:common#/$defs/reportMonth"},
-        "limit": {"$ref": "urn:schemas:mcp:common#/$defs/limit"},
-        "offset": {"$ref": "urn:schemas:mcp:common#/$defs/offset"},
-    },
-}
+# --- Service identity ---
+SERVICE_NAME: Final[str] = os.getenv("SERVICE_NAME", "j9cv-VCSChatbot-mcp")
 
-GET_VAST_GENERAL_BY_USER = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "get_vast_general_by_user Input",
-    "type": "object",
-    "additionalProperties": False,
-    "description": (
-        "Compliance/general details for the caller (includes decommissioned VASTs). "
-        "Email is extracted from the bearer token."
-    ),
-    "properties": {
-        "vast": {"$ref": "urn:schemas:mcp:common#/$defs/vast"},
-        "limit": {"$ref": "urn:schemas:mcp:common#/$defs/limit"},
-        "offset": {"$ref": "urn:schemas:mcp:common#/$defs/offset"},
-    },
-}
+# --- HTTP / transport ---
+HOST: Final[str] = os.getenv("HOST", "0.0.0.0")
+PORT: Final[int] = int(os.getenv("PORT", "8080"))
+HTTP_PATH: Final[str] = os.getenv("HTTP_PATH", "/mcp/")  # Streamable HTTP default
 
-"""
-Output JSON Schema for all MCP tools.
+# --- Auth / OIDC (Keycloak) ---
+OIDC_ISSUER_URI: Final[str] = os.getenv("OIDC_ISSUER_URI", "")   # e.g., https://keycloak-cde.acme.com/realm/acme-cde
+OIDC_JWKS_URI: Final[str] = os.getenv("OIDC_JWKS_URI", "")       # e.g., .../protocol/openid-connect/certs
+OIDC_ALLOWED_AUDIENCE: Final[str] = os.getenv("OIDC_ALLOWED_AUDIENCE", "account")  # your “mcp_service_audience”
 
-All tools return a uniform shape:
-{
-  "rows": [ { /* flat columns per row (300–400+) */ } ]
-}
-"""
+# Optional strictness toggles
+REQUIRE_EMAIL_CLAIM: Final[bool] = os.getenv("REQUIRE_EMAIL_CLAIM", "true").lower() == "true"
+ALLOWED_ISSUERS: Final[list[str]] = [s for s in os.getenv("ALLOWED_ISSUERS", "").split(",") if s]  # optional allowlist
 
-ROWS_OUTPUT = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "Standard Rows Output",
-    "type": "object",
-    "required": ["rows"],
-    "additionalProperties": False,
-    "properties": {
-        "rows": {
-            "type": "array",
-            "description": "Result set rows. Each item is a flat object keyed by column name.",
-            "items": {
-                "type": "object",
-                "additionalProperties": {
-                    "description": "Column value",
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "integer"},
-                        {"type": "number"},
-                        {"type": "boolean"},
-                        {"type": "null"},
-                    ],
-                },
-            },
-        }
-    },
-}
-
+# --- Logging ---
+LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO")
 
