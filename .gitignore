@@ -1,30 +1,41 @@
 """
-Centralized, boring config access. No secrets here—Cloud Run injects them as env vars.
-Other modules import from here so we don’t sprinkle os.getenv everywhere.
+Tiny JSON-ish logger setup. Keep it simple and consistent.
 """
 
 from __future__ import annotations
-import os
-from typing import Final
+import json
+import logging
+import sys
+from typing import Any
+
+from .config import LOG_LEVEL, SERVICE_NAME
 
 
-# --- Service identity ---
-SERVICE_NAME: Final[str] = os.getenv("SERVICE_NAME", "j9cv-VCSChatbot-mcp")
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        base = {
+            "service": SERVICE_NAME,
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+        # Add extras if present
+        if record.exc_info:
+            base["exc_info"] = self.formatException(record.exc_info)
+        if hasattr(record, "extra") and isinstance(record.extra, dict):
+            base.update(record.extra)  # type: ignore[reportAny]
+        return json.dumps(base, ensure_ascii=False)
 
-# --- HTTP / transport ---
-HOST: Final[str] = os.getenv("HOST", "0.0.0.0")
-PORT: Final[int] = int(os.getenv("PORT", "8080"))
-HTTP_PATH: Final[str] = os.getenv("HTTP_PATH", "/mcp/")  # Streamable HTTP default
 
-# --- Auth / OIDC (Keycloak) ---
-OIDC_ISSUER_URI: Final[str] = os.getenv("OIDC_ISSUER_URI", "")   # e.g., https://keycloak-cde.acme.com/realm/acme-cde
-OIDC_JWKS_URI: Final[str] = os.getenv("OIDC_JWKS_URI", "")       # e.g., .../protocol/openid-connect/certs
-OIDC_ALLOWED_AUDIENCE: Final[str] = os.getenv("OIDC_ALLOWED_AUDIENCE", "account")  # your “mcp_service_audience”
+def setup_logging() -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_JsonFormatter())
 
-# Optional strictness toggles
-REQUIRE_EMAIL_CLAIM: Final[bool] = os.getenv("REQUIRE_EMAIL_CLAIM", "true").lower() == "true"
-ALLOWED_ISSUERS: Final[list[str]] = [s for s in os.getenv("ALLOWED_ISSUERS", "").split(",") if s]  # optional allowlist
+    root = logging.getLogger()
+    root.setLevel(LOG_LEVEL)
+    root.handlers.clear()
+    root.addHandler(handler)
 
-# --- Logging ---
-LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO")
+    # Quiet down chatty libs in prod defaults
+    logging.getLogger("httpx").setLevel("WARNING")
+    logging.getLogger("fastmcp").setLevel("INFO")
 
