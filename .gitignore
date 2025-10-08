@@ -1,15 +1,18 @@
 """
-Tool: get_all_apps_value_by_user  -> dbo.SPGetAllAppsValueByUser
-- Current-month, daily snapshot
-- Optional VAST filter (CSV or list)
+Tool: get_all_apps_summary_by_user  -> dbo.SPGetAllAppsSummaryByUser
+- Historical monthly snapshots (current month until freeze)
+- Optional VAST filter
+- Optional report_month ('YYYY-MM' or 'Month YYYY' → 'YYYY-MM-01 00:00:00')
 - Pydantic validation & normalization for inputs
 """
 
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Union
+from datetime import datetime
 
 from fastmcp import Context
 from pydantic import BaseModel, Field, field_validator
+from dateutil import parser as dtparse
 
 from framework.core.registry import mcp
 from framework.core.config import DB_BACKEND
@@ -42,11 +45,33 @@ class _WithPaging(BaseModel):
         return max(0, v)
 
 
-class AllAppsValueParams(_WithPaging):
+def _normalize_month_literal(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        if len(s) == 7 and s[4] == "-":  # YYYY-MM
+            year = int(s[0:4]); month = int(s[5:7])
+            dt = datetime(year, month, 1)
+        else:
+            dt = dtparse.parse(s).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+class AllAppsSummaryParams(_WithPaging):
     vast: Optional[Union[str, List[Union[int, str]]]] = Field(
         default=None,
         description="VAST IDs to filter. Accepts CSV string ('101,202') or array (['101','202']). Omit for all allowed VASTs.",
         examples=["101,202", ["101", "202"]],
+    )
+    report_month: Optional[str] = Field(
+        default=None,
+        description="Target month. Accepts 'YYYY-MM' or natural language like 'February 2024'. Normalized to 'YYYY-MM-01 00:00:00'.",
+        examples=["2024-02", "February 2024"],
     )
 
     @field_validator("vast", mode="before")
@@ -69,27 +94,43 @@ class AllAppsValueParams(_WithPaging):
         s = str(v).strip()
         return s or None
 
+    @field_validator("report_month", mode="before")
+    @classmethod
+    def normalize_month(cls, v: Any) -> Optional[str]:
+        return _normalize_month_literal(v)
+
 
 @mcp.tool(
-    name="get_all_apps_value_by_user",
+    name="get_all_apps_summary_by_user",
     description=(
-        "Return current-month application vulnerability counts for the caller's accessible VASTs. "
-        "Optionally filter by VAST IDs."
+        "Return historical monthly summaries for the caller's accessible VASTs. "
+        "Supports an optional month filter (e.g., '2024-02' or 'February 2024')."
     ),
     output_schema=ROWS_OUTPUT,
 )
-async def get_all_apps_value_by_user(
-    params: AllAppsValueParams,
+async def get_all_apps_summary_by_user(
+    params: AllAppsSummaryParams,
     ctx: Context,
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> Dict[str, List[Dict[str, Any]]]]:
     email = (ctx.get_state("email") or "").lower()
 
     if DB_BACKEND == "mssql":
-        from framework.adapters.mssql import call_sp_allapps_value as run_query
-        rows = run_query(email=email, vast=params.vast, limit=params.limit, offset=params.offset)
+        from framework.adapters.mssql import call_sp_allapps_summary as run_query
+        rows = run_query(
+            email=email,
+            vast=params.vast,
+            report_month=params.report_month,
+            limit=params.limit,
+            offset=params.offset,
+        )
     else:
-        from framework.adapters.bigquery import query_allapps_value as run_query
-        rows = run_query(email=email, vast=params.vast, limit=params.limit, offset=params.offset)
+        from framework.adapters.bigquery import query_allapps_summary as run_query
+        rows = run_query(
+            email=email,
+            vast=params.vast,
+            report_month=params.report_month,
+            limit=params.limit,
+            offset=params.offset,
+        )
 
     return {"rows": rows}
-
