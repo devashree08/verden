@@ -1,53 +1,29 @@
 """
-Sample reference TOOL for developers.
+Sample reference RESOURCE for developers.
 
-- Shows @mcp.tool usage
-- Reads caller email from request context (set by EmailClaimMiddleware)
-- Uses our standard output shape: { "rows": [ ... ] }
+- Shows @mcp.resource usage
+- Returns a tiny static doc developers can expand or replace
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict
 
-from fastmcp import mcp, Context
-from framework.schemas.outputs import ROWS_OUTPUT
+from fastmcp import mcp
 
 
-@mcp.tool(
-    name="sample_echo",
-    description=(
-        "Echo back normalized inputs for debugging/demo. "
-        "Demonstrates context access (caller email) and the standard {rows:[...]} output."
-    ),
-    output_schema=ROWS_OUTPUT,  # advertise our unified output shape
-)
-async def sample_echo(
-    ctx: Context,
-    vast: Optional[Union[str, List[Union[int, str]]]] = None,
-    limit: int = 1000,
-    offset: int = 0,
-) -> Dict[str, List[Dict[str, Any]]]:
+@mcp.resource("doc://sample")
+async def sample_doc() -> Dict[str, Any]:
     """
-    Args:
-        ctx: FastMCP request context (provides access token, state, headers).
-        vast: Optional VAST IDs (CSV string or array). We don't normalize here—just echo.
-        limit: Row limit (ignored in this sample).
-        offset: Row offset (ignored in this sample).
-
     Returns:
-        { "rows": [ { "email": <caller>, "vast": <as-passed>, "limit": X, "offset": Y } ] }
+        A small JSON-ish document. In real code, you might pull structured text,
+        JSON, or load YAML and convert to JSON for the client.
     """
-    # Caller identity provided by our EmailClaimMiddleware (Step 3).
-    email = (ctx.get_state("email") or "").lower()
-
     return {
-        "rows": [
-            {
-                "email": email,
-                "vast": vast,
-                "limit": limit,
-                "offset": offset,
-                "note": "This is a reference tool; copy the pattern for real tools.",
-            }
-        ]
+        "title": "Sample Developer Doc",
+        "purpose": "Demonstrate how to expose read-only resources over MCP.",
+        "see_also": [
+            "resources/describe_fields.py (field dictionaries)",
+            "tools/sample_echo_tool.py",
+            "prompts/sample_prompt.py",
+        ],
     }
