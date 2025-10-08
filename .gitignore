@@ -1,41 +1,62 @@
-"""
-Centralized config (env-driven). Keep this tiny.
-"""
+"""Database adapters: MSSQL primary, BigQuery fallback."""
+# Import lazily in code where used to avoid import-time side effects.
+# from .mssql import MsSqlAdapter
+# from .bigquery import BigQueryAdapter
 
-from __future__ import annotations
-import os
-from typing import Final
+__all__ = []  # keep empty; adapters are imported explicitly where needed
 
-# Logging / runtime
-LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Backend switch: mssql | bigquery
-DB_BACKEND: Final[str] = os.getenv("DB_BACKEND", "mssql").lower()
 
-# OIDC (Keycloak) – public metadata
-OIDC_ISSUER_URI: Final[str] = os.getenv("OIDC_ISSUER_URI", "")
-OIDC_JWKS_URI: Final[str] = os.getenv("OIDC_JWKS_URI", "")
-OIDC_ALLOWED_AUDIENCE: Final[str] = os.getenv("OIDC_ALLOWED_AUDIENCE", "mcp-service")
+"""JSON Schema dicts for tool inputs/outputs (single source of truth)."""
+from .inputs import (
+    COMMON_DEFS,
+    GET_ALL_APPS_VALUE_BY_USER,
+    GET_ALL_APPS_SUMMARY_BY_USER,
+    GET_VAST_GENERAL_BY_USER,
+)
+from .outputs import ROWS_OUTPUT
 
-# SQL Server (primary)
-SQLSERVER_HOST: Final[str] = os.getenv("SQLSERVER_HOST", "")
-SQLSERVER_PORT: Final[int] = int(os.getenv("SQLSERVER_PORT", "1433"))
-SQLSERVER_DATABASE: Final[str] = os.getenv("SQLSERVER_DATABASE", "")
-SQLSERVER_USERNAME: Final[str] = os.getenv("SQLSERVER_USERNAME", "")
-SQLSERVER_PASSWORD: Final[str] = os.getenv("SQLSERVER_PASSWORD", "")
+__all__ = [
+    "COMMON_DEFS",
+    "GET_ALL_APPS_VALUE_BY_USER",
+    "GET_ALL_APPS_SUMMARY_BY_USER",
+    "GET_VAST_GENERAL_BY_USER",
+    "ROWS_OUTPUT",
+]
 
-# Encryption policy – your org allows insecure to reach on-prem
-ALLOW_INSECURE_SQL_ENCRYPTION: Final[bool] = os.getenv("ALLOW_INSECURE_SQL_ENCRYPTION", "true").lower() == "true"
 
-# BigQuery (fallback)
-BQ_PROJECT_ID: Final[str] = os.getenv("BQ_PROJECT_ID", "")
-BQ_DATASET: Final[str] = os.getenv("BQ_DATASET", "")
-BQ_TABLE_ALLAPPS_VALUE: Final[str] = os.getenv("BQ_TABLE_ALLAPPS_VALUE", "allapps_value")
-BQ_TABLE_ALLAPPS_SUMMARY: Final[str] = os.getenv("BQ_TABLE_ALLAPPS_SUMMARY", "allapps_summary")
-BQ_TABLE_VAST_GENERAL: Final[str] = os.getenv("BQ_TABLE_VAST_GENERAL", "vast_general")
 
-# HTTP defaults (local dev only; Cloud Run injects PORT automatically)
-HOST: Final[str] = os.getenv("HOST", "0.0.0.0")
-PORT: Final[int] = int(os.getenv("PORT", "8080"))
-HTTP_PATH: Final[str] = os.getenv("HTTP_PATH", "/mcp/")
-SERVICE_NAME: Final[str] = os.getenv("SERVICE_NAME", "j9cv-VCSChatbot-mcp")
+
+"""Project layer: tools, resources, prompts."""
+__all__ = ["tools", "resources", "prompts"]
+
+
+
+"""Tool entrypoints (one file per tool)."""
+# Import tools here ONLY when you want side-effect registration via decorators.
+# Example (later):
+# from .sample_echo_tool import echo  # noqa: F401
+# from .get_all_apps_value_by_user import get_all_apps_value_by_user  # noqa: F401
+
+__all__ = []
+
+"""Prompt definitions for agents (optional)."""
+__all__ = []
+
+
+"""Resources (e.g., describe_fields) and static field dictionaries."""
+# Example (later):
+# from .describe_fields import describe_fields  # noqa: F401
+
+__all__ = []
+
+
+"""Tool entrypoints (one file per tool)."""
+# Import tools here ONLY when you want side-effect registration via decorators.
+# Example (later):
+# from .sample_echo_tool import echo  # noqa: F401
+# from .get_all_apps_value_by_user import get_all_apps_value_by_user  # noqa: F401
+
+__all__ = []
+
+
