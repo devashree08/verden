@@ -1,23 +1,41 @@
-# Logging / switching
-LOG_LEVEL=INFO
-DB_BACKEND=mssql   # mssql | bigquery
+"""
+Centralized config (env-driven). Keep this tiny.
+"""
 
-# OIDC (Keycloak) – public metadata, not secrets
-OIDC_ISSUER_URI=https://keycloak.example.com/realms/yourrealm
-OIDC_JWKS_URI=https://keycloak.example.com/realms/yourrealm/protocol/openid-connect/certs
-OIDC_ALLOWED_AUDIENCE=mcp-service
+from __future__ import annotations
+import os
+from typing import Final
+
+# Logging / runtime
+LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Backend switch: mssql | bigquery
+DB_BACKEND: Final[str] = os.getenv("DB_BACKEND", "mssql").lower()
+
+# OIDC (Keycloak) – public metadata
+OIDC_ISSUER_URI: Final[str] = os.getenv("OIDC_ISSUER_URI", "")
+OIDC_JWKS_URI: Final[str] = os.getenv("OIDC_JWKS_URI", "")
+OIDC_ALLOWED_AUDIENCE: Final[str] = os.getenv("OIDC_ALLOWED_AUDIENCE", "mcp-service")
 
 # SQL Server (primary)
-SQLSERVER_HOST=sql.internal.corp
-SQLSERVER_PORT=1433
-SQLSERVER_DATABASE=YourDb
-SQLSERVER_USERNAME=REDACTED   # store real value in Secret Manager
-SQLSERVER_PASSWORD=REDACTED   # store real value in Secret Manager
-ALLOW_INSECURE_SQL_ENCRYPTION=true
+SQLSERVER_HOST: Final[str] = os.getenv("SQLSERVER_HOST", "")
+SQLSERVER_PORT: Final[int] = int(os.getenv("SQLSERVER_PORT", "1433"))
+SQLSERVER_DATABASE: Final[str] = os.getenv("SQLSERVER_DATABASE", "")
+SQLSERVER_USERNAME: Final[str] = os.getenv("SQLSERVER_USERNAME", "")
+SQLSERVER_PASSWORD: Final[str] = os.getenv("SQLSERVER_PASSWORD", "")
+
+# Encryption policy – your org allows insecure to reach on-prem
+ALLOW_INSECURE_SQL_ENCRYPTION: Final[bool] = os.getenv("ALLOW_INSECURE_SQL_ENCRYPTION", "true").lower() == "true"
 
 # BigQuery (fallback)
-BQ_PROJECT_ID=your-gcp-project
-BQ_DATASET=security
-BQ_TABLE_ALLAPPS_VALUE=allapps_value
-BQ_TABLE_ALLAPPS_SUMMARY=allapps_summary
-BQ_TABLE_VAST_GENERAL=vast_general
+BQ_PROJECT_ID: Final[str] = os.getenv("BQ_PROJECT_ID", "")
+BQ_DATASET: Final[str] = os.getenv("BQ_DATASET", "")
+BQ_TABLE_ALLAPPS_VALUE: Final[str] = os.getenv("BQ_TABLE_ALLAPPS_VALUE", "allapps_value")
+BQ_TABLE_ALLAPPS_SUMMARY: Final[str] = os.getenv("BQ_TABLE_ALLAPPS_SUMMARY", "allapps_summary")
+BQ_TABLE_VAST_GENERAL: Final[str] = os.getenv("BQ_TABLE_VAST_GENERAL", "vast_general")
+
+# HTTP defaults (local dev only; Cloud Run injects PORT automatically)
+HOST: Final[str] = os.getenv("HOST", "0.0.0.0")
+PORT: Final[int] = int(os.getenv("PORT", "8080"))
+HTTP_PATH: Final[str] = os.getenv("HTTP_PATH", "/mcp/")
+SERVICE_NAME: Final[str] = os.getenv("SERVICE_NAME", "j9cv-VCSChatbot-mcp")
