@@ -1,65 +1,36 @@
-"""
-Resource: fields://{tool_name}
+schema_version: 1
+tool: get_all_apps_value_by_user
+temporal_scope: current
+last_updated: 2025-10-08
+notes: "Daily snapshot of current month; vulnerability/asset counts by VAST."
 
-Loads a YAML field dictionary from server/resources/fields/{tool_name}.yaml
-and returns it as JSON. No DB calls, no complexity.
+fields:
+  - name: VastID
+    type: int
+    mssql_type: int
+    bq_type: INT64
+    description: "Unique identifier of the VAST."
+    canonical_source: get_vast_general_by_user
+    temporal_scope: current
+    also_available_in: [get_all_apps_summary_by_user]
+    nullable: false
 
-Valid tool_name values:
-  - get_all_apps_value_by_user
-  - get_all_apps_summary_by_user
-  - get_vast_general_by_user
-"""
+  - name: CriticalVulnCount
+    type: int
+    mssql_type: int
+    bq_type: INT64
+    description: "Number of open critical vulnerabilities for the VAST (current month snapshot)."
+    canonical_source: get_all_apps_value_by_user
+    temporal_scope: current
+    also_available_in: [get_all_apps_summary_by_user]
+    nullable: true
 
-from __future__ import annotations
-from pathlib import Path
-from typing import Any, Dict
-
-from fastmcp import Context
-from ruamel.yaml import YAML
-
-from framework.core.registry import mcp
-
-# Resolve repo root relative to this file; avoids CWD surprises
-_FIELDS_DIR = Path(__file__).resolve().parent / "fields"
-
-# One-to-one mapping (explicit to avoid path traversal)
-_TOOL_TO_FILE = {
-    "get_all_apps_value_by_user": _FIELDS_DIR / "allapps_value.yaml",
-    "get_all_apps_summary_by_user": _FIELDS_DIR / "allapps_summary.yaml",
-    "get_vast_general_by_user": _FIELDS_DIR / "vast_general.yaml",
-}
-
-
-def _load_yaml(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"Field dictionary not found: {path.name}")
-    yaml = YAML(typ="safe")
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.load(f) or {}
-
-
-@mcp.resource("fields://{tool_name}")
-async def describe_fields(tool_name: str, ctx: Context) -> Dict[str, Any]:
-    """
-    Return the field dictionary JSON for the given tool name.
-
-    Example URIs:
-      fields://get_all_apps_value_by_user
-      fields://get_all_apps_summary_by_user
-      fields://get_vast_general_by_user
-    """
-    path = _TOOL_TO_FILE.get(tool_name)
-    if path is None:
-        # Keep error safe & clear for agents
-        return {
-            "error": "unknown_tool",
-            "message": f"Unsupported tool name '{tool_name}'.",
-            "supported": list(_TOOL_TO_FILE.keys()),
-        }
-
-    data = _load_yaml(path)
-    # Add minimal runtime metadata (helpful for debugging)
-    data.setdefault("_meta", {})
-    data["_meta"]["served_by"] = "fields-resource"
-    data["_meta"]["tool_name"] = tool_name
-    return data
+  - name: HighVulnCount
+    type: int
+    mssql_type: int
+    bq_type: INT64
+    description: "Number of open high-severity vulnerabilities for the VAST (current month snapshot)."
+    canonical_source: get_all_apps_value_by_user
+    temporal_scope: current
+    also_available_in: [get_all_apps_summary_by_user]
+    nullable: true
