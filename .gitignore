@@ -1,8 +1,8 @@
 schema_version: 1
-tool: get_all_apps_summary_by_user
-temporal_scope: monthly_snapshot
+tool: get_vast_general_by_user
+temporal_scope: current
 last_updated: 2025-10-08
-notes: "Historical monthly snapshots (frozen at month-end); combines general + counts."
+notes: "General/compliance attributes for VASTs (includes decommissioned)."
 
 fields:
   - name: VastID
@@ -11,27 +11,27 @@ fields:
     bq_type: INT64
     description: "Unique identifier of the VAST."
     canonical_source: get_vast_general_by_user
-    temporal_scope: monthly_snapshot
-    also_available_in: [get_all_apps_value_by_user]
+    temporal_scope: current
+    also_available_in: [get_all_apps_value_by_user, get_all_apps_summary_by_user]
     nullable: false
 
-  - name: ReportMonth
-    type: datetime
-    mssql_type: datetime
-    bq_type: DATETIME
-    description: "Snapshot month (literal 'YYYY-MM-01 00:00:00')."
-    canonical_source: get_all_apps_summary_by_user
-    temporal_scope: monthly_snapshot
+  - name: PCICompliant
+    type: bool
+    mssql_type: bit
+    bq_type: BOOL
+    description: "Whether the VAST meets PCI DSS requirements (true/false)."
+    canonical_source: get_vast_general_by_user
+    temporal_scope: current
     also_available_in: []
-    nullable: false
+    nullable: true
 
-  - name: CriticalVulnCount
-    type: int
-    mssql_type: int
-    bq_type: INT64
-    description: "Number of open critical vulnerabilities for the VAST at snapshot month."
-    canonical_source: get_all_apps_summary_by_user
-    temporal_scope: monthly_snapshot
-    also_available_in: [get_all_apps_value_by_user]
+  - name: SOXInScope
+    type: bool
+    mssql_type: bit
+    bq_type: BOOL
+    description: "Indicates if the VAST is in scope for SOX compliance."
+    canonical_source: get_vast_general_by_user
+    temporal_scope: current
+    also_available_in: []
     nullable: true
 
