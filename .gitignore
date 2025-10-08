@@ -1,1 +1,8 @@
-uv run python -c "import os; from dotenv import load_dotenv, find_dotenv; load_dotenv(find_dotenv(usecwd=True)); print(os.getenv('OIDC_ISSUER_URI'), os.getenv('OIDC_JWKS_URI'), os.getenv('OIDC_ALLOWED_AUDIENCE'))"
+log.info(
+        "OIDC config resolved",
+        extra={"extra": {
+            "issuer_set": bool(OIDC_ISSUER_URI),
+            "jwks_set": bool(OIDC_JWKS_URI),
+            "aud_set": bool(OIDC_ALLOWED_AUDIENCE),
+        }},
+    )
