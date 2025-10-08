@@ -1,21 +1,30 @@
-from fastmcp.server.dependencies import get_access_token  # add this import at top
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Union
 
-class EmailClaimMiddleware(Middleware):
-    async def on_request(self, context: MiddlewareContext, call_next):
-        # Get the verified access token (or None)
-        token = get_access_token()  # correct way in current FastMCP
-        if token is None:
-            return await context.fastmcp_context.error("Unauthorized: missing or invalid access token", status=401)
+from fastmcp import Context
+from framework.core.registry import mcp
+from framework.schemas.outputs import ROWS_OUTPUT
 
-        claims = token.claims or {}
-        raw_email = (
-            claims.get("email")
-            or claims.get("upn")
-            or claims.get("preferred_username")
-        )
-
-        if not raw_email:
-            return await context.fastmcp_context.error("Forbidden: email claim missing", status=403)
-
-        context.fastmcp_context.set_state("email", raw_email.strip().lower())
-        return await call_next()
+@mcp.tool(
+    name="sample_echo",
+    description="Echo normalized inputs and caller identity for debugging.",
+    output_schema=ROWS_OUTPUT,
+)
+async def sample_echo(
+    vast: Optional[Union[str, List[Union[int, str]]]] = None,
+    limit: int = 1000,
+    offset: int = 0,
+    ctx: Context = Context.depends(),   # ← dependency-injected context (current pattern)
+) -> Dict[str, List[Dict[str, Any]]]:
+    email = (ctx.get_state("email") or "").lower()
+    return {
+        "rows": [
+            {
+                "email": email,
+                "vast": vast,
+                "limit": limit,
+                "offset": offset,
+                "note": "Reference tool; copy this pattern for real tools.",
+            }
+        ]
+    }
