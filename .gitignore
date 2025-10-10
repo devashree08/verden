@@ -1,34 +1,31 @@
-# Smoke: Tool contracts
+# Build, push, and deploy (Cloud Run)
 
-## Goal
-Confirm the tools accept flexible inputs, normalize params, and return `{ "rows": [...] }`.
+## 1) Build & push to Artifact Registry
+# One-time: login
+gcloud auth configure-docker us-east4-docker.pkg.dev
 
-## Pre-reqs
-- Server running:
-  ```bash
-  uv run python -m framework.core.bootstrap
-  ```
-- Token for a user with some data access.
+# Build
+docker build -t us-east4-docker.pkg.dev/<PROJECT_ID>/j9cv-VCSChatbot-mcp-repo/mcp:v1 -f ops/Dockerfile .
 
-## Cases
+# Push
+docker push us-east4-docker.pkg.dev/<PROJECT_ID>/j9cv-VCSChatbot-mcp-repo/mcp:v1
 
-### 1) get_vast_general_by_user
-- Params: `{ "vast": ["101","202"], "limit": 5 }`
-- Expected: `{ "rows": [ { VastID: ..., PCICompliant: ..., ... } ] }`
-- Output schema always includes `rows` (even if empty).
+## 2) Secret Manager (create once)
+# Keep secrets minimal as agreed
+# SQLSERVER_HOST, SQLSERVER_DATABASE, SQLSERVER_USERNAME, SQLSERVER_PASSWORD
 
-### 2) get_all_apps_value_by_user
-- Params: `{ "vast": "101,202", "limit": 3 }`  (string CSV)
-- Expected: same as above; normalized internally to CSV.
+## 3) Service Account (runtime)
+# Grant SA access to secrets + (if needed) BQ + CMEK decrypt on the Run service
+# roles/secretmanager.secretAccessor
+# roles/bigquery.dataViewer, roles/bigquery.jobUser (if DB_BACKEND=bigquery)
+# roles/cloudkms.cryptoKeyDecrypter
 
-### 3) get_all_apps_summary_by_user
-- Params: `{ "report_month": "Feb 2024", "vast": "101" }`
-- Expected: `report_month` normalized to `"2024-02-01 00:00:00"`; returns rows for that month.
+## 4) Deploy (CMEK + secrets + env)
+gcloud run deploy j9cv-VCSChatbot-mcp   --image us-east4-docker.pkg.dev/<PROJECT_ID>/j9cv-VCSChatbot-mcp-repo/mcp:v1   --region us-east4   --platform managed   --port 8080   --cpu 1 --memory 512Mi --concurrency 20 --timeout 300   --min-instances 0   --service-account mcp-runtime@<PROJECT_ID>.iam.gserviceaccount.com   --set-secrets=SQLSERVER_HOST=SQLSERVER_HOST:latest,SQLSERVER_DATABASE=SQLSERVER_DATABASE:latest,SQLSERVER_USERNAME=SQLSERVER_USERNAME:latest,SQLSERVER_PASSWORD=SQLSERVER_PASSWORD:latest   --set-env-vars=LOG_LEVEL=INFO,DB_BACKEND=mssql,OIDC_ISSUER_URI=https://keycloak.example.com/realms/yourrealm,OIDC_JWKS_URI=https://keycloak.example.com/realms/yourrealm/protocol/openid-connect/certs,OIDC_ALLOWED_AUDIENCE=mcp-service,SQLSERVER_PORT=1433,ALLOW_INSECURE_SQL_ENCRYPTION=true   --ingress internal-and-cloud-load-balancing   --kms-key projects/<PROJECT_ID>/locations/us-east4/keyRings/<KEY_RING>/cryptoKeys/<KEY_NAME>
 
-### 4) Pagination guardrails
-- Params: `{ "limit": 999999, "offset": -10 }`
-- Expected: limit capped at 15000, offset coerced to 0, no crash.
+## 5) Flip backend without rebuild (optional)
+# MSSQL -> BigQuery
+gcloud run services update j9cv-VCSChatbot-mcp   --region us-east4   --set-env-vars=DB_BACKEND=bigquery,BQ_PROJECT_ID=<PROJECT_ID>,BQ_DATASET=VCSChatbotDateSet,BQ_TABLE_ALLAPPS_VALUE=all_apps_values,BQ_TABLE_ALLAPPS_SUMMARY=all_apps_summary,BQ_TABLE_VAST_GENERAL=vast_general
 
-### 5) Backend switch (optional)
-- Set `DB_BACKEND=bigquery` and repeat 1–3.
-- Expected: Same shapes; results come from BQ tables.
+# BigQuery -> MSSQL
+gcloud run services update j9cv-VCSChatbot-mcp   --region us-east4   --set-env-vars=DB_BACKEND=mssql
