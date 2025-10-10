@@ -1,14 +1,14 @@
-.git
-__pycache__
-.venv
-*.pyc
-*.pyo
-*.pyd
-.env
-.env.*
-dist
-build
-node_modules
-tests/
-scripts/
-*.md
+cat > replication-policy.json <<'EOF'
+{
+  "userManaged": {
+    "replicas": [
+      {
+        "location": "us-east4",
+        "customerManagedEncryption": {
+          "kmsKeyName": "projects/acme-it-np-kms-0/locations/us-east4/keyRings/acme-nonit-np-kr/cryptoKeys/acme-nonit-np-kms-000v"
+        }
+      }
+    ]
+  }
+}
+EOF
