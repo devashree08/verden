@@ -1,34 +1,34 @@
-# Smoke: Auth policy
+# Smoke: Tool contracts
 
 ## Goal
-Verify JWT validation, email extraction, and that tools run **only** with the token’s `email`.
+Confirm the tools accept flexible inputs, normalize params, and return `{ "rows": [...] }`.
 
 ## Pre-reqs
-- Server running locally:
+- Server running:
   ```bash
   uv run python -m framework.core.bootstrap
   ```
-- Valid Keycloak JWT for a test user (e.g., `alice@alice.com`).
+- Token for a user with some data access.
 
 ## Cases
 
-### 1) No token → 401/unauthorized
-- Open MCP Inspector → connect to `http://localhost:8080/mcp/` **without** `Authorization` header.
-- Expected: connection rejected or listing fails with unauthorized.
+### 1) get_vast_general_by_user
+- Params: `{ "vast": ["101","202"], "limit": 5 }`
+- Expected: `{ "rows": [ { VastID: ..., PCICompliant: ..., ... } ] }`
+- Output schema always includes `rows` (even if empty).
 
-### 2) Invalid issuer/audience → 401
-- Use a token with wrong `iss` or `aud`.
-- Expected: 401 with a clear auth error (check server log).
+### 2) get_all_apps_value_by_user
+- Params: `{ "vast": "101,202", "limit": 3 }`  (string CSV)
+- Expected: same as above; normalized internally to CSV.
 
-### 3) Valid token → tools/resources list
-- Connect with `Authorization: Bearer <JWT>` (valid `iss/aud/exp/nbf`).
-- Expected: tools `get_*` appear; resource template `fields://{tool_name}` appears; prompts appear.
+### 3) get_all_apps_summary_by_user
+- Params: `{ "report_month": "Feb 2024", "vast": "101" }`
+- Expected: `report_month` normalized to `"2024-02-01 00:00:00"`; returns rows for that month.
 
-### 4) Email propagation (policy)
-- Call any tool with **no `email` param** (we don’t accept an email input).
-- Expected: tool runs; server logs show hashed email; results scoped to that caller.
-- Quick check: `row_count` logs, no PII/token in logs.
+### 4) Pagination guardrails
+- Params: `{ "limit": 999999, "offset": -10 }`
+- Expected: limit capped at 15000, offset coerced to 0, no crash.
 
-### 5) Resource fetch
-- Resources → fetch `fields://get_vast_general_by_user`.
-- Expected: JSON with `fields` and `_meta`, no YAML parse errors.
+### 5) Backend switch (optional)
+- Set `DB_BACKEND=bigquery` and repeat 1–3.
+- Expected: Same shapes; results come from BQ tables.
