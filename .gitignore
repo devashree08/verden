@@ -1,1 +1,61 @@
-gemini -m gemini-2.5-pro -p '{"task":"return_columns","columns":[{"name":"Foo"},{"name":"Bar"}], "instructions":"Return {\"columns\":[{\"name\":\"Foo\",\"description\":\"x\"},{\"name\":\"Bar\",\"description\":\"y\"}] } and nothing else."}' --output-format json
+# ========= BUILDER (installs deps, compiles wheels) =========
+FROM python:3.13-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy
+
+# System tools required only for building wheels
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates gnupg build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast, reproducible deps)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /app
+
+# Copy dep manifests first to leverage layer caching
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# Copy source last (invalidates fewer layers)
+COPY . .
+
+# ========= RUNTIME (lean, no build tools) =========
+FROM python:3.13-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# ODBC 18 only in runtime (needed to reach SQL Server)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates gnupg unixodbc unixodbc-dev apt-transport-https \
+    && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/ms.gpg \
+ && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/ms.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
+      > /etc/apt/sources.list.d/microsoft-prod.list \
+ && apt-get update && ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
+      msodbcsql18 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user and own the workdir (Cloud Run supports this)
+RUN useradd --create-home --uid 10001 appuser
+WORKDIR /app
+RUN chown -R appuser:appuser /app
+
+# Copy only what we need from builder
+COPY --from=builder /app /app
+
+# Use the venv created by uv (placed under .venv)
+ENV PATH="/app/.venv/bin:${PATH}"
+
+# Switch to non-root
+USER appuser
+
+# Cloud Run will set PORT; default to 8080 for local
+EXPOSE 8080
+
+# Start the MCP server
+CMD ["python", "-m", "framework.core.bootstrap"]
