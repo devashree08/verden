@@ -1,14 +1,95 @@
-cat > replication-policy.json <<'EOF'
-{
-  "userManaged": {
-    "replicas": [
-      {
-        "location": "us-east4",
-        "customerManagedEncryption": {
-          "kmsKeyName": "projects/acme-it-np-kms-0/locations/us-east4/keyRings/acme-nonit-np-kr/cryptoKeys/acme-nonit-np-kms-000v"
-        }
-      }
-    ]
-  }
-}
-EOF
+Hi team,
+
+We’re standing up a small Model Context Protocol (MCP) HTTP service on Cloud Run (us-east4). It exposes three read-only tools that query on-prem MS SQL (primary) with a BigQuery fallback. The app enforces OIDC (Keycloak) at the app layer; our org policy enforces Cloud Run IAM auth at the edge.
+
+What we’re deploying
+
+Service: Cloud Run (2nd gen) HTTP server
+
+Image: in Artifact Registry (us-east4), repo j9cv-VCSChatbot-mcp-repo
+
+Networking: Direct VPC egress to Shared VPC subnet shared-np-east-green-subnet-1 (10.74.128.0/22); egress to MS SQL at 63.28.115.20:1433 (prod)
+
+Secrets: SQL creds in Secret Manager (regional us-east4, CMEK)
+
+CMEK: projects/acme-it-np-kms-0/locations/us-east4/keyRings/acme-nonit-np-kr/cryptoKeys/acme-nonit-np-kms-000v
+
+Runtime SA (approved): sa-dev-vsad-app-etcdo-0@acme-nonit-np.iam.gserviceaccount.com
+
+Why we’re blocked right now
+
+Cloud Run: Org policy requires IAM auth & approved SAs. Our initial create used default SA and got auto-deleted.
+
+Secret access: The runtime SA needs secretAccessor to read SQL secrets at runtime.
+
+VPC egress attach: The runtime SA (and/or deployer) needs compute.networkUser on the subnet to attach Direct VPC egress.
+
+Cloud Build: Our org requires CMEK on GCS for build staging/logs. Cloud Build service agents currently lack KMS grants, so CLI builds fail with a 412 CMEK policy error. We worked around this by building on a RHEL host and pushing to AR, but we’ll need Cloud Build fixed for CI/CD.
+
+What we need approved (one-shot)
+
+A. IAM roles for the runtime service account
+
+sa-dev-vsad-app-etcdo-0@acme-nonit-np.iam.gserviceaccount.com
+
+Artifact Registry Reader: roles/artifactregistry.reader (repo or project)
+
+Secret Manager Secret Accessor on: SQLSERVER_HOST, SQLSERVER_DATABASE, SQLSERVER_USERNAME, SQLSERVER_PASSWORD
+
+Compute Network User on subnet shared-np-east-green-subnet-1 (region us-east4, host project if Shared VPC): roles/compute.networkUser
+
+(Optional but standard) roles/logging.logWriter, roles/monitoring.metricWriter
+
+B. KMS grants (CMEK) for Google-managed service agents
+Grant roles/cloudkms.cryptoKeyEncrypterDecrypter on the key:
+
+Cloud Run service agent: service-<PROJECT_NUMBER>@serverless-robot-prod.iam.gserviceaccount.com
+
+Artifact Registry service agent: service-<PROJECT_NUMBER>@gcp-sa-artifactregistry.iam.gserviceaccount.com
+
+Secret Manager service agent: service-<PROJECT_NUMBER>@gcp-sa-secretmanager.iam.gserviceaccount.com
+
+C. Networking
+
+Confirm/allow egress/NAT from 10.74.128.0/22 to 63.28.115.20:1433 (prod SQL).
+
+If we later switch to private SQL 10.144.18.2, ensure private routing/firewall also permits it.
+
+If the org mandates Serverless VPC Access connectors instead of Direct VPC egress, please provide a us-east4 connector and grant roles/vpcaccess.user to the runtime SA.
+
+D. Caller access
+
+Our calling gateway/agent (or user group) needs Cloud Run Invoker: roles/run.invoker on the service (org policy requires IAM auth).
+
+We will present a Google ID token at the edge (Authorization header) and pass the Keycloak JWT to the app in a secondary header (e.g., X-Keycloak-Token) for app-layer RBAC.
+
+E. (Later) Cloud Build for CI/CD
+If we move back to Cloud Build:
+
+Two us-east4 CMEK-default GCS buckets for staging and logs.
+
+Grants:
+
+CB SA <PROJECT_NUMBER>@cloudbuild.gserviceaccount.com: roles/storage.objectAdmin on both buckets
+
+CB service agent service-<PROJECT_NUMBER>@gcp-sa-cloudbuild.iam.gserviceaccount.com: roles/cloudkms.cryptoKeyEncrypterDecrypter on the buckets’ CMEK
+
+Current status / what we can do immediately
+
+Image is already in Artifact Registry (CMEK via Console).
+
+Secrets are in Secret Manager (regional us-east4, CMEK).
+
+We can create Cloud Run via Console with CMEK.
+
+Once the above grants are in place, we’ll attach Direct VPC egress to the subnet, point to SQL 63.28.115.20, and run an end-to-end ODBC test through our MCP tool with MCP Inspector.
+
+Please confirm:
+
+The role grants above (runtime SA, service agents, invoker, subnet).
+
+Networking/NAT/firewall for egress from 10.74.128.0/22 to 63.28.115.20:1433.
+
+Whether Direct VPC egress is approved, or if you require a Serverless VPC Access connector.
+
+Happy to provide exact resource IDs (project number, host project) if needed.
