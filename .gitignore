@@ -1,21 +1,67 @@
-## Tools (how to pick)
+"""
+Logging: JSON to stdout (Cloud Run -> Cloud Logging).
+- Emits both UTC and EST timestamps for analytics.
+- No external deps; uses stdlib zoneinfo.
+"""
 
-All tools derive the user’s identity from the OIDC token (email) and enforce RBAC in the DB layer.
+from __future__ import annotations
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+from typing import Any, Dict
 
-1) **get_all_apps_score_by_user**  
-   QRM score **monthly snapshot** per VAST.  
-   - Inputs: `vast` (CSV or list, optional), `report_month` (optional), `limit`, `offset`  
-   - If `report_month` is omitted, the proc returns the **latest** frozen month.  
-   - For multi-month ranges, the **agent should call once per month** and merge client-side.  
-   - `report_month` is normalized to the string literal `YYYY-MM-01 00:00:00` (no timezone math). This literal represents **EST midnight** in the DB.
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # Fallback: skip EST field if not available
 
-2) **get_all_apps_value_by_user**  
-   **Values** monthly snapshot per VAST (ownership, counts, etc.).  
-   - Inputs: `vast` (CSV or list, optional), `report_month` (optional), `limit`, `offset`  
-   - Same semantics as Score: omit `report_month` for latest; agent loops for spans.  
-   - `report_month` normalization identical to above (EST midnight literal, no tz conversion).
 
-3) **get_vast_general_by_user**  
-   Compliance / general metadata per VAST (includes decommissioned).  
-   - Inputs: `vast` (CSV or list, optional), `limit`, `offset`  
-   - **No** `report_month` (non-snapshot).
+def _now_utc_iso(ts: float) -> str:
+    # e.g., 2025-10-15T16:12:33.123+00:00
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _to_est_iso(ts: float) -> str | None:
+    if not ZoneInfo:
+        return None
+    ny = ZoneInfo("America/New_York")  # EST/EDT as appropriate
+    return datetime.fromtimestamp(ts, tz=ny).isoformat(timespec="milliseconds")
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: Dict[str, Any] = {
+            "severity": record.levelname,
+            "message": record.getMessage(),
+            "logger": record.name,
+            "time_utc": _now_utc_iso(record.created),
+        }
+        est = _to_est_iso(record.created)
+        if est:
+            payload["time_est"] = est
+
+        # Merge dict extras if present
+        extra_fields = getattr(record, "extra_fields", None)
+        if isinstance(extra_fields, dict):
+            payload.update(extra_fields)
+
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def setup_logging() -> None:
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # Clear default handlers (avoid duplicates on reload)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    handler = logging.StreamHandler(stream=sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    root.addHandler(handler)
