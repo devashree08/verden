@@ -1,150 +1,142 @@
 """
-Tool: get_all_apps_score_by_user
+AuditLogMiddleware: one structured JSON log per tool call.
 
-Purpose
--------
-QRM score monthly snapshot per VAST.
-If `report_month` is omitted, the proc returns the latest frozen month.
-
-Inputs
-------
-- vast (optional), report_month (optional), limit, offset
-
-Output
-------
-{ "rows": [ ... ] }
+- Correct FastMCP hook signature: on_call_tool(self, context, call_next)
+- Extracts tool name and arguments from context payload safely.
+- Never logs tokens or full inputs; keeps PII minimal and approved (email).
 """
 
 from __future__ import annotations
-from typing import Any, Dict, Iterable, Union
-from datetime import datetime
+import logging
+import time
+import uuid
+from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field
-from fastmcp import Context
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from framework.core.config import DB_BACKEND, SERVICE_NAME
 
-from framework.core.registry import mcp
-from framework.core.config import DB_BACKEND
-from framework.schemas.outputs import rows_schema
-from framework.adapters import mssql as mssql_adapter
-from framework.adapters import bigquery as bq_adapter  # fallback only
-
-# Local parsing (use dateutil if available; otherwise be conservative)
-try:
-    from dateutil import parser as dtparse  # already declared in project deps
-except Exception:  # pragma: no cover
-    dtparse = None
+log = logging.getLogger(__name__)
 
 
-# ---- Local normalizers (keep tools self-contained & consistent) ----
-def _to_csv(vast: Union[str, Iterable[Union[str, int]], None]) -> str | None:
+def _safe_get_payload(context: MiddlewareContext) -> Optional[Dict[str, Any]]:
     """
-    Accepts CSV string ("101, 202") or iterable ([101, "202"]).
-    Returns a clean CSV string "101,202", or None if empty/invalid.
+    Try a few attribute names used across FastMCP versions to find the request payload.
+    We expect a dict containing at least type/name/arguments for call_tool frames.
     """
-    if vast is None:
-        return None
-    if isinstance(vast, str):
-        s = vast.strip()
-        return s if s else None
-    try:
-        tokens: list[str] = []
-        for v in vast:
-            if v is None:
-                continue
-            t = str(v).strip()
-            if t:
-                tokens.append(t)
-        return ",".join(tokens) or None
-    except TypeError:
-        t = str(vast).strip()
-        return t or None
-
-
-def _normalize_report_month_literal(report_month: str | datetime | None) -> str | None:
-    """
-    Normalize to DB literal: 'YYYY-MM-01 00:00:00'
-    Accepts 'YYYY-MM', 'Month YYYY' (e.g., 'February 2024'), datetime, or already-literal.
-    No timezone math; the DB stores a naive literal representing EST midnight.
-    """
-    if report_month is None:
-        return None
-    if isinstance(report_month, datetime):
-        dt = report_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    s = str(report_month).strip()
-    if not s:
-        return None
-
-    # Fast-path 'YYYY-MM'
-    if len(s) == 7 and s[4] == "-" and s[:4].isdigit() and s[5:7].isdigit():
-        year = int(s[:4]); month = int(s[5:7])
-        dt = datetime(year, month, 1)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    if dtparse:
-        try:
-            dt = dtparse.parse(s)
-            dt = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return None
+    for attr in ("payload", "body", "request", "frame", "data"):
+        val = getattr(context, attr, None)
+        if isinstance(val, dict):
+            return val
     return None
 
 
-# ---- Params schema ----
-class ScoreParams(BaseModel):
-    vast: str | list[str | int] | None = Field(
-        default=None,
-        description=(
-            "VAST filter. Accepts CSV string (e.g., '101,202') or a list like [101,'202'].\n"
-            "Omit to include all caller-permitted VASTs."
-        ),
-    )
-    report_month: str | None = Field(
-        default=None,
-        description=(
-            "Target month. Accepts 'YYYY-MM', 'Month YYYY', or the exact literal "
-            "'YYYY-MM-01 00:00:00'. Omit to fetch the latest frozen month."
-        ),
-    )
-    limit: int = Field(default=1000, ge=1, le=15000, description="Max rows to return (1–15000). Default 1000.")
-    offset: int = Field(default=0, ge=0, description="Rows to skip before returning results. Default 0.")
+def _extract_tool_and_args(context: MiddlewareContext) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Best-effort extraction of tool name and arguments from the context payload.
+    Expected call_tool shape (typical):
+      {"type":"call_tool","name":"<tool>","arguments":{"params":{...}},"id":"..."}
+    """
+    payload = _safe_get_payload(context)
+    if not isinstance(payload, dict):
+        # Some builds stash fields on context itself; try common attributes.
+        name = getattr(context, "tool_name", None)
+        args = getattr(context, "arguments", None)
+        if isinstance(args, dict):
+            return name, args
+        return name, None
+
+    # Standard MCP request shapes
+    name = payload.get("name") or payload.get("tool") if isinstance(payload.get("tool"), str) else payload.get("tool", {}).get("name") if isinstance(payload.get("tool"), dict) else None
+    arguments = payload.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = None
+    return name, arguments
 
 
-@mcp.tool(
-    name="get_all_apps_score_by_user",
-    description=(
-        "QRM score monthly snapshot per VAST for the authenticated user. "
-        "If 'report_month' is omitted, the stored procedure returns the latest frozen month."
-    ),
-    output_schema=rows_schema,
-)
-async def get_all_apps_score_by_user(params: ScoreParams, ctx: Context) -> Dict[str, Any]:
-    email: str = ctx.state.get("email")
-    if not email:
-        # Auth middleware should set this; empty result is the safest fallback.
-        return {"rows": []}
+class AuditLogMiddleware(Middleware):
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        start = time.perf_counter()
 
-    vast_csv = _to_csv(params.vast)
-    report_literal = _normalize_report_month_literal(params.report_month)
+        # Correlation
+        request_id = context.headers.get("x-request-id") or str(uuid.uuid4())
+        trace = context.headers.get("x-cloud-trace-context", "")
 
-    if DB_BACKEND == "mssql":
-        rows = mssql_adapter.run_allapps_score_by_user(
-            email=email,
-            vast_csv=vast_csv,
-            report_month_literal=report_literal,
-            limit=params.limit,
-            offset=params.offset,
-        )
-        return {"rows": rows}
+        # Identity (approved PII)
+        email = context.state.get("email", "")
 
-    # Fallback: BigQuery
-    rows = bq_adapter.run_allapps_score_by_user(
-        email=email,
-        vast_csv=vast_csv,
-        report_month_literal=report_literal,
-        limit=params.limit,
-        offset=params.offset,
-    )
-    return {"rows": rows}
+        # Tool metadata
+        tool_name, arguments = _extract_tool_and_args(context)
+
+        # Light input summary (do NOT log full args)
+        params = arguments.get("params") if isinstance(arguments, dict) else None
+        limit = offset = None
+        vast = report_month = None
+        try:
+            if isinstance(params, dict):
+                limit = params.get("limit")
+                offset = params.get("offset")
+                vast = params.get("vast")
+                report_month = params.get("report_month")
+        except Exception:
+            pass
+
+        def _vast_count(v) -> int:
+            if v is None:
+                return 0
+            if isinstance(v, str):
+                return len([t for t in (x.strip() for x in v.split(",")) if t])
+            if isinstance(v, (list, tuple)):
+                return len([t for t in v if t not in ("", None, "")])
+            return 0
+
+        try:
+            result = await call_next()
+
+            rows = result.get("rows") if isinstance(result, dict) else None
+            row_count = len(rows) if isinstance(rows, list) else None
+            latency_ms = round((time.perf_counter() - start) * 1000, 2)
+
+            log.info(
+                "tool_call_ok",
+                extra={"extra_fields": {
+                    "event": "tool_call",
+                    "status": "ok",
+                    "service": SERVICE_NAME,
+                    "tool": tool_name or "unknown",
+                    "email": email,
+                    "db_backend": DB_BACKEND,
+                    "limit": limit,
+                    "offset": offset,
+                    "vast_count": _vast_count(vast),
+                    "has_report_month": bool(report_month),
+                    "row_count": row_count,
+                    "latency_ms": latency_ms,
+                    "request_id": request_id,
+                    "trace": trace,
+                }},
+            )
+            return result
+
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - start) * 1000, 2)
+            log.error(
+                "tool_call_error",
+                exc_info=True,
+                extra={"extra_fields": {
+                    "event": "tool_call",
+                    "status": "error",
+                    "service": SERVICE_NAME,
+                    "tool": tool_name or "unknown",
+                    "email": email,
+                    "db_backend": DB_BACKEND,
+                    "limit": limit,
+                    "offset": offset,
+                    "vast_count": _vast_count(vast),
+                    "has_report_month": bool(report_month),
+                    "latency_ms": latency_ms,
+                    "request_id": request_id,
+                    "trace": trace,
+                    "error_type": type(exc).__name__,
+                }},
+            )
+            raise
