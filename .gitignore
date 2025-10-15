@@ -1,21 +1,16 @@
 """
-Tool: get_all_apps_score_by_user
+Tool: get_all_apps_value_by_user
 
 Purpose
 -------
-Return QRM score snapshots per VAST for the caller (derived from OIDC email).
-- Monthly snapshot semantics; if `report_month` is omitted, MSSQL proc returns the latest month.
+Monthly **values** snapshot per VAST (ownership, vulnerability counts, etc.) for the caller.
+- If `report_month` is omitted, MSSQL proc returns the latest month.
 - For multi-month spans, the **agent should call once per month and merge** client-side.
 
 Inputs
 ------
-- vast: list[str|int] or CSV string (optional)
-- report_month: "YYYY-MM" | "Month YYYY" | "YYYY-MM-01 00:00:00" (optional)
-- limit / offset: pagination safety
-
-Output
-------
-{ "rows": [ { ...columns... } ] }
+- vast, report_month (optional), limit, offset
+Output: { "rows": [ ... ] }
 """
 
 from __future__ import annotations
@@ -35,36 +30,32 @@ from framework.adapters import mssql as mssql_adapter
 from framework.adapters import bigquery as bq_adapter  # fallback only
 
 
-class ScoreParams(BaseModel):
+class ValueParams(BaseModel):
     vast: str | list[str | int] | None = Field(
         default=None,
-        description=(
-            "VAST filter. Accepts CSV (e.g., '101,202') or a list like [101, '202']."
-            " Omit for all VASTs permitted to the caller."
-        ),
+        description="VAST filter (CSV or list). Omit to include all caller-permitted VASTs.",
     )
     report_month: str | None = Field(
         default=None,
         description=(
-            "Month to query. Accepts 'YYYY-MM', 'Month YYYY', or full literal "
-            "'YYYY-MM-01 00:00:00'. If omitted, latest month is used by the proc."
+            "Month to query. Accepts 'YYYY-MM', 'Month YYYY', or literal "
+            "'YYYY-MM-01 00:00:00'. If omitted, latest month is used."
         ),
     )
-    limit: int = Field(default=1000, ge=1, le=15000, description="Max rows to return.")
-    offset: int = Field(default=0, ge=0, description="Row offset for pagination.")
+    limit: int = Field(default=1000, ge=1, le=15000)
+    offset: int = Field(default=0, ge=0)
 
 
 @mcp.tool(
-    name="get_all_apps_score_by_user",
+    name="get_all_apps_value_by_user",
     description=(
-        "QRM score snapshots per VAST for the authenticated user. "
-        "Monthly snapshot table; omit report_month for latest month. "
-        "For a multi-month span, call once per month and combine client-side."
+        "Monthly values snapshot per VAST (ownership, counts) for the authenticated user. "
+        "Omit report_month for the latest month. For multiple months, issue one call per month."
     ),
     output_schema=rows_schema,
 )
-async def get_all_apps_score_by_user(params: ScoreParams, ctx: Context) -> Dict[str, Any]:
-    email: str = ctx.state.get("email")  # set by OIDC middleware
+async def get_all_apps_value_by_user(params: ValueParams, ctx: Context) -> Dict[str, Any]:
+    email: str = ctx.state.get("email")
     if not email:
         return {"rows": []}
 
@@ -72,7 +63,7 @@ async def get_all_apps_score_by_user(params: ScoreParams, ctx: Context) -> Dict[
     report_month = normalize_report_month_literal(params.report_month) if params.report_month else None
 
     if DB_BACKEND == "mssql":
-        rows = mssql_adapter.run_allapps_score_by_user(
+        rows = mssql_adapter.run_allapps_value_by_user(
             email=email,
             vast_csv=vast_csv,
             report_month=report_month,
@@ -81,8 +72,7 @@ async def get_all_apps_score_by_user(params: ScoreParams, ctx: Context) -> Dict[
         )
         return {"rows": rows}
 
-    # Fallback path is explicit flip only; not mixed with MSSQL.
-    rows = bq_adapter.run_allapps_score_by_user(
+    rows = bq_adapter.run_allapps_value_by_user(
         email=email,
         vast_csv=vast_csv,
         report_month=report_month,
