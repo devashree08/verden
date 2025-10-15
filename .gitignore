@@ -1,10 +1,10 @@
 """
-Tool: get_all_apps_value_by_user
+Tool: get_all_apps_score_by_user
 
 Purpose
 -------
-Monthly values snapshot per VAST (ownership, counts, etc.).
-If `report_month` is omitted, the proc returns the latest month.
+QRM score monthly snapshot per VAST.
+If `report_month` is omitted, the proc returns the latest frozen month.
 
 Inputs
 ------
@@ -28,14 +28,14 @@ from framework.schemas.outputs import rows_schema
 from framework.adapters import mssql as mssql_adapter
 from framework.adapters import bigquery as bq_adapter  # fallback only
 
-# Local parsing (no external deps here)
+# Local parsing (use dateutil if available; otherwise be conservative)
 try:
-    from dateutil import parser as dtparse  # already in project deps
+    from dateutil import parser as dtparse  # already declared in project deps
 except Exception:  # pragma: no cover
-    dtparse = None  # if missing, we just skip parsing fallback
+    dtparse = None
 
 
-# ---- Local normalizers (align with score tool style) ----
+# ---- Local normalizers (keep tools self-contained & consistent) ----
 def _to_csv(vast: Union[str, Iterable[Union[str, int]], None]) -> str | None:
     """
     Accepts CSV string ("101, 202") or iterable ([101, "202"]).
@@ -82,7 +82,6 @@ def _normalize_report_month_literal(report_month: str | datetime | None) -> str 
         dt = datetime(year, month, 1)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    # If full literal already, let adapters also accept it; we still try to parse for safety.
     if dtparse:
         try:
             dt = dtparse.parse(s)
@@ -94,7 +93,7 @@ def _normalize_report_month_literal(report_month: str | datetime | None) -> str 
 
 
 # ---- Params schema ----
-class ValueParams(BaseModel):
+class ScoreParams(BaseModel):
     vast: str | list[str | int] | None = Field(
         default=None,
         description=(
@@ -106,7 +105,7 @@ class ValueParams(BaseModel):
         default=None,
         description=(
             "Target month. Accepts 'YYYY-MM', 'Month YYYY', or the exact literal "
-            "'YYYY-MM-01 00:00:00'. Omit to fetch the latest month."
+            "'YYYY-MM-01 00:00:00'. Omit to fetch the latest frozen month."
         ),
     )
     limit: int = Field(default=1000, ge=1, le=15000, description="Max rows to return (1–15000). Default 1000.")
@@ -114,23 +113,24 @@ class ValueParams(BaseModel):
 
 
 @mcp.tool(
-    name="get_all_apps_value_by_user",
+    name="get_all_apps_score_by_user",
     description=(
-        "Monthly values snapshot per VAST for the authenticated user. "
-        "If 'report_month' is omitted, the stored procedure returns the latest month."
+        "QRM score monthly snapshot per VAST for the authenticated user. "
+        "If 'report_month' is omitted, the stored procedure returns the latest frozen month."
     ),
     output_schema=rows_schema,
 )
-async def get_all_apps_value_by_user(params: ValueParams, ctx: Context) -> Dict[str, Any]:
+async def get_all_apps_score_by_user(params: ScoreParams, ctx: Context) -> Dict[str, Any]:
     email: str = ctx.state.get("email")
     if not email:
+        # Auth middleware should set this; empty result is the safest fallback.
         return {"rows": []}
 
     vast_csv = _to_csv(params.vast)
     report_literal = _normalize_report_month_literal(params.report_month)
 
     if DB_BACKEND == "mssql":
-        rows = mssql_adapter.run_allapps_value_by_user(
+        rows = mssql_adapter.run_allapps_score_by_user(
             email=email,
             vast_csv=vast_csv,
             report_month_literal=report_literal,
@@ -140,7 +140,7 @@ async def get_all_apps_value_by_user(params: ValueParams, ctx: Context) -> Dict[
         return {"rows": rows}
 
     # Fallback: BigQuery
-    rows = bq_adapter.run_allapps_value_by_user(
+    rows = bq_adapter.run_allapps_score_by_user(
         email=email,
         vast_csv=vast_csv,
         report_month_literal=report_literal,
