@@ -1,10 +1,88 @@
-async def get_all_apps_score_by_user(
+"""
+Tool: get_all_apps_value_by_user
+
+Monthly values snapshot per VAST.
+If `report_month` is omitted, the proc returns the latest month.
+
+Inputs (separate fields): vast, report_month, limit, offset
+Output: { "rows": [ ... ] }
+"""
+
+from __future__ import annotations
+from typing import Any, Dict, Iterable, Union, Annotated
+from datetime import datetime
+
+from fastmcp import Context
+from pydantic import Field
+
+from framework.core.registry import mcp
+from framework.core.config import DB_BACKEND
+from framework.schemas.outputs import rows_schema
+from framework.adapters import mssql as mssql_adapter
+from framework.adapters import bigquery as bq_adapter
+
+try:
+    from dateutil import parser as dtparse
+except Exception:
+    dtparse = None
+
+
+def _to_csv_from_list(v: list[str | int] | None) -> str | None:
+    if not v:
+        return None
+    toks = [str(x).strip() for x in v if x not in (None, "", " ")]
+    return ",".join(t for t in toks if t) or None
+
+
+def _normalize_report_month_literal(report_month: str | datetime | None) -> str | None:
+    if report_month is None:
+        return None
+    if isinstance(report_month, datetime):
+        dt = report_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    s = str(report_month).strip()
+    if not s:
+        return None
+    if len(s) == 7 and s[4] == "-" and s[:4].isdigit() and s[5:7].isdigit():
+        year = int(s[:4]); month = int(s[5:7])
+        return datetime(year, month, 1).strftime("%Y-%m-%d %H:%M:%S")
+    if dtparse:
+        try:
+            dt = dtparse.parse(s).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+    return None
+
+
+@mcp.tool(
+    name="get_all_apps_value_by_user",
+    description=(
+        "Monthly values snapshot per VAST for the authenticated user. "
+        "If 'report_month' is omitted, the stored procedure returns the latest month."
+    ),
+    output_schema=rows_schema,
+)
+async def get_all_apps_value_by_user(
     vast: Annotated[list[str | int] | None, Field(description="VAST filter as a list e.g. ['101','202']. Omit for all caller-permitted VASTs.")] = None,
-    report_month: Annotated[str | None, Field(description="Accepts 'YYYY-MM', 'Month YYYY', or 'YYYY-MM-01 00:00:00'. Omit for latest frozen month.")] = None,
+    report_month: Annotated[str | None, Field(description="Accepts 'YYYY-MM', 'Month YYYY', or 'YYYY-MM-01 00:00:00'. Omit for latest month.")] = None,
     limit: Annotated[int, Field(ge=1, le=15000, description="Max rows to return (1–15000). Default 1000.")] = 1000,
     offset: Annotated[int, Field(ge=0, description="Rows to skip before returning results. Default 0.")] = 0,
-    ctx: Context,  # <-- injected by FastMCP
+    ctx: Context = Context.depends(),
 ) -> Dict[str, Any]:
     email = (ctx.get_state("email") or "").strip()
     if not email:
         return {"rows": []}
+
+    vast_csv = _to_csv_from_list(vast)
+    report_literal = _normalize_report_month_literal(report_month)
+
+    if DB_BACKEND == "mssql":
+        rows = mssql_adapter.run_allapps_value_by_user(
+            email=email, vast_csv=vast_csv, report_month_literal=report_literal, limit=limit, offset=offset
+        )
+    else:
+        rows = bq_adapter.run_allapps_value_by_user(
+            email=email, vast_csv=vast_csv, report_month_literal=report_literal, limit=limit, offset=offset
+        )
+    return {"rows": rows}
