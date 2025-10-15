@@ -1,14 +1,14 @@
 """
-Tool: get_vast_general_by_user
+Tool: get_all_apps_value_by_user
 
 Purpose
 -------
-Compliance / general metadata per VAST for the caller (includes decommissioned VASTs).
-No report_month parameter (non-snapshot table).
+Monthly values snapshot per VAST (ownership, counts, etc.).
+If `report_month` is omitted, the proc returns the latest month.
 
 Inputs
 ------
-- vast (optional), limit, offset
+- vast (optional), report_month (optional), limit, offset
 
 Output
 ------
@@ -17,6 +17,7 @@ Output
 
 from __future__ import annotations
 from typing import Any, Dict, Iterable, Union
+from datetime import datetime
 
 from pydantic import BaseModel, Field
 from fastmcp import Context
@@ -27,8 +28,14 @@ from framework.schemas.outputs import rows_schema
 from framework.adapters import mssql as mssql_adapter
 from framework.adapters import bigquery as bq_adapter  # fallback only
 
+# Local parsing (no external deps here)
+try:
+    from dateutil import parser as dtparse  # already in project deps
+except Exception:  # pragma: no cover
+    dtparse = None  # if missing, we just skip parsing fallback
 
-# ---- Local normalizers (keep tools self-contained & consistent) ----
+
+# ---- Local normalizers (align with score tool style) ----
 def _to_csv(vast: Union[str, Iterable[Union[str, int]], None]) -> str | None:
     """
     Accepts CSV string ("101, 202") or iterable ([101, "202"]).
@@ -53,13 +60,53 @@ def _to_csv(vast: Union[str, Iterable[Union[str, int]], None]) -> str | None:
         return t or None
 
 
+def _normalize_report_month_literal(report_month: str | datetime | None) -> str | None:
+    """
+    Normalize to DB literal: 'YYYY-MM-01 00:00:00'
+    Accepts 'YYYY-MM', 'Month YYYY' (e.g., 'February 2024'), datetime, or already-literal.
+    No timezone math; the DB stores a naive literal representing EST midnight.
+    """
+    if report_month is None:
+        return None
+    if isinstance(report_month, datetime):
+        dt = report_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    s = str(report_month).strip()
+    if not s:
+        return None
+
+    # Fast-path 'YYYY-MM'
+    if len(s) == 7 and s[4] == "-" and s[:4].isdigit() and s[5:7].isdigit():
+        year = int(s[:4]); month = int(s[5:7])
+        dt = datetime(year, month, 1)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # If full literal already, let adapters also accept it; we still try to parse for safety.
+    if dtparse:
+        try:
+            dt = dtparse.parse(s)
+            dt = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+    return None
+
+
 # ---- Params schema ----
-class GeneralParams(BaseModel):
+class ValueParams(BaseModel):
     vast: str | list[str | int] | None = Field(
         default=None,
         description=(
             "VAST filter. Accepts CSV string (e.g., '101,202') or a list like [101,'202'].\n"
-            "Omit to include all caller-permitted VASTs (includes decommissioned)."
+            "Omit to include all caller-permitted VASTs."
+        ),
+    )
+    report_month: str | None = Field(
+        default=None,
+        description=(
+            "Target month. Accepts 'YYYY-MM', 'Month YYYY', or the exact literal "
+            "'YYYY-MM-01 00:00:00'. Omit to fetch the latest month."
         ),
     )
     limit: int = Field(default=1000, ge=1, le=15000, description="Max rows to return (1–15000). Default 1000.")
@@ -67,34 +114,36 @@ class GeneralParams(BaseModel):
 
 
 @mcp.tool(
-    name="get_vast_general_by_user",
+    name="get_all_apps_value_by_user",
     description=(
-        "Compliance/general metadata per VAST for the authenticated user. "
-        "Includes decommissioned VASTs. No report_month filter."
+        "Monthly values snapshot per VAST for the authenticated user. "
+        "If 'report_month' is omitted, the stored procedure returns the latest month."
     ),
     output_schema=rows_schema,
 )
-async def get_vast_general_by_user(params: GeneralParams, ctx: Context) -> Dict[str, Any]:
+async def get_all_apps_value_by_user(params: ValueParams, ctx: Context) -> Dict[str, Any]:
     email: str = ctx.state.get("email")
     if not email:
-        # Auth middleware should have set this; return empty for safety.
         return {"rows": []}
 
     vast_csv = _to_csv(params.vast)
+    report_literal = _normalize_report_month_literal(params.report_month)
 
     if DB_BACKEND == "mssql":
-        rows = mssql_adapter.run_vast_general_by_user(
+        rows = mssql_adapter.run_allapps_value_by_user(
             email=email,
             vast_csv=vast_csv,
+            report_month_literal=report_literal,
             limit=params.limit,
             offset=params.offset,
         )
         return {"rows": rows}
 
     # Fallback: BigQuery
-    rows = bq_adapter.run_vast_general_by_user(
+    rows = bq_adapter.run_allapps_value_by_user(
         email=email,
         vast_csv=vast_csv,
+        report_month_literal=report_literal,
         limit=params.limit,
         offset=params.offset,
     )
