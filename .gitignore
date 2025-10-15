@@ -1,95 +1,92 @@
-Hi team,
+"""
+Tool: get_all_apps_score_by_user
 
-We’re standing up a small Model Context Protocol (MCP) HTTP service on Cloud Run (us-east4). It exposes three read-only tools that query on-prem MS SQL (primary) with a BigQuery fallback. The app enforces OIDC (Keycloak) at the app layer; our org policy enforces Cloud Run IAM auth at the edge.
+Purpose
+-------
+Return QRM score snapshots per VAST for the caller (derived from OIDC email).
+- Monthly snapshot semantics; if `report_month` is omitted, MSSQL proc returns the latest month.
+- For multi-month spans, the **agent should call once per month and merge** client-side.
 
-What we’re deploying
+Inputs
+------
+- vast: list[str|int] or CSV string (optional)
+- report_month: "YYYY-MM" | "Month YYYY" | "YYYY-MM-01 00:00:00" (optional)
+- limit / offset: pagination safety
 
-Service: Cloud Run (2nd gen) HTTP server
+Output
+------
+{ "rows": [ { ...columns... } ] }
+"""
 
-Image: in Artifact Registry (us-east4), repo j9cv-VCSChatbot-mcp-repo
+from __future__ import annotations
+from typing import Dict, Any
 
-Networking: Direct VPC egress to Shared VPC subnet shared-np-east-green-subnet-1 (10.74.128.0/22); egress to MS SQL at 63.28.115.20:1433 (prod)
+from pydantic import BaseModel, Field
+from fastmcp import Context
 
-Secrets: SQL creds in Secret Manager (regional us-east4, CMEK)
+from framework.core.registry import mcp
+from framework.core.config import DB_BACKEND
+from framework.schemas.inputs import (
+    normalize_vast_csv,
+    normalize_report_month_literal,
+)
+from framework.schemas.outputs import rows_schema
+from framework.adapters import mssql as mssql_adapter
+from framework.adapters import bigquery as bq_adapter  # fallback only
 
-CMEK: projects/acme-it-np-kms-0/locations/us-east4/keyRings/acme-nonit-np-kr/cryptoKeys/acme-nonit-np-kms-000v
 
-Runtime SA (approved): sa-dev-vsad-app-etcdo-0@acme-nonit-np.iam.gserviceaccount.com
+class ScoreParams(BaseModel):
+    vast: str | list[str | int] | None = Field(
+        default=None,
+        description=(
+            "VAST filter. Accepts CSV (e.g., '101,202') or a list like [101, '202']."
+            " Omit for all VASTs permitted to the caller."
+        ),
+    )
+    report_month: str | None = Field(
+        default=None,
+        description=(
+            "Month to query. Accepts 'YYYY-MM', 'Month YYYY', or full literal "
+            "'YYYY-MM-01 00:00:00'. If omitted, latest month is used by the proc."
+        ),
+    )
+    limit: int = Field(default=1000, ge=1, le=15000, description="Max rows to return.")
+    offset: int = Field(default=0, ge=0, description="Row offset for pagination.")
 
-Why we’re blocked right now
 
-Cloud Run: Org policy requires IAM auth & approved SAs. Our initial create used default SA and got auto-deleted.
+@mcp.tool(
+    name="get_all_apps_score_by_user",
+    description=(
+        "QRM score snapshots per VAST for the authenticated user. "
+        "Monthly snapshot table; omit report_month for latest month. "
+        "For a multi-month span, call once per month and combine client-side."
+    ),
+    output_schema=rows_schema,
+)
+async def get_all_apps_score_by_user(params: ScoreParams, ctx: Context) -> Dict[str, Any]:
+    email: str = ctx.state.get("email")  # set by OIDC middleware
+    if not email:
+        return {"rows": []}
 
-Secret access: The runtime SA needs secretAccessor to read SQL secrets at runtime.
+    vast_csv = normalize_vast_csv(params.vast)
+    report_month = normalize_report_month_literal(params.report_month) if params.report_month else None
 
-VPC egress attach: The runtime SA (and/or deployer) needs compute.networkUser on the subnet to attach Direct VPC egress.
+    if DB_BACKEND == "mssql":
+        rows = mssql_adapter.run_allapps_score_by_user(
+            email=email,
+            vast_csv=vast_csv,
+            report_month=report_month,
+            limit=params.limit,
+            offset=params.offset,
+        )
+        return {"rows": rows}
 
-Cloud Build: Our org requires CMEK on GCS for build staging/logs. Cloud Build service agents currently lack KMS grants, so CLI builds fail with a 412 CMEK policy error. We worked around this by building on a RHEL host and pushing to AR, but we’ll need Cloud Build fixed for CI/CD.
-
-What we need approved (one-shot)
-
-A. IAM roles for the runtime service account
-
-sa-dev-vsad-app-etcdo-0@acme-nonit-np.iam.gserviceaccount.com
-
-Artifact Registry Reader: roles/artifactregistry.reader (repo or project)
-
-Secret Manager Secret Accessor on: SQLSERVER_HOST, SQLSERVER_DATABASE, SQLSERVER_USERNAME, SQLSERVER_PASSWORD
-
-Compute Network User on subnet shared-np-east-green-subnet-1 (region us-east4, host project if Shared VPC): roles/compute.networkUser
-
-(Optional but standard) roles/logging.logWriter, roles/monitoring.metricWriter
-
-B. KMS grants (CMEK) for Google-managed service agents
-Grant roles/cloudkms.cryptoKeyEncrypterDecrypter on the key:
-
-Cloud Run service agent: service-<PROJECT_NUMBER>@serverless-robot-prod.iam.gserviceaccount.com
-
-Artifact Registry service agent: service-<PROJECT_NUMBER>@gcp-sa-artifactregistry.iam.gserviceaccount.com
-
-Secret Manager service agent: service-<PROJECT_NUMBER>@gcp-sa-secretmanager.iam.gserviceaccount.com
-
-C. Networking
-
-Confirm/allow egress/NAT from 10.74.128.0/22 to 63.28.115.20:1433 (prod SQL).
-
-If we later switch to private SQL 10.144.18.2, ensure private routing/firewall also permits it.
-
-If the org mandates Serverless VPC Access connectors instead of Direct VPC egress, please provide a us-east4 connector and grant roles/vpcaccess.user to the runtime SA.
-
-D. Caller access
-
-Our calling gateway/agent (or user group) needs Cloud Run Invoker: roles/run.invoker on the service (org policy requires IAM auth).
-
-We will present a Google ID token at the edge (Authorization header) and pass the Keycloak JWT to the app in a secondary header (e.g., X-Keycloak-Token) for app-layer RBAC.
-
-E. (Later) Cloud Build for CI/CD
-If we move back to Cloud Build:
-
-Two us-east4 CMEK-default GCS buckets for staging and logs.
-
-Grants:
-
-CB SA <PROJECT_NUMBER>@cloudbuild.gserviceaccount.com: roles/storage.objectAdmin on both buckets
-
-CB service agent service-<PROJECT_NUMBER>@gcp-sa-cloudbuild.iam.gserviceaccount.com: roles/cloudkms.cryptoKeyEncrypterDecrypter on the buckets’ CMEK
-
-Current status / what we can do immediately
-
-Image is already in Artifact Registry (CMEK via Console).
-
-Secrets are in Secret Manager (regional us-east4, CMEK).
-
-We can create Cloud Run via Console with CMEK.
-
-Once the above grants are in place, we’ll attach Direct VPC egress to the subnet, point to SQL 63.28.115.20, and run an end-to-end ODBC test through our MCP tool with MCP Inspector.
-
-Please confirm:
-
-The role grants above (runtime SA, service agents, invoker, subnet).
-
-Networking/NAT/firewall for egress from 10.74.128.0/22 to 63.28.115.20:1433.
-
-Whether Direct VPC egress is approved, or if you require a Serverless VPC Access connector.
-
-Happy to provide exact resource IDs (project number, host project) if needed.
+    # Fallback path is explicit flip only; not mixed with MSSQL.
+    rows = bq_adapter.run_allapps_score_by_user(
+        email=email,
+        vast_csv=vast_csv,
+        report_month=report_month,
+        limit=params.limit,
+        offset=params.offset,
+    )
+    return {"rows": rows}
