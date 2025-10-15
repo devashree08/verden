@@ -1,33 +1,127 @@
 """
-Input normalizers for tools.
+Input JSON Schemas for MCP tools (single source of truth).
 
-- normalize_vast_csv(vast):
-    Accepts CSV string ("101, 202") or list/tuple ([101, "202"]).
-    Returns a clean CSV: "101,202", or None if empty. Never injects spaces.
-
-- normalize_report_month_literal(report_month):
-    Accepts "YYYY-MM", "Month YYYY" (e.g., "Feb 2025"), or the full literal
-    "YYYY-MM-01 00:00:00". Returns the **string literal** "YYYY-MM-01 00:00:00".
-
-    IMPORTANT (EST rule): We DO NOT apply timezone math. The DB stores a
-    naive literal (no timezone) that is **conceptually EST** at midnight.
-    This function only formats to that literal; it never converts between
-    timezones. If parsing fails, returns None so the tool can omit the
-    parameter (allowing the proc to use the latest month).
+Important:
+- Clients NEVER send `email`. The server extracts it from the OIDC JWT.
+- `vast` may be CSV ("101,202") or an array ([101, 202]); we normalize to CSV.
+- `report_month` accepts "YYYY-MM" or "Month YYYY" (e.g., "February 2024");
+  we normalize to the literal "YYYY-MM-01 00:00:00" (no timezone math).
+  This literal is stored by the DB as conceptually **EST midnight**.
+- Pagination: limit default 1000, cap 15000; offset default 0.
 """
-from __future__ import annotations
-from typing import Iterable, Optional, Union
 
-# ... leave your imports and implementations as-is ...
+# Common $defs reused by all schemas. Keep inline to avoid extra files.
+COMMON_DEFS = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "urn:schemas:mcp:common",
+    "$defs": {
+        "vastCsv": {
+            "type": "string",
+            "title": "VAST IDs (CSV)",
+            "description": "Comma-separated VAST IDs, e.g., '101,202,303'. Whitespace allowed.",
+            "pattern": r"^\s*\d+\s*(\s*,\s*\d+\s*)*$",
+            "examples": ["101,202,303"],
+        },
+        "vastArray": {
+            "type": "array",
+            "title": "VAST IDs (Array)",
+            "description": "Array of VAST IDs; will be normalized to CSV internally.",
+            "items": {
+                "oneOf": [
+                    {"type": "integer", "minimum": 0},
+                    {"type": "string", "pattern": r"^\d+$"},
+                ]
+            },
+            "examples": [[101, 202, 303]],
+        },
+        "vast": {
+            "title": "VAST IDs",
+            "description": (
+                "Optional filter to specific VAST IDs. Accepts CSV string or array. "
+                "If omitted or empty, no VAST filter is applied (RBAC still enforced)."
+            ),
+            "oneOf": [{"$ref": "#/$defs/vastCsv"}, {"$ref": "#/$defs/vastArray"}],
+        },
+        "limit": {
+            "type": "integer",
+            "title": "Limit",
+            "minimum": 1,
+            "maximum": 15000,
+            "default": 1000,
+            "description": "Maximum rows to return (1–15000). Default 1000.",
+        },
+        "offset": {
+            "type": "integer",
+            "title": "Offset",
+            "minimum": 0,
+            "default": 0,
+            "description": "Rows to skip before returning results. Default 0.",
+        },
+        "reportMonth": {
+            "type": "string",
+            "title": "Report Month",
+            "description": (
+                "Target month to query. Accepts 'YYYY-MM' (e.g., '2024-02') or natural language like "
+                "'February 2024'. Normalized to the literal 'YYYY-MM-01 00:00:00'. "
+                "The DB stores this as a naive string that represents **EST midnight**."
+            ),
+            "examples": ["2024-02", "February 2024", "2024-02-01 00:00:00"],
+        },
+    },
+}
 
-# Update per-argument descriptions (for Pydantic field help in tools):
-# - In get_all_apps_* tools, ensure Field(description=...) matches:
-#
-# vast:
-#   "VAST filter. Accepts CSV (e.g., '101,202') or a list like [101, '202'].
-#    Omit for all caller-permitted VASTs."
-#
-# report_month:
-#   "Month to query. Accepts 'YYYY-MM', 'Month YYYY', or the exact literal
-#    'YYYY-MM-01 00:00:00'. If omitted, the proc returns the latest month.
-#    Note: stored as a naive literal that represents EST midnight; no timezone math."
+# 1) Score tool — monthly snapshots; omit report_month => latest frozen
+GET_ALL_APPS_SCORE_BY_USER = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "get_all_apps_score_by_user Input",
+    "type": "object",
+    "additionalProperties": False,
+    "description": (
+        "QRM score monthly snapshot for the caller’s permitted VASTs. "
+        "Email is extracted from the bearer token. If 'report_month' is omitted, "
+        "the stored procedure returns the latest frozen month."
+    ),
+    "properties": {
+        "vast": {"$ref": "urn:schemas:mcp:common#/$defs/vast"},
+        "report_month": {"$ref": "urn:schemas:mcp:common#/$defs/reportMonth"},
+        "limit": {"$ref": "urn:schemas:mcp:common#/$defs/limit"},
+        "offset": {"$ref": "urn:schemas:mcp:common#/$defs/offset"},
+    },
+}
+
+# 2) Value tool — monthly snapshots; omit report_month => latest
+GET_ALL_APPS_VALUE_BY_USER = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "get_all_apps_value_by_user Input",
+    "type": "object",
+    "additionalProperties": False,
+    "description": (
+        "Values monthly snapshot per VAST (ownership, counts, etc.). "
+        "Email is extracted from the bearer token. If 'report_month' is omitted, "
+        "the stored procedure returns the latest month."
+    ),
+    "properties": {
+        "vast": {"$ref": "urn:schemas:mcp:common#/$defs/vast"},
+        "report_month": {"$ref": "urn:schemas:mcp:common#/$defs/reportMonth"},
+        "limit": {"$ref": "urn:schemas:mcp:common#/$defs/limit"},
+        "offset": {"$ref": "urn:schemas:mcp:common#/$defs/offset"},
+    },
+}
+
+# 3) General tool — non-snapshot; no report_month
+GET_VAST_GENERAL_BY_USER = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "get_vast_general_by_user Input",
+    "type": "object",
+    "additionalProperties": False,
+    "description": (
+        "Compliance/general details per VAST (includes decommissioned). "
+        "Email is extracted from the bearer token."
+    ),
+    "properties": {
+        "vast": {"$ref": "urn:schemas:mcp:common#/$defs/vast"},
+        "limit": {"$ref": "urn:schemas:mcp:common#/$defs/limit"},
+        "offset": {"$ref": "urn:schemas:mcp:common#/$defs/offset"},
+    },
+}
+
