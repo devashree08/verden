@@ -1,16 +1,18 @@
 """
-Tool: get_all_apps_value_by_user
+Tool: get_vast_general_by_user
 
 Purpose
 -------
-Monthly **values** snapshot per VAST (ownership, vulnerability counts, etc.) for the caller.
-- If `report_month` is omitted, MSSQL proc returns the latest month.
-- For multi-month spans, the **agent should call once per month and merge** client-side.
+Compliance / general metadata per VAST for the caller (includes decommissioned VASTs).
+No report_month parameter (non-snapshot table).
 
 Inputs
 ------
-- vast, report_month (optional), limit, offset
-Output: { "rows": [ ... ] }
+- vast (optional), limit, offset
+
+Output
+------
+{ "rows": [ ... ] }
 """
 
 from __future__ import annotations
@@ -21,61 +23,48 @@ from fastmcp import Context
 
 from framework.core.registry import mcp
 from framework.core.config import DB_BACKEND
-from framework.schemas.inputs import (
-    normalize_vast_csv,
-    normalize_report_month_literal,
-)
+from framework.schemas.inputs import normalize_vast_csv
 from framework.schemas.outputs import rows_schema
 from framework.adapters import mssql as mssql_adapter
 from framework.adapters import bigquery as bq_adapter  # fallback only
 
 
-class ValueParams(BaseModel):
+class GeneralParams(BaseModel):
     vast: str | list[str | int] | None = Field(
         default=None,
-        description="VAST filter (CSV or list). Omit to include all caller-permitted VASTs.",
-    )
-    report_month: str | None = Field(
-        default=None,
-        description=(
-            "Month to query. Accepts 'YYYY-MM', 'Month YYYY', or literal "
-            "'YYYY-MM-01 00:00:00'. If omitted, latest month is used."
-        ),
+        description="VAST filter (CSV or list). Omit to include all caller-permitted VASTs (including decommissioned).",
     )
     limit: int = Field(default=1000, ge=1, le=15000)
     offset: int = Field(default=0, ge=0)
 
 
 @mcp.tool(
-    name="get_all_apps_value_by_user",
+    name="get_vast_general_by_user",
     description=(
-        "Monthly values snapshot per VAST (ownership, counts) for the authenticated user. "
-        "Omit report_month for the latest month. For multiple months, issue one call per month."
+        "Compliance/general metadata per VAST for the authenticated user. "
+        "Includes decommissioned VASTs. No report_month filter."
     ),
     output_schema=rows_schema,
 )
-async def get_all_apps_value_by_user(params: ValueParams, ctx: Context) -> Dict[str, Any]:
+async def get_vast_general_by_user(params: GeneralParams, ctx: Context) -> Dict[str, Any]:
     email: str = ctx.state.get("email")
     if not email:
         return {"rows": []}
 
     vast_csv = normalize_vast_csv(params.vast)
-    report_month = normalize_report_month_literal(params.report_month) if params.report_month else None
 
     if DB_BACKEND == "mssql":
-        rows = mssql_adapter.run_allapps_value_by_user(
+        rows = mssql_adapter.run_vast_general_by_user(
             email=email,
             vast_csv=vast_csv,
-            report_month=report_month,
             limit=params.limit,
             offset=params.offset,
         )
         return {"rows": rows}
 
-    rows = bq_adapter.run_allapps_value_by_user(
+    rows = bq_adapter.run_vast_general_by_user(
         email=email,
         vast_csv=vast_csv,
-        report_month=report_month,
         limit=params.limit,
         offset=params.offset,
     )
