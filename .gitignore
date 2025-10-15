@@ -1,31 +1,32 @@
 schema_version: 1
 tool: get_all_apps_score_by_user
 temporal_scope: monthly_snapshot
-canonical_source: get_all_apps_score_by_user
+last_updated: 2025-10-15
 notes: >
-  QRM score snapshot per VAST. If ReportMonth is omitted at query-time,
-  the proc returns the latest frozen month. Columns below are placeholders
-  until SME-reviewed.
+  QRM score snapshot per VAST. If report_month is omitted at query-time,
+  the proc returns the latest frozen month. Placeholder fields until SME review.
 
-columns:
+fields:
   - name: VastID
     type: int
-    mssql_type: int
-    bq_type: INT64
-    description: Application VAST identifier.
-    also_available_in:
-      - get_all_apps_value_by_user
-      - get_vast_general_by_user
+    description: "Application VAST identifier."
+    canonical_source: get_vast_general_by_user
+    temporal_scope: non_snapshot
+    also_available_in: [get_all_apps_value_by_user, get_vast_general_by_user]
+    nullable: false
 
   - name: ReportMonth
     type: datetime
-    mssql_type: datetime
-    bq_type: TIMESTAMP
-    description: Month snapshot boundary (YYYY-MM-01 00:00:00).
+    description: "Month boundary for the snapshot (YYYY-MM-01 00:00:00)."
+    canonical_source: get_all_apps_score_by_user
+    temporal_scope: monthly_snapshot
+    also_available_in: [get_all_apps_value_by_user]
+    nullable: false
 
   - name: QRMScore
     type: decimal
-    mssql_type: decimal(38,6)
-    bq_type: NUMERIC
-    description: Quantitative risk metric for the application.
-
+    description: "Quantitative risk score for the application in the snapshot month."
+    canonical_source: get_all_apps_score_by_user
+    temporal_scope: monthly_snapshot
+    also_available_in: []
+    nullable: true
