@@ -2,7 +2,7 @@
 AuditLogMiddleware: one structured JSON log per tool call.
 
 - Correct FastMCP hook signature: on_call_tool(self, context, call_next)
-- Extracts tool name and arguments from context payload safely.
+- Defensive access to context attributes (headers/state may be absent).
 - Never logs tokens or full inputs; keeps PII minimal and approved (email).
 """
 
@@ -46,23 +46,41 @@ def _extract_tool_and_args(context: MiddlewareContext) -> tuple[Optional[str], O
         return name, None
 
     # Standard MCP request shapes
-    name = payload.get("name") or payload.get("tool") if isinstance(payload.get("tool"), str) else payload.get("tool", {}).get("name") if isinstance(payload.get("tool"), dict) else None
+    tool_name = None
+    if isinstance(payload.get("name"), str):
+        tool_name = payload["name"]
+    elif isinstance(payload.get("tool"), str):
+        tool_name = payload["tool"]
+    elif isinstance(payload.get("tool"), dict):
+        t = payload["tool"]
+        if isinstance(t.get("name"), str):
+            tool_name = t["name"]
+
     arguments = payload.get("arguments")
     if not isinstance(arguments, dict):
         arguments = None
-    return name, arguments
+
+    return tool_name, arguments
 
 
 class AuditLogMiddleware(Middleware):
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         start = time.perf_counter()
 
+        # Defensive header/state access (may be absent depending on transport/version)
+        headers = getattr(context, "headers", None)
+        if not isinstance(headers, dict):
+            headers = {}
+        state = getattr(context, "state", None)
+        if not isinstance(state, dict):
+            state = {}
+
         # Correlation
-        request_id = context.headers.get("x-request-id") or str(uuid.uuid4())
-        trace = context.headers.get("x-cloud-trace-context", "")
+        request_id = headers.get("x-request-id") or str(uuid.uuid4())
+        trace = headers.get("x-cloud-trace-context", "")
 
         # Identity (approved PII)
-        email = context.state.get("email", "")
+        email = state.get("email", "")
 
         # Tool metadata
         tool_name, arguments = _extract_tool_and_args(context)
