@@ -1,146 +1,168 @@
 """
-MSSQL adapter (primary backend).
+BigQuery adapter (fallback backend).
 
-- ODBC Driver 18 with SQL auth (user/password).
-- Procs:
-    - dbo.SPGetAllAppsScoreByUser(@Email NVARCHAR(320), @VAST NVARCHAR(MAX)=NULL, @ReportMonth DATETIME=NULL)
-    - dbo.SPGetAllAppsValueByUser(@Email NVARCHAR(320), @VAST NVARCHAR(MAX)=NULL, @ReportMonth DATETIME=NULL)
-    - dbo.SPGetVastGeneralByUser(@Email NVARCHAR(320), @VAST NVARCHAR(MAX)=NULL)
+- Mirrors MSSQL function signatures so tools can switch by DB_BACKEND.
+- Enforces row-level security in-SQL by deriving caller EID from workers and
+  intersecting with allowed VASTs before reading data tables.
+- Parameterized queries via google-cloud-bigquery (no string interpolation).
+- LIMIT/OFFSET applied in SQL.
 
-- We DO NOT set cursor.timeout (can be missing on some pyodbc builds).
-- Connection timeout is set in the DSN; command timeout uses server defaults.
-- Pagination: streamed on the client to avoid loading huge result sets into memory all at once.
+Table names come from config:
+  - BQ_TABLE_ALLAPPS_SCORE
+  - BQ_TABLE_ALLAPPS_VALUE
+  - BQ_TABLE_VAST_GENERAL
+
+Reference tables (same dataset):
+  - ref_aaas_workers_outbound
+  - ref_eid_vast_map
 """
 
 from __future__ import annotations
+from typing import Any, Dict, List, Optional
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence
-import contextlib
 import logging
-
-import pyodbc
+from google.cloud import bigquery
 
 from framework.core.config import (
-    SQLSERVER_HOST,
-    SQLSERVER_PORT,
-    SQLSERVER_DATABASE,
-    SQLSERVER_USERNAME,
-    SQLSERVER_PASSWORD,
-    ALLOW_INSECURE_SQL_ENCRYPTION,
+    BQ_PROJECT_ID,
+    BQ_DATASET,
+    BQ_TABLE_ALLAPPS_SCORE,
+    BQ_TABLE_ALLAPPS_VALUE,
+    BQ_TABLE_VAST_GENERAL,
 )
 
 log = logging.getLogger(__name__)
 
-# Keep connection timeout conservative — network hiccups should fail fast.
-_CONNECT_TIMEOUT = 10  # seconds
+# Reference tables (dataset-scoped)
+_REF_WORKERS = "ref_aaas_workers_outbound"
+_REF_EID_VAST = "ref_eid_vast_map"
 
 
-def _conn_str() -> str:
+def _client() -> bigquery.Client:
+    # If BQ_PROJECT_ID is empty, the client uses ADC's default project.
+    return bigquery.Client(project=BQ_PROJECT_ID or None)
+
+
+def _bq_param(name: str, value: Any) -> bigquery.ScalarQueryParameter:
     """
-    Build the ODBC 18 connection string.
-
-    If/when you move to strict TLS:
-      - set Encrypt=yes;TrustServerCertificate=no
-      - make sure Windows/RHEL trust store contains the issuing CA
+    Map Python types to BQ parameter types.
+    - report_month is passed as a STRING literal in DB format 'YYYY-MM-01 00:00:00'.
     """
-    enc = "no" if ALLOW_INSECURE_SQL_ENCRYPTION else "yes"
-    trust = "yes" if ALLOW_INSECURE_SQL_ENCRYPTION else "no"
+    if isinstance(value, bool):
+        return bigquery.ScalarQueryParameter(name, "BOOL", value)
+    if isinstance(value, int):
+        return bigquery.ScalarQueryParameter(name, "INT64", value)
+    # Default to string; covers email, csv, report_month.
+    return bigquery.ScalarQueryParameter(name, "STRING", value)
 
-    return (
-        f"Driver={{ODBC Driver 18 for SQL Server}};"
-        f"Server=tcp:{SQLSERVER_HOST},{SQLSERVER_PORT};"
-        f"Database={SQLSERVER_DATABASE};"
-        f"Uid={SQLSERVER_USERNAME};"
-        f"Pwd={SQLSERVER_PASSWORD};"
-        f"Encrypt={enc};"
-        f"TrustServerCertificate={trust};"
-        f"Connection Timeout={_CONNECT_TIMEOUT};"
+
+def _email_acl_cte() -> str:
+    """
+    CTE that resolves caller email -> EID, then EID -> allowed VASTs.
+    """
+    ds = BQ_DATASET
+    prj = BQ_PROJECT_ID
+    return f"""
+WITH email_to_eid AS (
+  SELECT CAST(MIN(w.identityeid) AS STRING) AS eid
+  FROM `{prj}.{ds}.{_REF_WORKERS}` AS w
+  WHERE LOWER(TRIM(w.emailaddressinternal)) = LOWER(TRIM(@email))
+),
+allowed_vasts AS (
+  SELECT DISTINCT ev.vast_id
+  FROM `{prj}.{ds}.{_REF_EID_VAST}` AS ev
+  JOIN email_to_eid e ON ev.eid = e.eid
+)
+"""
+
+
+def _vast_filter_sql(column_name: str) -> str:
+    """
+    Build a filter that intersects the provided VAST list (if any) with allowed_vasts.
+
+    The provided list is a CSV string; we split and cast to INT64 safely.
+    """
+    return f"""
+AND (
+  @vast_csv IS NULL
+  OR {column_name} IN UNNEST(
+      ARRAY(
+        SELECT CAST(TRIM(x) AS INT64)
+        FROM UNNEST(SPLIT(@vast_csv, ',')) AS x
+        WHERE TRIM(x) != ''
+      )
     )
+)
+AND {column_name} IN (SELECT vast_id FROM allowed_vasts)
+"""
 
 
-@contextlib.contextmanager
-def _connect():
-    """
-    Context manager so we always close connections even on exceptions.
-    """
-    cn = pyodbc.connect(_conn_str())
-    try:
-        yield cn
-    finally:
-        with contextlib.suppress(Exception):
-            cn.close()
-
-
-def _rows_to_dicts(cursor: pyodbc.Cursor, rows: Iterable[Sequence[Any]]) -> List[Dict[str, Any]]:
-    """
-    Convert pyodbc row tuples into dicts keyed by column name.
-    """
-    cols = [c[0] for c in cursor.description] if cursor.description else []
+def _run(
+    sql: str,
+    params: Dict[str, Any],
+    timeout: int = 90,
+) -> List[Dict[str, Any]]:
+    client = _client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[_bq_param(k, v) for k, v in params.items()]
+    )
+    job = client.query(sql, job_config=job_config)
+    result = job.result(timeout=timeout)  # type: ignore[arg-type]
     out: List[Dict[str, Any]] = []
-    for r in rows:
-        out.append({cols[i]: r[i] for i in range(len(cols))})
+    for row in result:
+        out.append(dict(row.items()))
     return out
 
 
-def _stream_with_pagination(cursor: pyodbc.Cursor, limit: int, offset: int) -> List[Dict[str, Any]]:
-    """
-    Stream rows from the cursor and apply offset/limit without materializing everything.
-
-    - We consume and discard `offset` rows.
-    - We collect up to `limit` rows.
-    """
-    if limit <= 0:
-        return []
-    if offset < 0:
-        offset = 0
-
-    # Fetch in modest chunks; pyodbc doesn't support skipping without reading.
-    chunk_size = 500
-    out_rows: List[Sequence[Any]] = []
-
-    # Discard rows up to offset
-    remaining_to_discard = offset
-    while remaining_to_discard > 0:
-        to_fetch = min(chunk_size, remaining_to_discard)
-        chunk = cursor.fetchmany(to_fetch)
-        if not chunk:
-            break
-        remaining_to_discard -= len(chunk)
-
-    # Collect up to limit
-    remaining = limit
-    while remaining > 0:
-        to_fetch = min(chunk_size, remaining)
-        chunk = cursor.fetchmany(to_fetch)
-        if not chunk:
-            break
-        out_rows.extend(chunk)
-        remaining -= len(chunk)
-
-    return _rows_to_dicts(cursor, out_rows)
-
-
-# -------- Public adapter functions (one per proc) --------
+# ---------- Public adapter functions (one per tool) ----------
 
 def run_allapps_score_by_user(
     *,
     email: str,
     vast_csv: Optional[str],
     report_month: Optional[str],
-    limit: int = 1000,
-    offset: int = 0,
+    limit: int,
+    offset: int,
 ) -> List[Dict[str, Any]]:
     """
-    Execute dbo.SPGetAllAppsScoreByUser.
-    - If @ReportMonth is NULL, the proc returns the latest month.
+    Fallback for SPGetAllAppsScoreByUser.
+    - If report_month is provided, filter to that literal 'YYYY-MM-01 00:00:00'.
+    - If omitted, we read the latest month (via a subquery).
     """
-    with _connect() as cn:
-        cursor = cn.cursor()
-        cursor.execute(
-            "EXEC dbo.SPGetAllAppsScoreByUser @Email=?, @VAST=?, @ReportMonth=?",
-            (email, vast_csv, report_month),
-        )
-        return _stream_with_pagination(cursor, limit, offset)
+    prj, ds, tbl = BQ_PROJECT_ID, BQ_DATASET, BQ_TABLE_ALLAPPS_SCORE
+    filter_rm = "AND ReportMonth = @report_month" if report_month else ""
+
+    latest_month_cte = "" if report_month else f"""
+, latest_rm AS (
+  SELECT MAX(ReportMonth) AS rm FROM `{prj}.{ds}.{tbl}`
+)
+"""
+
+    effective_rm_join = "" if report_month else """
+JOIN latest_rm USING ()  -- cross join singleton
+"""
+
+    sql = f"""
+{_email_acl_cte()}
+{latest_month_cte}
+SELECT *
+FROM `{prj}.{ds}.{tbl}`
+{effective_rm_join}
+WHERE TRUE
+{_vast_filter_sql("VastID")}
+{filter_rm if report_month else "AND ReportMonth = latest_rm.rm"}
+ORDER BY VastID
+LIMIT @limit OFFSET @offset
+"""
+
+    params = {
+        "email": email,
+        "vast_csv": vast_csv,
+        "report_month": report_month,
+        "limit": int(limit),
+        "offset": int(offset),
+    }
+    return _run(sql, params)
 
 
 def run_allapps_value_by_user(
@@ -148,37 +170,78 @@ def run_allapps_value_by_user(
     email: str,
     vast_csv: Optional[str],
     report_month: Optional[str],
-    limit: int = 1000,
-    offset: int = 0,
+    limit: int,
+    offset: int,
 ) -> List[Dict[str, Any]]:
     """
-    Execute dbo.SPGetAllAppsValueByUser.
-    - If @ReportMonth is NULL, the proc returns the latest month.
+    Fallback for SPGetAllAppsValueByUser.
+    - If report_month is provided, filter to that literal 'YYYY-MM-01 00:00:00'.
+    - If omitted, we read the latest month (via a subquery).
     """
-    with _connect() as cn:
-        cursor = cn.cursor()
-        cursor.execute(
-            "EXEC dbo.SPGetAllAppsValueByUser @Email=?, @VAST=?, @ReportMonth=?",
-            (email, vast_csv, report_month),
-        )
-        return _stream_with_pagination(cursor, limit, offset)
+    prj, ds, tbl = BQ_PROJECT_ID, BQ_DATASET, BQ_TABLE_ALLAPPS_VALUE
+    filter_rm = "AND ReportMonth = @report_month" if report_month else ""
+
+    latest_month_cte = "" if report_month else f"""
+, latest_rm AS (
+  SELECT MAX(ReportMonth) AS rm FROM `{prj}.{ds}.{tbl}`
+)
+"""
+
+    effective_rm_join = "" if report_month else """
+JOIN latest_rm USING ()  -- cross join singleton
+"""
+
+    sql = f"""
+{_email_acl_cte()}
+{latest_month_cte}
+SELECT *
+FROM `{prj}.{ds}.{tbl}`
+{effective_rm_join}
+WHERE TRUE
+{_vast_filter_sql("VastID")}
+{filter_rm if report_month else "AND ReportMonth = latest_rm.rm"}
+ORDER BY VastID
+LIMIT @limit OFFSET @offset
+"""
+
+    params = {
+        "email": email,
+        "vast_csv": vast_csv,
+        "report_month": report_month,
+        "limit": int(limit),
+        "offset": int(offset),
+    }
+    return _run(sql, params)
 
 
 def run_vast_general_by_user(
     *,
     email: str,
     vast_csv: Optional[str],
-    limit: int = 1000,
-    offset: int = 0,
+    limit: int,
+    offset: int,
 ) -> List[Dict[str, Any]]:
     """
-    Execute dbo.SPGetVastGeneralByUser.
-    - Compliance/general facts; includes decommissioned VASTs.
+    Fallback for SPGetVastGeneralByUser.
+    - Non-snapshot table (no ReportMonth).
     """
-    with _connect() as cn:
-        cursor = cn.cursor()
-        cursor.execute(
-            "EXEC dbo.SPGetVastGeneralByUser @Email=?, @VAST=?",
-            (email, vast_csv),
-        )
-        return _stream_with_pagination(cursor, limit, offset)
+    prj, ds, tbl = BQ_PROJECT_ID, BQ_DATASET, BQ_TABLE_VAST_GENERAL
+
+    sql = f"""
+{_email_acl_cte()}
+SELECT *
+FROM `{prj}.{ds}.{tbl}`
+WHERE TRUE
+{_vast_filter_sql("VastID")}
+ORDER BY VastID
+LIMIT @limit OFFSET @offset
+"""
+
+    params = {
+        "email": email,
+        "vast_csv": vast_csv,
+        "limit": int(limit),
+        "offset": int(offset),
+    }
+    return _run(sql, params)
+
