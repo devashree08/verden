@@ -1,127 +1,43 @@
-"""
-Input JSON Schemas for MCP tools (single source of truth).
+# Tool contract checks (manual smoke)
 
-Important:
-- Clients NEVER send `email`. The server extracts it from the OIDC JWT.
-- `vast` may be CSV ("101,202") or an array ([101, 202]); we normalize to CSV.
-- `report_month` accepts "YYYY-MM" or "Month YYYY" (e.g., "February 2024");
-  we normalize to the literal "YYYY-MM-01 00:00:00" (no timezone math).
-  This literal is stored by the DB as conceptually **EST midnight**.
-- Pagination: limit default 1000, cap 15000; offset default 0.
-"""
+## get_all_apps_score_by_user
+**Request**
+```json
+{ "params": { "limit": 1 } }
+```
+**Expect**
+- 200 OK
+- JSON: `{ "rows": [ ... ] }`
+- rows length <= 1
+- When `report_month` omitted → `ReportMonth` equals the latest snapshot month in the DB.
 
-# Common $defs reused by all schemas. Keep inline to avoid extra files.
-COMMON_DEFS = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "urn:schemas:mcp:common",
-    "$defs": {
-        "vastCsv": {
-            "type": "string",
-            "title": "VAST IDs (CSV)",
-            "description": "Comma-separated VAST IDs, e.g., '101,202,303'. Whitespace allowed.",
-            "pattern": r"^\s*\d+\s*(\s*,\s*\d+\s*)*$",
-            "examples": ["101,202,303"],
-        },
-        "vastArray": {
-            "type": "array",
-            "title": "VAST IDs (Array)",
-            "description": "Array of VAST IDs; will be normalized to CSV internally.",
-            "items": {
-                "oneOf": [
-                    {"type": "integer", "minimum": 0},
-                    {"type": "string", "pattern": r"^\d+$"},
-                ]
-            },
-            "examples": [[101, 202, 303]],
-        },
-        "vast": {
-            "title": "VAST IDs",
-            "description": (
-                "Optional filter to specific VAST IDs. Accepts CSV string or array. "
-                "If omitted or empty, no VAST filter is applied (RBAC still enforced)."
-            ),
-            "oneOf": [{"$ref": "#/$defs/vastCsv"}, {"$ref": "#/$defs/vastArray"}],
-        },
-        "limit": {
-            "type": "integer",
-            "title": "Limit",
-            "minimum": 1,
-            "maximum": 15000,
-            "default": 1000,
-            "description": "Maximum rows to return (1–15000). Default 1000.",
-        },
-        "offset": {
-            "type": "integer",
-            "title": "Offset",
-            "minimum": 0,
-            "default": 0,
-            "description": "Rows to skip before returning results. Default 0.",
-        },
-        "reportMonth": {
-            "type": "string",
-            "title": "Report Month",
-            "description": (
-                "Target month to query. Accepts 'YYYY-MM' (e.g., '2024-02') or natural language like "
-                "'February 2024'. Normalized to the literal 'YYYY-MM-01 00:00:00'. "
-                "The DB stores this as a naive string that represents **EST midnight**."
-            ),
-            "examples": ["2024-02", "February 2024", "2024-02-01 00:00:00"],
-        },
-    },
-}
+**Request (specific month)**
+```json
+{ "params": { "report_month": "Feb 2025", "vast": ["101","202"], "limit": 100 } }
+```
+**Expect**
+- `report_month` normalized to `"2025-02-01 00:00:00"`
+- rows only include those VASTs (and only rows for that month)
 
-# 1) Score tool — monthly snapshots; omit report_month => latest frozen
-GET_ALL_APPS_SCORE_BY_USER = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "get_all_apps_score_by_user Input",
-    "type": "object",
-    "additionalProperties": False,
-    "description": (
-        "QRM score monthly snapshot for the caller’s permitted VASTs. "
-        "Email is extracted from the bearer token. If 'report_month' is omitted, "
-        "the stored procedure returns the latest frozen month."
-    ),
-    "properties": {
-        "vast": {"$ref": "urn:schemas:mcp:common#/$defs/vast"},
-        "report_month": {"$ref": "urn:schemas:mcp:common#/$defs/reportMonth"},
-        "limit": {"$ref": "urn:schemas:mcp:common#/$defs/limit"},
-        "offset": {"$ref": "urn:schemas:mcp:common#/$defs/offset"},
-    },
-}
+## get_all_apps_value_by_user
+**Request**
+```json
+{ "params": { "report_month": "2025-07", "limit": 5 } }
+```
+**Expect**
+- `report_month` normalized to `"2025-07-01 00:00:00"`
+- rows length <= 5
 
-# 2) Value tool — monthly snapshots; omit report_month => latest
-GET_ALL_APPS_VALUE_BY_USER = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "get_all_apps_value_by_user Input",
-    "type": "object",
-    "additionalProperties": False,
-    "description": (
-        "Values monthly snapshot per VAST (ownership, counts, etc.). "
-        "Email is extracted from the bearer token. If 'report_month' is omitted, "
-        "the stored procedure returns the latest month."
-    ),
-    "properties": {
-        "vast": {"$ref": "urn:schemas:mcp:common#/$defs/vast"},
-        "report_month": {"$ref": "urn:schemas:mcp:common#/$defs/reportMonth"},
-        "limit": {"$ref": "urn:schemas:mcp:common#/$defs/limit"},
-        "offset": {"$ref": "urn:schemas:mcp:common#/$defs/offset"},
-    },
-}
+## get_vast_general_by_user
+**Request**
+```json
+{ "params": { "vast": "123,456", "limit": 5 } }
+```
+**Expect**
+- rows length <= 5
+- Includes decommissioned VASTs as applicable
 
-# 3) General tool — non-snapshot; no report_month
-GET_VAST_GENERAL_BY_USER = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "get_vast_general_by_user Input",
-    "type": "object",
-    "additionalProperties": False,
-    "description": (
-        "Compliance/general details per VAST (includes decommissioned). "
-        "Email is extracted from the bearer token."
-    ),
-    "properties": {
-        "vast": {"$ref": "urn:schemas:mcp:common#/$defs/vast"},
-        "limit": {"$ref": "urn:schemas:mcp:common#/$defs/limit"},
-        "offset": {"$ref": "urn:schemas:mcp:common#/$defs/offset"},
-    },
-}
-
+## Input normalization edge cases
+- `vast = ""` or `[]` → treated as `None` (no filter)
+- `report_month = "  "` → treated as `None`
+- `report_month` invalid (e.g., `"Febtober 2025"`) → treated as `None` (proc uses latest)
