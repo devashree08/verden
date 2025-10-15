@@ -1,43 +1,21 @@
-# Tool contract checks (manual smoke)
+## Tools (how to pick)
 
-## get_all_apps_score_by_user
-**Request**
-```json
-{ "params": { "limit": 1 } }
-```
-**Expect**
-- 200 OK
-- JSON: `{ "rows": [ ... ] }`
-- rows length <= 1
-- When `report_month` omitted → `ReportMonth` equals the latest snapshot month in the DB.
+All tools derive the user’s identity from the OIDC token (email) and enforce RBAC in the DB layer.
 
-**Request (specific month)**
-```json
-{ "params": { "report_month": "Feb 2025", "vast": ["101","202"], "limit": 100 } }
-```
-**Expect**
-- `report_month` normalized to `"2025-02-01 00:00:00"`
-- rows only include those VASTs (and only rows for that month)
+1) **get_all_apps_score_by_user**  
+   QRM score **monthly snapshot** per VAST.  
+   - Inputs: `vast` (CSV or list, optional), `report_month` (optional), `limit`, `offset`  
+   - If `report_month` is omitted, the proc returns the **latest** frozen month.  
+   - For multi-month ranges, the **agent should call once per month** and merge client-side.  
+   - `report_month` is normalized to the string literal `YYYY-MM-01 00:00:00` (no timezone math). This literal represents **EST midnight** in the DB.
 
-## get_all_apps_value_by_user
-**Request**
-```json
-{ "params": { "report_month": "2025-07", "limit": 5 } }
-```
-**Expect**
-- `report_month` normalized to `"2025-07-01 00:00:00"`
-- rows length <= 5
+2) **get_all_apps_value_by_user**  
+   **Values** monthly snapshot per VAST (ownership, counts, etc.).  
+   - Inputs: `vast` (CSV or list, optional), `report_month` (optional), `limit`, `offset`  
+   - Same semantics as Score: omit `report_month` for latest; agent loops for spans.  
+   - `report_month` normalization identical to above (EST midnight literal, no tz conversion).
 
-## get_vast_general_by_user
-**Request**
-```json
-{ "params": { "vast": "123,456", "limit": 5 } }
-```
-**Expect**
-- rows length <= 5
-- Includes decommissioned VASTs as applicable
-
-## Input normalization edge cases
-- `vast = ""` or `[]` → treated as `None` (no filter)
-- `report_month = "  "` → treated as `None`
-- `report_month` invalid (e.g., `"Febtober 2025"`) → treated as `None` (proc uses latest)
+3) **get_vast_general_by_user**  
+   Compliance / general metadata per VAST (includes decommissioned).  
+   - Inputs: `vast` (CSV or list, optional), `limit`, `offset`  
+   - **No** `report_month` (non-snapshot).
