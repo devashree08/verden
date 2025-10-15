@@ -1,71 +1,184 @@
 """
-Tool: get_vast_general_by_user
+MSSQL adapter (primary backend).
 
-Purpose
--------
-Compliance / general metadata per VAST for the caller (includes decommissioned VASTs).
-No report_month parameter (non-snapshot table).
+- ODBC Driver 18 with SQL auth (user/password).
+- Procs:
+    - dbo.SPGetAllAppsScoreByUser(@Email NVARCHAR(320), @VAST NVARCHAR(MAX)=NULL, @ReportMonth DATETIME=NULL)
+    - dbo.SPGetAllAppsValueByUser(@Email NVARCHAR(320), @VAST NVARCHAR(MAX)=NULL, @ReportMonth DATETIME=NULL)
+    - dbo.SPGetVastGeneralByUser(@Email NVARCHAR(320), @VAST NVARCHAR(MAX)=NULL)
 
-Inputs
-------
-- vast (optional), limit, offset
-
-Output
-------
-{ "rows": [ ... ] }
+- We DO NOT set cursor.timeout (can be missing on some pyodbc builds).
+- Connection timeout is set in the DSN; command timeout uses server defaults.
+- Pagination: streamed on the client to avoid loading huge result sets into memory all at once.
 """
 
 from __future__ import annotations
-from typing import Dict, Any
 
-from pydantic import BaseModel, Field
-from fastmcp import Context
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+import contextlib
+import logging
 
-from framework.core.registry import mcp
-from framework.core.config import DB_BACKEND
-from framework.schemas.inputs import normalize_vast_csv
-from framework.schemas.outputs import rows_schema
-from framework.adapters import mssql as mssql_adapter
-from framework.adapters import bigquery as bq_adapter  # fallback only
+import pyodbc
 
-
-class GeneralParams(BaseModel):
-    vast: str | list[str | int] | None = Field(
-        default=None,
-        description="VAST filter (CSV or list). Omit to include all caller-permitted VASTs (including decommissioned).",
-    )
-    limit: int = Field(default=1000, ge=1, le=15000)
-    offset: int = Field(default=0, ge=0)
-
-
-@mcp.tool(
-    name="get_vast_general_by_user",
-    description=(
-        "Compliance/general metadata per VAST for the authenticated user. "
-        "Includes decommissioned VASTs. No report_month filter."
-    ),
-    output_schema=rows_schema,
+from framework.core.config import (
+    SQLSERVER_HOST,
+    SQLSERVER_PORT,
+    SQLSERVER_DATABASE,
+    SQLSERVER_USERNAME,
+    SQLSERVER_PASSWORD,
+    ALLOW_INSECURE_SQL_ENCRYPTION,
 )
-async def get_vast_general_by_user(params: GeneralParams, ctx: Context) -> Dict[str, Any]:
-    email: str = ctx.state.get("email")
-    if not email:
-        return {"rows": []}
 
-    vast_csv = normalize_vast_csv(params.vast)
+log = logging.getLogger(__name__)
 
-    if DB_BACKEND == "mssql":
-        rows = mssql_adapter.run_vast_general_by_user(
-            email=email,
-            vast_csv=vast_csv,
-            limit=params.limit,
-            offset=params.offset,
-        )
-        return {"rows": rows}
+# Keep connection timeout conservative — network hiccups should fail fast.
+_CONNECT_TIMEOUT = 10  # seconds
 
-    rows = bq_adapter.run_vast_general_by_user(
-        email=email,
-        vast_csv=vast_csv,
-        limit=params.limit,
-        offset=params.offset,
+
+def _conn_str() -> str:
+    """
+    Build the ODBC 18 connection string.
+
+    If/when you move to strict TLS:
+      - set Encrypt=yes;TrustServerCertificate=no
+      - make sure Windows/RHEL trust store contains the issuing CA
+    """
+    enc = "no" if ALLOW_INSECURE_SQL_ENCRYPTION else "yes"
+    trust = "yes" if ALLOW_INSECURE_SQL_ENCRYPTION else "no"
+
+    return (
+        f"Driver={{ODBC Driver 18 for SQL Server}};"
+        f"Server=tcp:{SQLSERVER_HOST},{SQLSERVER_PORT};"
+        f"Database={SQLSERVER_DATABASE};"
+        f"Uid={SQLSERVER_USERNAME};"
+        f"Pwd={SQLSERVER_PASSWORD};"
+        f"Encrypt={enc};"
+        f"TrustServerCertificate={trust};"
+        f"Connection Timeout={_CONNECT_TIMEOUT};"
     )
-    return {"rows": rows}
+
+
+@contextlib.contextmanager
+def _connect():
+    """
+    Context manager so we always close connections even on exceptions.
+    """
+    cn = pyodbc.connect(_conn_str())
+    try:
+        yield cn
+    finally:
+        with contextlib.suppress(Exception):
+            cn.close()
+
+
+def _rows_to_dicts(cursor: pyodbc.Cursor, rows: Iterable[Sequence[Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert pyodbc row tuples into dicts keyed by column name.
+    """
+    cols = [c[0] for c in cursor.description] if cursor.description else []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append({cols[i]: r[i] for i in range(len(cols))})
+    return out
+
+
+def _stream_with_pagination(cursor: pyodbc.Cursor, limit: int, offset: int) -> List[Dict[str, Any]]:
+    """
+    Stream rows from the cursor and apply offset/limit without materializing everything.
+
+    - We consume and discard `offset` rows.
+    - We collect up to `limit` rows.
+    """
+    if limit <= 0:
+        return []
+    if offset < 0:
+        offset = 0
+
+    # Fetch in modest chunks; pyodbc doesn't support skipping without reading.
+    chunk_size = 500
+    out_rows: List[Sequence[Any]] = []
+
+    # Discard rows up to offset
+    remaining_to_discard = offset
+    while remaining_to_discard > 0:
+        to_fetch = min(chunk_size, remaining_to_discard)
+        chunk = cursor.fetchmany(to_fetch)
+        if not chunk:
+            break
+        remaining_to_discard -= len(chunk)
+
+    # Collect up to limit
+    remaining = limit
+    while remaining > 0:
+        to_fetch = min(chunk_size, remaining)
+        chunk = cursor.fetchmany(to_fetch)
+        if not chunk:
+            break
+        out_rows.extend(chunk)
+        remaining -= len(chunk)
+
+    return _rows_to_dicts(cursor, out_rows)
+
+
+# -------- Public adapter functions (one per proc) --------
+
+def run_allapps_score_by_user(
+    *,
+    email: str,
+    vast_csv: Optional[str],
+    report_month: Optional[str],
+    limit: int = 1000,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Execute dbo.SPGetAllAppsScoreByUser.
+    - If @ReportMonth is NULL, the proc returns the latest month.
+    """
+    with _connect() as cn:
+        cursor = cn.cursor()
+        cursor.execute(
+            "EXEC dbo.SPGetAllAppsScoreByUser @Email=?, @VAST=?, @ReportMonth=?",
+            (email, vast_csv, report_month),
+        )
+        return _stream_with_pagination(cursor, limit, offset)
+
+
+def run_allapps_value_by_user(
+    *,
+    email: str,
+    vast_csv: Optional[str],
+    report_month: Optional[str],
+    limit: int = 1000,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Execute dbo.SPGetAllAppsValueByUser.
+    - If @ReportMonth is NULL, the proc returns the latest month.
+    """
+    with _connect() as cn:
+        cursor = cn.cursor()
+        cursor.execute(
+            "EXEC dbo.SPGetAllAppsValueByUser @Email=?, @VAST=?, @ReportMonth=?",
+            (email, vast_csv, report_month),
+        )
+        return _stream_with_pagination(cursor, limit, offset)
+
+
+def run_vast_general_by_user(
+    *,
+    email: str,
+    vast_csv: Optional[str],
+    limit: int = 1000,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Execute dbo.SPGetVastGeneralByUser.
+    - Compliance/general facts; includes decommissioned VASTs.
+    """
+    with _connect() as cn:
+        cursor = cn.cursor()
+        cursor.execute(
+            "EXEC dbo.SPGetVastGeneralByUser @Email=?, @VAST=?",
+            (email, vast_csv),
+        )
+        return _stream_with_pagination(cursor, limit, offset)
