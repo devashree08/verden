@@ -1,42 +1,33 @@
-schema_version: 1
-tool: get_all_apps_score_by_user
-temporal_scope: monthly_snapshot
-last_updated: '2025-10-15'
-notes: >
-  QRM score snapshot per VAST. If ReportMonth is omitted at query-time,
-  the proc returns the latest frozen month. Columns below are placeholders
-  until SME-reviewed.
+"""
+Input normalizers for tools.
 
-columns:
-  - name: VastID
-    type: int
-    mssql_type: int
-    bq_type: INT64
-    description: Application VAST identifier.
-    canonical_source: get_all_apps_score_by_user
-    nullable: false
-    also_available_in:
-      - get_all_apps_value_by_user
-      - get_vast_general_by_user
-    description_auto: false
+- normalize_vast_csv(vast):
+    Accepts CSV string ("101, 202") or list/tuple ([101, "202"]).
+    Returns a clean CSV: "101,202", or None if empty. Never injects spaces.
 
-  - name: ReportMonth
-    type: datetime
-    mssql_type: datetime
-    bq_type: TIMESTAMP
-    description: Month snapshot boundary (YYYY-MM-01 00:00:00).
-    canonical_source: get_all_apps_score_by_user
-    nullable: false
-    also_available_in:
-      - get_all_apps_value_by_user
-    description_auto: false
+- normalize_report_month_literal(report_month):
+    Accepts "YYYY-MM", "Month YYYY" (e.g., "Feb 2025"), or the full literal
+    "YYYY-MM-01 00:00:00". Returns the **string literal** "YYYY-MM-01 00:00:00".
 
-  - name: QRMScore
-    type: decimal
-    mssql_type: decimal(38,6)
-    bq_type: NUMERIC
-    description: Quantitative risk score for the application.
-    canonical_source: get_all_apps_score_by_user
-    nullable: true
-    also_available_in: []
-    description_auto: true
+    IMPORTANT (EST rule): We DO NOT apply timezone math. The DB stores a
+    naive literal (no timezone) that is **conceptually EST** at midnight.
+    This function only formats to that literal; it never converts between
+    timezones. If parsing fails, returns None so the tool can omit the
+    parameter (allowing the proc to use the latest month).
+"""
+from __future__ import annotations
+from typing import Iterable, Optional, Union
+
+# ... leave your imports and implementations as-is ...
+
+# Update per-argument descriptions (for Pydantic field help in tools):
+# - In get_all_apps_* tools, ensure Field(description=...) matches:
+#
+# vast:
+#   "VAST filter. Accepts CSV (e.g., '101,202') or a list like [101, '202'].
+#    Omit for all caller-permitted VASTs."
+#
+# report_month:
+#   "Month to query. Accepts 'YYYY-MM', 'Month YYYY', or the exact literal
+#    'YYYY-MM-01 00:00:00'. If omitted, the proc returns the latest month.
+#    Note: stored as a naive literal that represents EST midnight; no timezone math."
