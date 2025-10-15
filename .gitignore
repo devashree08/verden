@@ -1,247 +1,46 @@
 """
-BigQuery adapter (fallback backend).
+Resource: fields://{tool_name}
 
-- Mirrors MSSQL function signatures so tools can switch by DB_BACKEND.
-- Enforces row-level security in-SQL by deriving caller EID from workers and
-  intersecting with allowed VASTs before reading data tables.
-- Parameterized queries via google-cloud-bigquery (no string interpolation).
-- LIMIT/OFFSET applied in SQL.
-
-Table names come from config:
-  - BQ_TABLE_ALLAPPS_SCORE
-  - BQ_TABLE_ALLAPPS_VALUE
-  - BQ_TABLE_VAST_GENERAL
-
-Reference tables (same dataset):
-  - ref_aaas_workers_outbound
-  - ref_eid_vast_map
+Resolve per-tool field dictionaries stored under server/resources/fields/*.yaml.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict
 
-import logging
-from google.cloud import bigquery
+from fastmcp import Context
+from ruamel.yaml import YAML
+from framework.core.registry import mcp
 
-from framework.core.config import (
-    BQ_PROJECT_ID,
-    BQ_DATASET,
-    BQ_TABLE_ALLAPPS_SCORE,
-    BQ_TABLE_ALLAPPS_VALUE,
-    BQ_TABLE_VAST_GENERAL,
-)
+_FIELDS_DIR = Path(__file__).resolve().parent / "fields"
 
-log = logging.getLogger(__name__)
-
-# Reference tables (dataset-scoped)
-_REF_WORKERS = "ref_aaas_workers_outbound"
-_REF_EID_VAST = "ref_eid_vast_map"
+_TOOL_TO_FILE = {
+    "get_all_apps_score_by_user": _FIELDS_DIR / "allapps_score.yaml",
+    "get_all_apps_value_by_user": _FIELDS_DIR / "allapps_value.yaml",
+    "get_vast_general_by_user": _FIELDS_DIR / "vast_general.yaml",
+}
 
 
-def _client() -> bigquery.Client:
-    # If BQ_PROJECT_ID is empty, the client uses ADC's default project.
-    return bigquery.Client(project=BQ_PROJECT_ID or None)
+def _load_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Field dictionary not found: {path.name}")
+    yaml = YAML(typ="safe")
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.load(f) or {}
 
 
-def _bq_param(name: str, value: Any) -> bigquery.ScalarQueryParameter:
-    """
-    Map Python types to BQ parameter types.
-    - report_month is passed as a STRING literal in DB format 'YYYY-MM-01 00:00:00'.
-    """
-    if isinstance(value, bool):
-        return bigquery.ScalarQueryParameter(name, "BOOL", value)
-    if isinstance(value, int):
-        return bigquery.ScalarQueryParameter(name, "INT64", value)
-    # Default to string; covers email, csv, report_month.
-    return bigquery.ScalarQueryParameter(name, "STRING", value)
-
-
-def _email_acl_cte() -> str:
-    """
-    CTE that resolves caller email -> EID, then EID -> allowed VASTs.
-    """
-    ds = BQ_DATASET
-    prj = BQ_PROJECT_ID
-    return f"""
-WITH email_to_eid AS (
-  SELECT CAST(MIN(w.identityeid) AS STRING) AS eid
-  FROM `{prj}.{ds}.{_REF_WORKERS}` AS w
-  WHERE LOWER(TRIM(w.emailaddressinternal)) = LOWER(TRIM(@email))
-),
-allowed_vasts AS (
-  SELECT DISTINCT ev.vast_id
-  FROM `{prj}.{ds}.{_REF_EID_VAST}` AS ev
-  JOIN email_to_eid e ON ev.eid = e.eid
-)
-"""
-
-
-def _vast_filter_sql(column_name: str) -> str:
-    """
-    Build a filter that intersects the provided VAST list (if any) with allowed_vasts.
-
-    The provided list is a CSV string; we split and cast to INT64 safely.
-    """
-    return f"""
-AND (
-  @vast_csv IS NULL
-  OR {column_name} IN UNNEST(
-      ARRAY(
-        SELECT CAST(TRIM(x) AS INT64)
-        FROM UNNEST(SPLIT(@vast_csv, ',')) AS x
-        WHERE TRIM(x) != ''
-      )
-    )
-)
-AND {column_name} IN (SELECT vast_id FROM allowed_vasts)
-"""
-
-
-def _run(
-    sql: str,
-    params: Dict[str, Any],
-    timeout: int = 90,
-) -> List[Dict[str, Any]]:
-    client = _client()
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[_bq_param(k, v) for k, v in params.items()]
-    )
-    job = client.query(sql, job_config=job_config)
-    result = job.result(timeout=timeout)  # type: ignore[arg-type]
-    out: List[Dict[str, Any]] = []
-    for row in result:
-        out.append(dict(row.items()))
-    return out
-
-
-# ---------- Public adapter functions (one per tool) ----------
-
-def run_allapps_score_by_user(
-    *,
-    email: str,
-    vast_csv: Optional[str],
-    report_month: Optional[str],
-    limit: int,
-    offset: int,
-) -> List[Dict[str, Any]]:
-    """
-    Fallback for SPGetAllAppsScoreByUser.
-    - If report_month is provided, filter to that literal 'YYYY-MM-01 00:00:00'.
-    - If omitted, we read the latest month (via a subquery).
-    """
-    prj, ds, tbl = BQ_PROJECT_ID, BQ_DATASET, BQ_TABLE_ALLAPPS_SCORE
-    filter_rm = "AND ReportMonth = @report_month" if report_month else ""
-
-    latest_month_cte = "" if report_month else f"""
-, latest_rm AS (
-  SELECT MAX(ReportMonth) AS rm FROM `{prj}.{ds}.{tbl}`
-)
-"""
-
-    effective_rm_join = "" if report_month else """
-JOIN latest_rm USING ()  -- cross join singleton
-"""
-
-    sql = f"""
-{_email_acl_cte()}
-{latest_month_cte}
-SELECT *
-FROM `{prj}.{ds}.{tbl}`
-{effective_rm_join}
-WHERE TRUE
-{_vast_filter_sql("VastID")}
-{filter_rm if report_month else "AND ReportMonth = latest_rm.rm"}
-ORDER BY VastID
-LIMIT @limit OFFSET @offset
-"""
-
-    params = {
-        "email": email,
-        "vast_csv": vast_csv,
-        "report_month": report_month,
-        "limit": int(limit),
-        "offset": int(offset),
-    }
-    return _run(sql, params)
-
-
-def run_allapps_value_by_user(
-    *,
-    email: str,
-    vast_csv: Optional[str],
-    report_month: Optional[str],
-    limit: int,
-    offset: int,
-) -> List[Dict[str, Any]]:
-    """
-    Fallback for SPGetAllAppsValueByUser.
-    - If report_month is provided, filter to that literal 'YYYY-MM-01 00:00:00'.
-    - If omitted, we read the latest month (via a subquery).
-    """
-    prj, ds, tbl = BQ_PROJECT_ID, BQ_DATASET, BQ_TABLE_ALLAPPS_VALUE
-    filter_rm = "AND ReportMonth = @report_month" if report_month else ""
-
-    latest_month_cte = "" if report_month else f"""
-, latest_rm AS (
-  SELECT MAX(ReportMonth) AS rm FROM `{prj}.{ds}.{tbl}`
-)
-"""
-
-    effective_rm_join = "" if report_month else """
-JOIN latest_rm USING ()  -- cross join singleton
-"""
-
-    sql = f"""
-{_email_acl_cte()}
-{latest_month_cte}
-SELECT *
-FROM `{prj}.{ds}.{tbl}`
-{effective_rm_join}
-WHERE TRUE
-{_vast_filter_sql("VastID")}
-{filter_rm if report_month else "AND ReportMonth = latest_rm.rm"}
-ORDER BY VastID
-LIMIT @limit OFFSET @offset
-"""
-
-    params = {
-        "email": email,
-        "vast_csv": vast_csv,
-        "report_month": report_month,
-        "limit": int(limit),
-        "offset": int(offset),
-    }
-    return _run(sql, params)
-
-
-def run_vast_general_by_user(
-    *,
-    email: str,
-    vast_csv: Optional[str],
-    limit: int,
-    offset: int,
-) -> List[Dict[str, Any]]:
-    """
-    Fallback for SPGetVastGeneralByUser.
-    - Non-snapshot table (no ReportMonth).
-    """
-    prj, ds, tbl = BQ_PROJECT_ID, BQ_DATASET, BQ_TABLE_VAST_GENERAL
-
-    sql = f"""
-{_email_acl_cte()}
-SELECT *
-FROM `{prj}.{ds}.{tbl}`
-WHERE TRUE
-{_vast_filter_sql("VastID")}
-ORDER BY VastID
-LIMIT @limit OFFSET @offset
-"""
-
-    params = {
-        "email": email,
-        "vast_csv": vast_csv,
-        "limit": int(limit),
-        "offset": int(offset),
-    }
-    return _run(sql, params)
+@mcp.resource("fields://{tool_name}")
+async def describe_fields(tool_name: str, ctx: Context) -> Dict[str, Any]:
+    path = _TOOL_TO_FILE.get(tool_name)
+    if path is None:
+        return {
+            "error": "unknown_tool",
+            "message": f"Unsupported tool name '{tool_name}'.",
+            "supported": list(_TOOL_TO_FILE.keys()),
+        }
+    data = _load_yaml(path)
+    data.setdefault("_meta", {})
+    data["_meta"]["served_by"] = "fields-resource"
+    data["_meta"]["tool_name"] = tool_name
+    return data
 
