@@ -1,43 +1,4 @@
-# Build, push, and deploy (Cloud Run)
-
-## 1) Build & push to Artifact Registry
-**One-time:** login
-```bash
-gcloud auth configure-docker us-east4-docker.pkg.dev
-```
-
-**Build**
-```bash
-docker build -t us-east4-docker.pkg.dev/<PROJECT_ID>/j9cv-VCSChatbot-mcp-repo/mcp:v1 -f ops/Dockerfile .
-```
-
-**Push**
-```bash
-docker push us-east4-docker.pkg.dev/<PROJECT_ID>/j9cv-VCSChatbot-mcp-repo/mcp:v1
-```
-
-## 2) Secret Manager (create once)
-Keep secrets minimal as agreed:
-- `SQLSERVER_HOST`, `SQLSERVER_DATABASE`, `SQLSERVER_USERNAME`, `SQLSERVER_PASSWORD`
-
-## 3) Service Account (runtime)
-Grant SA access to secrets + (if needed) BQ + CMEK decrypt on the Run service:
-- `roles/secretmanager.secretAccessor`
-- `roles/bigquery.dataViewer`, `roles/bigquery.jobUser` (if `DB_BACKEND=bigquery`)
-- `roles/cloudkms.cryptoKeyDecrypter`
-
-## 4) Deploy (CMEK + secrets + env)
-```bash
-gcloud run deploy j9cv-VCSChatbot-mcp   --image us-east4-docker.pkg.dev/<PROJECT_ID>/j9cv-VCSChatbot-mcp-repo/mcp:v1   --region us-east4   --platform managed   --port 8080   --cpu 1 --memory 512Mi --concurrency 20 --timeout 300   --min-instances 0   --service-account mcp-runtime@<PROJECT_ID>.iam.gserviceaccount.com   --set-secrets=SQLSERVER_HOST=SQLSERVER_HOST:latest,SQLSERVER_DATABASE=SQLSERVER_DATABASE:latest,SQLSERVER_USERNAME=SQLSERVER_USERNAME:latest,SQLSERVER_PASSWORD=SQLSERVER_PASSWORD:latest   --set-env-vars=LOG_LEVEL=INFO,DB_BACKEND=mssql,OIDC_ISSUER_URI=https://keycloak.example.com/realms/yourrealm,OIDC_JWKS_URI=https://keycloak.example.com/realms/yourrealm/protocol/openid-connect/certs,OIDC_ALLOWED_AUDIENCE=mcp-service,SQLSERVER_PORT=1433,ALLOW_INSECURE_SQL_ENCRYPTION=true   --ingress internal-and-cloud-load-balancing   --kms-key projects/<PROJECT_ID>/locations/us-east4/keyRings/<KEY_RING>/cryptoKeys/<KEY_NAME>
-```
-
-## 5) Flip backend without rebuild (optional)
-**MSSQL → BigQuery**
-```bash
-gcloud run services update j9cv-VCSChatbot-mcp   --region us-east4   --set-env-vars=DB_BACKEND=bigquery,BQ_PROJECT_ID=<PROJECT_ID>,BQ_DATASET=VCSChatbotDateSet,BQ_TABLE_ALLAPPS_VALUE=all_apps_values,BQ_TABLE_ALLAPPS_SUMMARY=all_apps_summary,BQ_TABLE_VAST_GENERAL=vast_general
-```
-
-**BigQuery → MSSQL**
-```bash
-gcloud run services update j9cv-VCSChatbot-mcp   --region us-east4   --set-env-vars=DB_BACKEND=mssql
-```
+curl -sS -X POST "http://127.0.0.1:8080/mcp/" \
+  -H "Content-Type: application/json" \
+  -H "X-User-JWT: <YOUR_KEYCLOAK_JWT>" \
+  -d '{"type":"tools/list"}' | jq
