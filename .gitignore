@@ -1,40 +1,192 @@
-# Paging Cookbook
+# MCP Enterprise Template (HTTP on Cloud Run)
 
-A simple pattern to retrieve large result sets page-by-page.
+Small, readable **Model Context Protocol (MCP) HTTP server** you can clone for new services.
+- **Primary data**: On-prem **MS SQL Server** (via ODBC 18)
+- **Fallback**: **BigQuery** snapshot tables
+- **Auth**: Keycloak OIDC (validate JWT, extract `email` claim internally)
+- **Transport**: MCP over **HTTP** (works with MCP Inspector)
+- **Tooling**: Python 3.13.7, FastMCP, uv, ruff
+- **Runtime**: Dockerfile → Artifact Registry → Cloud Run
 
-## Pattern
-1. First call: use `{"limit": 1000, "offset": 0}`
-2. Next page: re-call with `offset = previous_offset + limit`
+> Goal (Phase-1): run this MCP server on Cloud Run. Keep code simple, boring, and enterprise-ready.
 
-## Example (filtering two VASTs)
-- Call A:
+---
+
+## How it works (end-to-end)
+
+- **Single endpoint**: MCP over HTTP uses **one path** (e.g., `/mcp/`). Tools are *not* separate REST routes. (Some clients use Server-Sent Events at `/mcp/sse`.)
+- **Discovery → tool selection**: Clients (MCP Inspector/agents) hit `/mcp/`, read tool **descriptions** + **JSON Schemas**, then call a tool by name on the same endpoint.
+- **Auth**: Requests include `Authorization: Bearer <JWT>` (Keycloak). Server validates `iss/aud/exp/nbf`, verifies signature via JWKS, and extracts **`email`** from the token.  
+  The extracted **email is used internally** as the stored-proc parameter `@Email`. **Clients do not send `email` in inputs.**
+- **Data access** (adapter switch):
+  - `DB_BACKEND=mssql` → run stored procs via **pyodbc + ODBC Driver 18** (procs enforce `email → EID → access` via `workersfeed` + `ref.UserVastAccess`).
+  - `DB_BACKEND=bigquery` → run SELECTs on exported BQ tables with the **same access semantics**, using exported refs (e.g., `ref_aaas_workers_outbound` for email→EID and `ref_eid_vast_map` for EID→VAST).
+- **Output shape** (all tools):
   ```json
-  {"vast": ["123", "456"], "limit": 1000, "offset": 0}
+  { "rows": [ { /* columns (300–400) */ } ] }
   ```
-- Call B:
-  ```json
-  {"vast": ["123", "456"], "limit": 1000, "offset": 1000}
-  ```
-- Call C:
-  ```json
-  {"vast": ["123", "456"], "limit": 1000, "offset": 2000}
-  ```
+- **Field dictionaries**: `/resources/describe_fields/<tool>` serves YAML/JSON column docs so clients/devs understand large schemas without bloating tool I/O.
+- **Auditing**: On success, logs include request ID, tool name, latency, row count, and the extracted **email** (no tokens).
 
-Stop when the returned `rows` array is empty or you've reached your target.
-----
+---
 
+## Tools (how to pick)
 
-# Tool Selection Guide
+All tools derive the user’s identity from the OIDC token (email) and enforce RBAC in the DB layer.
 
-Use **exactly one** of these tools based on the question intent:
+1) **get_all_apps_score_by_user**  
+   QRM score **monthly snapshot** per VAST.  
+   - Inputs: `vast` (CSV or list, optional), `report_month` (optional), `limit`, `offset`  
+   - If `report_month` is omitted, the proc returns the **latest** frozen month.  
+   - For multi-month ranges, the **agent should call once per month** and merge client-side.  
+   - `report_month` is normalized to the **string literal** `YYYY-MM-01 00:00:00` (naive), which represents **EST midnight** in the DB.
 
-- **get_all_apps_score_by_user** — For **QRM scoring** questions by month. If `report_month` is omitted, it returns the **latest frozen** month.
-- **get_all_apps_value_by_user** — For **monthly counts/rollups** (vulns, assets, etc.). If `report_month` is omitted, it returns the **latest frozen** month.
-- **get_vast_general_by_user** — For **compliance/general attributes** (SOX, PCI, flags). **No** `report_month` parameter.
+2) **get_all_apps_value_by_user**  
+   **Values** monthly snapshot per VAST (ownership, counts, etc.).  
+   - Inputs: `vast` (CSV or list, optional), `report_month` (optional), `limit`, `offset`  
+   - Same semantics as Score: omit `report_month` for latest; agent loops for spans.  
+   - `report_month` normalization identical to above (EST midnight literal, no tz conversion).
 
-**Paging:** Results can be large. Set `limit` (default 1000, max 15000) and `offset`. To fetch the next page, call again with `offset = previous_offset + limit`.
+3) **get_vast_general_by_user**  
+   Compliance / general metadata per VAST (includes decommissioned).  
+   - Inputs: `vast` (CSV or list, optional), `limit`, `offset`  
+   - **No** `report_month` (non-snapshot).
 
-**Columns:** For column meanings, fetch the related fields resource:
-- `fields://get_all_apps_score_by_user`
-- `fields://get_all_apps_value_by_user`
-- `fields://get_vast_general_by_user`
+**Shared normalization**
+- `vast`: accept CSV **or** array; normalize internally to CSV (empty ⇒ omit filter).
+- `report_month`: parse NL or `YYYY-MM` → literal `YYYY-MM-01 00:00:00` (no timezone math).
+
+---
+
+## Repo structure (stable)
+
+```text
+framework/   # Reusable engine: bootstrap, auth, adapters, schemas
+  core/      # HTTP startup, tool/resource registration, config, logging
+  auth/      # OIDC token validation (discovery -> JWKS), extracts `email`
+  adapters/  # mssql (primary), bigquery (fallback)
+  schemas/   # Shared JSON Schemas for inputs/outputs
+server/      # Project layer: add/change code here
+  tools/     # 3 SQL tools + sample tool (one file per tool)
+  resources/ # describe_fields resource + static field dictionaries
+  prompts/   # optional prompt files (md/txt) for agents
+  config/    # runtime env README (no secrets)
+scripts/     # one-offs (e.g., generate field dictionaries)
+ops/         # Dockerfile + deploy notes (Cloud Run)
+tests/       # smoke tests/checklists (auth + tool contracts)
+.env.example # local placeholders only (no secrets)
+pyproject.toml       # uv-managed deps (resolved via uv.lock)
+ruff.toml            # lint + docstring rules
+README.md            # this file
+```
+
+**Ownership**
+- `framework/` is tiny and reusable across projects (plumbing).
+- `server/` is where you spend time (tools/resources/prompts).
+- `ops/` holds the **single** Dockerfile and Cloud Run notes.
+
+---
+
+## Tooling
+
+- **Python** 3.13.7
+- **uv** for env/deps (`uv sync` creates/uses a venv; no separate `python -m venv`)
+- **ruff** for lint + docstrings
+- **MCP Inspector** for local testing (HTTP/SSE)
+- **Docker** to containerize for Cloud Run
+- Later in CI/CD: **Cloud Build**, **Artifact Registry**, **Cloud Run** (org policy may enforce CMEK)
+
+> We set `pyproject.toml` → `[tool.uv] package = false` so `uv sync` does **not** attempt to build/install this repo as a package (flat app layout).
+
+---
+
+## Local dev (Windows / VS Code)
+
+```bash
+# (Optional) lock exact versions for reproducibility
+uv lock
+git add uv.lock
+
+# Install deps (uses uv.lock if present)
+uv sync
+
+# Lint
+uv run ruff check .
+```
+
+When the entrypoint is added:
+```bash
+# Start the MCP HTTP server (exposes /mcp/)
+# uv run python -m framework.core.bootstrap
+
+# Then point MCP Inspector to: http://localhost:8080/mcp/
+```
+
+> If `uv init` created a `src/` directory, delete it. We’re building an app, not a pip package.
+
+---
+
+## Configuration (env + secrets)
+
+- **Non-secret env** (examples):  
+  `OIDC_ISSUER_URI`, `OIDC_ALLOWED_AUDIENCE`, `DB_BACKEND`, `ENCRYPT=false`, `TRUST_SERVER_CERTIFICATE=true`.
+- **Secrets** (examples):  
+  `SQLSERVER_HOST`, `SQLSERVER_DATABASE`, `SQLSERVER_USERNAME`, `SQLSERVER_PASSWORD`.
+
+Cloud Run maps Secret Manager → **env vars** at deploy (e.g., `--set-secrets=SQLSERVER_PASSWORD=...:latest`).  
+The app **does not call Secret Manager** directly; it just reads env vars.
+
+---
+
+## GCP deployment (overview)
+
+1) **Build** image from `ops/Dockerfile` (Cloud Build or local) → push to **Artifact Registry**.  
+2) **Deploy** to **Cloud Run** with:
+   - **Networking**: **Direct VPC egress** (preferred) `--network --subnet --vpc-egress=all-traffic`, or **Serverless VPC Access** connector if required.
+   - **Secrets**: `--set-secrets=...` maps SQL creds to env vars.
+   - **Env**: `--set-env-vars=OIDC_ISSUER_URI=...,OIDC_ALLOWED_AUDIENCE=...,DB_BACKEND=mssql` etc.
+   - **Auth**: service enforces `Authorization: Bearer <JWT>` on all tool/resource calls.
+   - **CMEK**: Your org may require `--kms-key="projects/.../cryptoKeys/..."` for Cloud Run/AR/SM.
+
+**Service config (cost-friendly defaults)**: 1 vCPU, 512Mi, concurrency 20, timeout 300s, min instances 0.
+
+---
+
+## Adding a new tool (quick recipe)
+
+1) Copy `server/tools/sample_echo_tool.py` → rename file + function.  
+2) Import shared JSON Schemas from `framework/schemas`.  
+3) Keep logic tiny: **auth → normalize → adapter call → return `{ "rows": [...] }`**.  
+4) Add/extend a field dictionary YAML in `server/resources/fields/` if the result has many columns.  
+5) Test in MCP Inspector.
+
+---
+
+## Python dependencies
+
+- `fastmcp` — MCP server (HTTP)
+- `pyodbc` — SQL Server ODBC 18
+- `pyjwt[crypto]` — JWT validation
+- `requests` — OIDC discovery (well-known → JWKS)
+- `pydantic` — light validation
+- `python-dateutil` — parse “Feb 2024” → `YYYY-MM-01 00:00:00`
+- `ruamel.yaml` — field dictionaries
+- `google-cloud-bigquery` — fallback adapter
+
+---
+
+## Testing
+
+- **MCP Inspector**: end-to-end tool checks over HTTP/SSE.
+- **pytest** (later): smoke tests for auth policy and tool contract shape.
+
+---
+
+## Conventions
+
+- **1 file = 1 tool**. No SQL in tools; tools call adapters.
+- **Unified output**: always `{ "rows": [ … ] }`.
+- **Input normalization**: `vast` CSV/array → CSV, `report_month` → `YYYY-MM-01 00:00:00`.
+- **Pagination**: `limit` (default 1000, max 15000), `offset` (default 0).
+- **Logging**: JSON; never log tokens; **log extracted email** with request ID on success (audit). Inline errors include a stable code + request ID.
+- **Comments**: module header docstrings + function docstrings (**Args/Returns/Raises**). Inline comments explain **why**, not what.
