@@ -1,3 +1,4 @@
+No `report_month`. 
 Pagination: set `limit` (default 1000, max 15000) and `offset` (start at 0). 
 To get more rows, call again with `offset = previous_offset + limit`. 
-See `fields://get_all_apps_value_by_user` for column definitions.
+See `fields://get_vast_general_by_user` for column definitions.
