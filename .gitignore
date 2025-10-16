@@ -1,32 +1,39 @@
 #!/usr/bin/env python3
 """
-Hydrate descriptions in server/resources/fields/allapps_score.yaml using dbo.Risk_Element.
+Generate/refresh field dictionary YAMLs for the three MCP tools by introspecting
+SQL Server stored procedure result sets. No data is read; we only ask SQL Server
+for the first result set schema.
 
-- Matches Risk_Element.elementName to YAML column names using a canonical key:
-  lowercased, non-alphanumeric stripped (drops spaces, '/', '_', etc.)
-  e.g., "SPI/PII Application" -> "spipiiapplication", "OCI Servers" -> "ociservers"
+- Score tool:    dbo.SPGetAllAppsScoreByUser(@Email, @VAST, @ReportMonth)
+- Value tool:    dbo.SPGetAllAppsValueByUser(@Email, @VAST, @ReportMonth)
+- General tool:  dbo.SPGetVastGeneralByUser(@Email, @VAST)
 
-- Replaces column 'description' with cleaned 'scoreMessage' where matched,
-  and sets description_auto: true.
+Behavior:
+- Uses sp_describe_first_result_set on an EXEC batch with @Email set to a harmless
+  non-empty value (required), @VAST/@ReportMonth NULL.
+- Writes YAML for each tool with type info, placeholders, and overlap metadata.
+- If a YAML already exists, preserves any human-written column "description",
+  plus file-level "notes" and "last_updated", unless --force is passed.
 
 Usage:
-    uv run python scripts/hydrate_score_descriptions.py --dry-run --preview 20
-    uv run python scripts/hydrate_score_descriptions.py --write
+    uv run python scripts/gen_field_dicts.py --write
+    uv run python scripts/gen_field_dicts.py --write --email alice@acme.com
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
-import html
+import datetime as dt
 import logging
-import re
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyodbc
 from ruamel.yaml import YAML
 
+# Reuse existing env vars (same as adapters)
 from framework.core.config import (
     SQLSERVER_HOST,
     SQLSERVER_PORT,
@@ -40,11 +47,11 @@ yaml = YAML()
 yaml.default_flow_style = False
 yaml.indent(mapping=2, sequence=2, offset=2)
 
-log = logging.getLogger("hydrate_score_descriptions")
+log = logging.getLogger("gen_field_dicts")
 
 # ----------------------- Connection helpers -----------------------
 
-_CONNECT_TIMEOUT = 10
+_CONNECT_TIMEOUT = 10  # seconds
 
 
 def _conn_str() -> str:
@@ -72,102 +79,246 @@ def _connect():
             cn.close()
 
 
-# ----------------------- Helpers -----------------------
+# ----------------------- Introspection -----------------------
 
-_CANON = re.compile(r"[^a-z0-9]+")
-
-
-def _canon(s: str) -> str:
-    return _CANON.sub("", s.lower())
-
-
-def _strip_html(s: str) -> str:
-    # remove basic <p>..</p> and other tags, unescape entities
-    s = re.sub(r"</?p[^>]*>", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = html.unescape(s)
-    return " ".join(s.split()).strip()
-
-
-def _load_yaml(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"YAML not found: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.load(f) or {}
-
-
-def _save_yaml(path: Path, data: Dict[str, Any]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        yaml.dump(data, f)
-
-
-# ----------------------- Main -----------------------
-
-def _fetch_risk_elements(cn) -> List[Tuple[str, str]]:
+def _describe_proc_resultset(cn: pyodbc.Connection, exec_batch: str) -> List[Dict[str, Any]]:
+    """
+    Call sys.sp_describe_first_result_set(@tsql = N'<exec batch>') and return column metadata.
+    """
+    sql = """
+    DECLARE @tsql NVARCHAR(MAX) = ?;
+    EXEC sys.sp_describe_first_result_set
+        @tsql = @tsql,
+        @params = NULL,
+        @browse_information_mode = 0;
+    """
     cur = cn.cursor()
-    cur.execute("SELECT elementName, scoreMessage FROM dbo.Risk_Element")
-    out: List[Tuple[str, str]] = []
-    for name, msg in cur.fetchall():
-        if not name or not msg:
+    cur.execute(sql, (exec_batch,))
+    rows = cur.fetchall()
+    cols = [c[0] for c in cur.description]
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        rec = {cols[i]: r[i] for i in range(len(cols))}
+        # Filter out rows that don't represent actual output columns (is_hidden = 1)
+        if rec.get("is_hidden"):
             continue
-        out.append((str(name), str(msg)))
+        out.append(rec)
     return out
 
 
+# ----------------------- Type mapping -----------------------
+
+def _simple_type(system_type_name: str) -> str:
+    t = system_type_name.lower()
+    if any(k in t for k in ["int", "bigint", "smallint", "tinyint"]) and "point" not in t:
+        return "int"
+    if t.startswith("decimal") or t.startswith("numeric") or "money" in t:
+        return "decimal"
+    if "float" in t or "real" in t:
+        return "float"
+    if t.startswith("bit"):
+        return "bool"
+    if "datetime" in t or t.startswith("date") or t.startswith("time"):
+        return "datetime"
+    # varchar, nvarchar, char, nchar, text, ntext, uniqueidentifier, xml, etc.
+    return "string"
+
+
+def _bq_type(simple: str) -> str:
+    return {
+        "int": "INT64",
+        "decimal": "NUMERIC",
+        "float": "FLOAT64",
+        "bool": "BOOL",
+        "datetime": "TIMESTAMP",
+        "string": "STRING",
+    }.get(simple, "STRING")
+
+
+def _neutral_placeholder(tool: str, col: str, base_type: str) -> str:
+    name = col
+    # ID/date/label heuristics → neutral wording
+    lower = name.lower()
+    if any(k in lower for k in ["id", "identifier", "key", "guid"]):
+        return f"Identifier for '{name}'."
+    if any(k in lower for k in ["date", "time", "month", "reported", "reportmonth"]):
+        return f"Timestamp or date for '{name}'."
+    if any(k in lower for k in ["name", "label", "desc", "owner", "status", "type"]):
+        return f"Attribute for '{name}'."
+
+    if tool == "get_all_apps_score_by_user":
+        return f"Scoring element for '{name}'."
+    if tool == "get_all_apps_value_by_user":
+        return f"Value snapshot for '{name}' at the monthly freeze."
+    # vast_general
+    return f"Attribute for '{name}'."
+
+
+# ----------------------- YAML helpers -----------------------
+
+def _load_yaml_if_exists(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.load(f) or {}
+    return data
+
+
+def _preserve_existing_column_desc(existing: Dict[str, Any]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for col in existing.get("columns", []) or []:
+        name = str(col.get("name", "")).strip()
+        desc = col.get("description")
+        if name and isinstance(desc, str) and desc.strip():
+            out[name.lower()] = desc
+    return out
+
+
+def _preserve_file_meta(existing: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    return existing.get("notes"), existing.get("last_updated")
+
+
+def _temporal_scope_for_tool(tool: str) -> str:
+    if tool == "get_all_apps_score_by_user":
+        return "monthly_snapshot"
+    if tool == "get_all_apps_value_by_user":
+        return "monthly_snapshot"
+    return "current"
+
+
+def _target_yaml_path(tool: str) -> Path:
+    base = Path(__file__).resolve().parents[1] / "server" / "resources" / "fields"
+    mapping = {
+        "get_all_apps_score_by_user": base / "allapps_score.yaml",
+        "get_all_apps_value_by_user": base / "allapps_value.yaml",
+        "get_vast_general_by_user": base / "vast_general.yaml",
+    }
+    return mapping[tool]
+
+
+# ----------------------- Main generation -----------------------
+
+def _build_yaml_for_tool(cn: pyodbc.Connection, tool: str, email: str, force: bool) -> Tuple[Path, Dict[str, Any], List[str]]:
+    # Exec batches (email required; VAST/ReportMonth NULL)
+    exec_map = {
+        "get_all_apps_score_by_user": "EXEC dbo.SPGetAllAppsScoreByUser @Email='{e}', @VAST=NULL, @ReportMonth=NULL",
+        "get_all_apps_value_by_user": "EXEC dbo.SPGetAllAppsValueByUser @Email='{e}', @VAST=NULL, @ReportMonth=NULL",
+        "get_vast_general_by_user":   "EXEC dbo.SPGetVastGeneralByUser  @Email='{e}', @VAST=NULL",
+    }
+    exec_batch = exec_map[tool].format(e=email)
+
+    meta = _describe_proc_resultset(cn, exec_batch)
+    cols = []
+    col_names: List[str] = []
+
+    # Load existing YAML to preserve human descriptions + file notes
+    path = _target_yaml_path(tool)
+    existing = _load_yaml_if_exists(path)
+    existing_desc_by_name = _preserve_existing_column_desc(existing) if not force else {}
+    existing_notes, existing_last_updated = (None, None)
+    if not force:
+        existing_notes, existing_last_updated = _preserve_file_meta(existing)
+
+    for rec in meta:
+        name = rec.get("name") or rec.get("column_ordinal")  # 'name' is standard in this proc output
+        if not name:
+            continue
+        name = str(name)
+        system_type = str(rec.get("system_type_name") or "")
+        is_nullable = bool(rec.get("is_nullable"))
+
+        simple = _simple_type(system_type)
+        bq = _bq_type(simple)
+
+        desc = existing_desc_by_name.get(name.lower()) or _neutral_placeholder(tool, name, simple)
+
+        cols.append({
+            "name": name,
+            "type": simple,
+            "mssql_type": system_type,
+            "bq_type": bq,
+            "description": desc,
+            "canonical_source": tool,
+            "nullable": is_nullable,
+            "also_available_in": [],
+            "description_auto": False,
+        })
+        col_names.append(name)
+
+    # Base document (notes preserved if present)
+    today = dt.date.today().isoformat()
+    doc = {
+        "schema_version": 1,
+        "tool": tool,
+        "temporal_scope": _temporal_scope_for_tool(tool),
+        "last_updated": existing_last_updated or today,
+        "notes": existing_notes or (
+            "Auto-generated from SQL Server result-set metadata. "
+            "Descriptions are placeholders unless previously curated."
+        ),
+        "columns": cols,
+    }
+    return path, doc, col_names
+
+
+def _apply_overlaps(docs_by_tool: Dict[str, Dict[str, Any]]) -> None:
+    # Build sets of names per tool (case-insensitive)
+    names = {t: {c["name"].lower() for c in d["columns"]} for t, d in docs_by_tool.items()}
+    for tool, doc in docs_by_tool.items():
+        for col in doc["columns"]:
+            n = col["name"].lower()
+            also: List[str] = []
+            for other_tool, others in names.items():
+                if other_tool == tool:
+                    continue
+                if n in others:
+                    also.append(other_tool)
+            col["also_available_in"] = sorted(also)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Hydrate score YAML descriptions from dbo.Risk_Element.")
-    ap.add_argument("--write", action="store_true", help="Persist changes; otherwise dry-run.")
-    ap.add_argument("--preview", type=int, default=20, help="Show first N updates in dry-run.")
+    ap = argparse.ArgumentParser(description="Generate/refresh field dictionary YAMLs from SQL Server metadata.")
+    ap.add_argument("--write", action="store_true", help="Write files instead of dry-run.")
+    ap.add_argument("--force", action="store_true", help="Overwrite descriptions/notes even if present.")
+    ap.add_argument("--email", default="alice@acme.com", help="Required email to pass to stored procs during introspection.")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    # Locate score yaml
-    yaml_path = Path(__file__).resolve().parents[1] / "server" / "resources" / "fields" / "allapps_score.yaml"
-    data = _load_yaml(yaml_path)
-    cols = data.get("columns") or []
-    if not cols:
-        log.error("No 'columns' found in %s. Run gen_field_dicts.py first.", yaml_path)
+    required = [SQLSERVER_HOST, SQLSERVER_DATABASE, SQLSERVER_USERNAME, SQLSERVER_PASSWORD]
+    if not all(required):
+        log.error("SQL Server env vars missing; check SQLSERVER_* in .env / Secret Manager.")
         return
 
-    # Canonical map of YAML columns
-    yaml_by_key: Dict[str, Dict[str, Any]] = {}
-    for col in cols:
-        name = str(col.get("name", "")).strip()
-        if not name:
-            continue
-        yaml_by_key[_canon(name)] = col
-
-    # Fetch risk elements
-    updates: List[Tuple[str, str]] = []
     with _connect() as cn:
-        for elem_name, score_msg in _fetch_risk_elements(cn):
-            key = _canon(elem_name)
-            if not key:
-                continue
-            col = yaml_by_key.get(key)
-            if not col:
-                continue
-            cleaned = _strip_html(score_msg)
-            if not cleaned:
-                continue
-            old_desc = col.get("description", "")
-            if old_desc != cleaned:
-                col["description"] = cleaned
-                col["description_auto"] = True
-                updates.append((col.get("name", elem_name), cleaned))
+        docs: Dict[str, Dict[str, Any]] = {}
+        paths: Dict[str, Path] = {}
+        all_names: Dict[str, List[str]] = {}
 
-    if not updates:
-        print("[dry-run] No matching columns to update.")
-        return
+        for tool in [
+            "get_all_apps_score_by_user",
+            "get_all_apps_value_by_user",
+            "get_vast_general_by_user",
+        ]:
+            path, doc, names = _build_yaml_for_tool(cn, tool, args.email, args.force)
+            docs[tool] = doc
+            paths[tool] = path
+            all_names[tool] = names
 
-    if args.write:
-        _save_yaml(yaml_path, data)
-        print(f"[write]   Updated {len(updates)} column descriptions in {yaml_path}")
-    else:
-        print(f"[dry-run] Would update {len(updates)} columns in {yaml_path}")
-        for i, (name, desc) in enumerate(updates[: max(1, args.preview)]):
-            print(f"  - {name}: {desc[:120]}{'…' if len(desc) > 120 else ''}")
+        _apply_overlaps(docs)
+
+        # Write or print summaries
+        for tool in ["get_all_apps_score_by_user", "get_all_apps_value_by_user", "get_vast_general_by_user"]:
+            path = paths[tool]
+            doc = docs[tool]
+            msg = f"{tool}: {len(doc['columns'])} columns -> {path}"
+            if args.write:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("w", encoding="utf-8") as f:
+                    yaml.dump(doc, f)
+                print(f"[write]   {msg}")
+            else:
+                print(f"[dry-run] {msg}")
 
 
 if __name__ == "__main__":
