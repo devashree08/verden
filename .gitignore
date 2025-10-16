@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-Generate/refresh field dictionary YAMLs for the three MCP tools by introspecting
-SQL Server stored procedure result sets (schema only, no data fetch).
+Hydrate descriptions in server/resources/fields/allapps_score.yaml using dbo.Risk_Element.
 
-Tools:
-- get_all_apps_score_by_user  -> dbo.SPGetAllAppsScoreByUser(@Email, @VAST, @ReportMonth)
-- get_all_apps_value_by_user  -> dbo.SPGetAllAppsValueByUser(@Email, @VAST, @ReportMonth)
-- get_vast_general_by_user    -> dbo.SPGetVastGeneralByUser(@Email, @VAST)
+- Matches Risk_Element.elementName to YAML column names using a canonical key:
+  lowercased, non-alphanumeric stripped (drops spaces, '/', '_', etc.)
+  e.g., "SPI/PII Application" -> "spipiiapplication", "OCI Servers" -> "ociservers"
 
-Usage:
-  uv run python -m scripts.gen_field_dicts --dry-run
-  uv run python -m scripts.gen_field_dicts --write --email alice@acme.com
-  uv run python -m scripts.gen_field_dicts --write --force
+- Replaces column 'description' with cleaned 'scoreMessage' where matched,
+  and sets description_auto: true.
+
+Dry-run is default (no file writes). Use --write to persist changes.
+
+Examples:
+  uv run python -m scripts.hydrate_score_descriptions --preview 10
+  uv run python -m scripts.hydrate_score_descriptions --write --preview 25 --show-unmatched 30
 """
 
 from __future__ import annotations
 
-# Ensure project root (contains `framework/`) is importable
+# Ensure project root importability
 from pathlib import Path
 import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -25,15 +27,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import argparse
 import contextlib
-import datetime as dt
+import html
 import logging
+import re
+from typing import Any, Dict, List, Tuple
 
 import pyodbc
 from ruamel.yaml import YAML
-from ruamel.yaml.comments import CommentedMap, CommentedSeq
-from ruamel.yaml.scalarstring import FoldedScalarString
 
-# Pull SQL settings from our shared config
 from framework.core.config import (
     SQLSERVER_HOST,
     SQLSERVER_PORT,
@@ -43,19 +44,19 @@ from framework.core.config import (
     ALLOW_INSECURE_SQL_ENCRYPTION,
 )
 
-# ---------- YAML setup (round-trip, stable order) ----------
+# -------- YAML config (round-trip; stable indent) --------
 yaml = YAML(typ="rt")
 yaml.preserve_quotes = True
 yaml.width = 4096
-yaml.indent(mapping=2, sequence=2, offset=2)
+yaml.indent(mapping=2, sequence=4, offset=2)
 
-log = logging.getLogger("gen_field_dicts")
+log = logging.getLogger("hydrate_score_descriptions")
 
-# ---------- ODBC connection ----------
-_CONNECT_TIMEOUT = 10  # seconds
+# -------- SQL connection helpers --------
+_CONNECT_TIMEOUT = 10
 
 
-def _conn_str():
+def _conn_str() -> str:
     enc = "no" if ALLOW_INSECURE_SQL_ENCRYPTION else "yes"
     trust = "yes" if ALLOW_INSECURE_SQL_ENCRYPTION else "no"
     return (
@@ -80,252 +81,126 @@ def _connect():
             cn.close()
 
 
-# ---------- Introspection ----------
-def _describe_proc_resultset(cn, exec_batch):
-    """
-    Call sys.sp_describe_first_result_set(@tsql = N'<exec batch>')
-    and return list of metadata rows (dicts). Hidden columns are skipped.
-    """
-    sql = """
-    DECLARE @tsql NVARCHAR(MAX) = ?;
-    EXEC sys.sp_describe_first_result_set
-        @tsql = @tsql,
-        @params = NULL,
-        @browse_information_mode = 0;
-    """
-    cur = cn.cursor()
-    cur.execute(sql, (exec_batch,))
-    rows = cur.fetchall()
-    cols = [c[0] for c in cur.description]
-    out = []
-    for r in rows:
-        rec = {cols[i]: r[i] for i in range(len(cols))}
-        if rec.get("is_hidden"):
-            continue
-        out.append(rec)
-    return out
+# -------- Canonicalization / cleaning --------
+_CANON = re.compile(r"[^a-z0-9]+")
 
 
-# ---------- Type mapping ----------
-def _simple_type(system_type_name: str) -> str:
-    t = (system_type_name or "").lower()
-    if any(k in t for k in ("bigint", "int", "smallint", "tinyint")):
-        return "int"
-    if t.startswith("decimal") or t.startswith("numeric") or "money" in t:
-        return "decimal"
-    if "float" in t or "real" in t:
-        return "float"
-    if t.startswith("bit"):
-        return "bool"
-    if "datetime" in t or t.startswith("date") or t.startswith("time"):
-        return "datetime"
-    return "string"
+def _canon(s: str) -> str:
+    return _CANON.sub("", s.lower())
 
 
-def _bq_type(simple: str) -> str:
-    mapping = {
-        "int": "INT64",
-        "decimal": "NUMERIC",
-        "float": "FLOAT64",
-        "bool": "BOOL",
-        "datetime": "TIMESTAMP",
-        "string": "STRING",
-    }
-    return mapping.get(simple, "STRING")
+def _strip_html(s: str) -> str:
+    # remove simple <p>..</p> and other tags, unescape entities
+    s = re.sub(r"</?p[^>]*>", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html.unescape(s)
+    return " ".join(s.split()).strip()
 
 
-# ---------- Placeholder text ----------
-def _placeholder(tool: str, col_name: str) -> str:
-    lower = col_name.lower()
-    # ID/date/label heuristics → neutral phrasing
-    if any(k in lower for k in ("id", "identifier", "key", "guid")):
-        return f"Identifier for '{col_name}'."
-    if any(k in lower for k in ("date", "time", "month", "reported", "reportmonth")):
-        return f"Timestamp or date for '{col_name}'."
-    if any(k in lower for k in ("name", "label", "desc", "owner", "status", "type")):
-        return f"Attribute for '{col_name}'."
-
-    if tool == "get_all_apps_score_by_user":
-        return f"Scoring element for '{col_name}'."
-    if tool == "get_all_apps_value_by_user":
-        return f"Value snapshot for '{col_name}' at the monthly freeze."
-    # vast_general (default)
-    return f"Attribute for '{col_name}'."
+# -------- YAML I/O --------
+def _yaml_path() -> Path:
+    return PROJECT_ROOT / "server" / "resources" / "fields" / "allapps_score.yaml"
 
 
-# ---------- YAML file helpers ----------
-def _fields_dir():
-    return PROJECT_ROOT / "server" / "resources" / "fields"
-
-
-def _target_yaml_path(tool: str):
-    base = _fields_dir()
-    mapping = {
-        "get_all_apps_score_by_user": base / "allapps_score.yaml",
-        "get_all_apps_value_by_user": base / "allapps_value.yaml",
-        "get_vast_general_by_user": base / "vast_general.yaml",
-    }
-    return mapping[tool]
-
-
-def _temporal_scope_for_tool(tool: str) -> str:
-    if tool in ("get_all_apps_score_by_user", "get_all_apps_value_by_user"):
-        return "monthly_snapshot"
-    return "current"
-
-
-def _load_yaml_if_exists(path: Path):
+def _load_yaml(path: Path) -> Dict[str, Any]:
     if not path.exists():
-        return None
+        raise FileNotFoundError(f"YAML not found: {path}")
     with path.open("r", encoding="utf-8") as f:
         return yaml.load(f) or {}
 
 
-def _preserve_existing_desc(existing_doc):
-    """
-    Return a dict {lower_name: description} from existing YAML for preservation.
-    """
-    out = {}
-    if not existing_doc:
-        return out
-    for col in existing_doc.get("columns", []) or []:
-        name = str(col.get("name", "")).strip()
-        desc = col.get("description")
-        if name and isinstance(desc, str) and desc.strip():
-            out[name.lower()] = desc
+def _save_yaml(path: Path, data: Dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        yaml.dump(data, f)
+
+
+# -------- DB fetch --------
+def _fetch_risk_elements(cn) -> List[Tuple[str, str]]:
+    cur = cn.cursor()
+    cur.execute("SELECT elementName, scoreMessage FROM dbo.Risk_Element")
+    out: List[Tuple[str, str]] = []
+    for name, msg in cur.fetchall():
+        if not name or not msg:
+            continue
+        out.append((str(name), str(msg)))
     return out
 
 
-# ---------- Build one tool doc ----------
-def _build_doc_for_tool(cn, tool: str, email: str, force: bool):
-    # Exec batches (email required; others NULL)
-    exec_map = {
-        "get_all_apps_score_by_user": f"EXEC dbo.SPGetAllAppsScoreByUser @Email='{email}', @VAST=NULL, @ReportMonth=NULL",
-        "get_all_apps_value_by_user": f"EXEC dbo.SPGetAllAppsValueByUser @Email='{email}', @VAST=NULL, @ReportMonth=NULL",
-        "get_vast_general_by_user":   f"EXEC dbo.SPGetVastGeneralByUser  @Email='{email}', @VAST=NULL",
-    }
-    meta = _describe_proc_resultset(cn, exec_map[tool])
-
-    # Load existing YAML (to preserve curated descriptions/notes)
-    path = _target_yaml_path(tool)
-    existing = _load_yaml_if_exists(path)
-    preserved_desc = {} if force else _preserve_existing_desc(existing)
-    preserved_notes = None if force else (existing.get("notes") if existing else None)
-    preserved_last_updated = None if force else (existing.get("last_updated") if existing else None)
-
-    # Build columns sequence
-    cols = CommentedSeq()
-    col_names_lower = set()
-    for rec in meta:
-        name = str(rec.get("name") or "").strip()
-        if not name:
-            continue
-        system_type = str(rec.get("system_type_name") or "")
-        is_nullable = bool(rec.get("is_nullable"))
-
-        simple = _simple_type(system_type)
-        bq = _bq_type(simple)
-        desc = preserved_desc.get(name.lower()) or _placeholder(tool, name)
-
-        col_map = CommentedMap()
-        col_map["name"] = name
-        col_map["type"] = simple
-        col_map["mssql_type"] = system_type
-        col_map["bq_type"] = bq
-        col_map["description"] = desc
-        col_map["canonical_source"] = tool
-        col_map["nullable"] = is_nullable
-        col_map["also_available_in"] = CommentedSeq()  # filled later in overlap pass
-        col_map["description_auto"] = False
-
-        cols.append(col_map)
-        col_names_lower.add(name.lower())
-
-    # Top-level document
-    today = dt.date.today().isoformat()
-    doc = CommentedMap()
-    doc["schema_version"] = 1
-    doc["tool"] = tool
-    doc["temporal_scope"] = _temporal_scope_for_tool(tool)
-    doc["last_updated"] = preserved_last_updated or today
-    default_notes = (
-        "Auto-generated from SQL Server result-set metadata. "
-        "Descriptions are placeholders unless previously curated."
-    )
-    doc["notes"] = FoldedScalarString(preserved_notes or default_notes)
-    doc["columns"] = cols
-
-    return path, doc, col_names_lower
-
-
-# ---------- Overlap pass ----------
-def _apply_overlaps(docs_by_tool):
-    """
-    For each column in each tool, fill `also_available_in` with other tools
-    where a column of the same name (case-insensitive) exists.
-    """
-    names_lower_by_tool = {}
-    for tool, doc in docs_by_tool.items():
-        names_lower_by_tool[tool] = {c["name"].lower() for c in doc["columns"]}
-
-    for tool, doc in docs_by_tool.items():
-        for col in doc["columns"]:
-            n = col["name"].lower()
-            also = []
-            for other, name_set in names_lower_by_tool.items():
-                if other == tool:
-                    continue
-                if n in name_set:
-                    also.append(other)
-            also.sort()
-            # Ensure it's a CommentedSeq for consistent YAML
-            col["also_available_in"] = CommentedSeq(also)
-
-
-# ---------- Main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Generate/refresh field dictionary YAMLs from stored proc schemas.")
-    ap.add_argument("--write", action="store_true", help="Write files (default is dry-run).")
-    ap.add_argument("--force", action="store_true", help="Do not preserve existing descriptions/notes.")
-    ap.add_argument("--email", default="alice@acme.com", help="Required @Email value for proc introspection.")
+    ap = argparse.ArgumentParser(description="Hydrate score YAML descriptions from dbo.Risk_Element.")
+    ap.add_argument("--write", action="store_true", help="Persist changes; otherwise dry-run.")
+    ap.add_argument("--preview", type=int, default=20, help="Show first N updated columns in the summary.")
+    ap.add_argument("--show-unmatched", type=int, default=20, help="List first N unmatched YAML columns in summary.")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    required = (SQLSERVER_HOST and SQLSERVER_DATABASE and SQLSERVER_USERNAME and SQLSERVER_PASSWORD)
-    if not required:
-        log.error("SQL Server env vars missing; check SQLSERVER_* in .env / Secret Manager.")
+    # Load YAML
+    yaml_path = _yaml_path()
+    data = _load_yaml(yaml_path)
+    cols = data.get("columns") or []
+    if not cols:
+        log.error("No 'columns' array in %s. Run gen_field_dicts.py first.", yaml_path)
         sys.exit(2)
 
+    # Canon map of YAML columns -> reference to the actual column dict
+    yaml_by_key: Dict[str, Dict[str, Any]] = {}
+    for col in cols:
+        name = str(col.get("name", "")).strip()
+        if not name:
+            continue
+        yaml_by_key[_canon(name)] = col
+
+    # Pull risk elements
+    updates: List[Tuple[str, str]] = []
+    matched_keys: set[str] = set()
+    risk_keys: set[str] = set()
+
     with _connect() as cn:
-        docs = {}
-        paths = {}
+        for elem_name, score_msg in _fetch_risk_elements(cn):
+            key = _canon(elem_name)
+            if not key:
+                continue
+            risk_keys.add(key)
+            col = yaml_by_key.get(key)
+            if not col:
+                continue
+            cleaned = _strip_html(score_msg)
+            if not cleaned:
+                continue
+            old_desc = str(col.get("description") or "")
+            if old_desc != cleaned:
+                col["description"] = cleaned
+                col["description_auto"] = True
+                updates.append((col.get("name", elem_name), cleaned))
+            matched_keys.add(key)
 
-        # Build all three first
-        for tool in [
-            "get_all_apps_score_by_user",
-            "get_all_apps_value_by_user",
-            "get_vast_general_by_user",
-        ]:
-            path, doc, _ = _build_doc_for_tool(cn, tool, args.email, args.force)
-            docs[tool] = doc
-            paths[tool] = path
+    # Compute unmatched YAML columns (i.e., no risk element match)
+    yaml_keys = set(yaml_by_key.keys())
+    unmatched_keys = sorted(yaml_keys - matched_keys)
 
-        # Then compute overlaps
-        _apply_overlaps(docs)
+    # Build friendly names for unmatched report
+    unmatched_names = [yaml_by_key[k].get("name", k) for k in unmatched_keys]
 
-        # Write or dry-run summary
-        for tool in ["get_all_apps_score_by_user", "get_all_apps_value_by_user", "get_vast_general_by_user"]:
-            path = paths[tool]
-            doc = docs[tool]
-            msg = f"{tool}: {len(doc['columns'])} columns -> {path}"
-            if args.write:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("w", encoding="utf-8") as f:
-                    yaml.dump(doc, f)
-                print(f"[write]   {msg}")
-            else:
-                print(f"[dry-run] {msg}")
+    # Summary
+    if args.write:
+        _save_yaml(yaml_path, data)
+        print(f"[write]   Updated {len(updates)} column descriptions in {yaml_path}")
+    else:
+        print(f"[dry-run] Would update {len(updates)} column descriptions in {yaml_path}")
+
+    # Show sample of updated
+    if updates:
+        print(f"  updated (showing up to {args.preview}):")
+        for i, (name, desc) in enumerate(updates[: max(1, args.preview)]):
+            print(f"    - {name}: {desc[:120]}{'…' if len(desc) > 120 else ''}")
+
+    # Show unmatched info
+    print(f"  unmatched columns: {len(unmatched_names)} (no Risk_Element match)")
+    if unmatched_names:
+        print(f"  unmatched sample (up to {args.show_unmatched}):")
+        for nm in unmatched_names[: max(1, args.show_unmatched)]:
+            print(f"    - {nm}")
 
 
 if __name__ == "__main__":
