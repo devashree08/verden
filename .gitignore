@@ -1,54 +1,40 @@
-from __future__ import annotations
-from pathlib import Path
-from fastmcp import Context
-from framework.core.registry import mcp
+# Paging Cookbook
 
-_PROMPT_PATH = Path(__file__).resolve().parent / "tool_selection.md"
+A simple pattern to retrieve large result sets page-by-page.
 
-@mcp.prompt(
-    name="tool_selection",
-    description="When to use each MCP tool (score vs value vs general) and how to page results."
-)
-async def tool_selection(ctx: Context) -> str:
-    try:
-        return _PROMPT_PATH.read_text(encoding="utf-8")
-    except Exception:
-        # Fallback text if the file is missing
-        return (
-            "Use get_all_apps_score_by_user for QRM scoring by month (latest if not specified).\n"
-            "Use get_all_apps_value_by_user for monthly counts/rollups (latest if not specified).\n"
-            "Use get_vast_general_by_user for compliance/general attributes (no report month).\n\n"
-            "Paging: set limit (default 1000, max 15000) and offset; to fetch more, increase offset by the previous limit.\n"
-            "See fields://<tool> for column definitions."
-        )
+## Pattern
+1. First call: use `{"limit": 1000, "offset": 0}`
+2. Next page: re-call with `offset = previous_offset + limit`
 
+## Example (filtering two VASTs)
+- Call A:
+  ```json
+  {"vast": ["123", "456"], "limit": 1000, "offset": 0}
+  ```
+- Call B:
+  ```json
+  {"vast": ["123", "456"], "limit": 1000, "offset": 1000}
+  ```
+- Call C:
+  ```json
+  {"vast": ["123", "456"], "limit": 1000, "offset": 2000}
+  ```
 
-
+Stop when the returned `rows` array is empty or you've reached your target.
+----
 
 
+# Tool Selection Guide
 
-from __future__ import annotations
-from pathlib import Path
-from fastmcp import Context
-from framework.core.registry import mcp
+Use **exactly one** of these tools based on the question intent:
 
-_PROMPT_PATH = Path(__file__).resolve().parent / "paging_cookbook.md"
+- **get_all_apps_score_by_user** — For **QRM scoring** questions by month. If `report_month` is omitted, it returns the **latest frozen** month.
+- **get_all_apps_value_by_user** — For **monthly counts/rollups** (vulns, assets, etc.). If `report_month` is omitted, it returns the **latest frozen** month.
+- **get_vast_general_by_user** — For **compliance/general attributes** (SOX, PCI, flags). **No** `report_month` parameter.
 
-@mcp.prompt(
-    name="paging_cookbook",
-    description="Examples for using limit/offset to page through large result sets."
-)
-async def paging_cookbook(ctx: Context) -> str:
-    try:
-        return _PROMPT_PATH.read_text(encoding="utf-8")
-    except Exception:
-        return (
-            "Paging pattern:\n"
-            "1) First call: {\"limit\": 1000, \"offset\": 0}\n"
-            "2) Next page: re-call with offset = previous_offset + limit\n\n"
-            "Example:\n"
-            "- A: {\"vast\": [\"123\",\"456\"], \"limit\": 1000, \"offset\": 0}\n"
-            "- B: {\"vast\": [\"123\",\"456\"], \"limit\": 1000, \"offset\": 1000}\n"
-            "- C: {\"vast\": [\"123\",\"456\"], \"limit\": 1000, \"offset\": 2000}\n"
-            "Stop when rows is empty or your target is reached."
-        )
+**Paging:** Results can be large. Set `limit` (default 1000, max 15000) and `offset`. To fetch the next page, call again with `offset = previous_offset + limit`.
+
+**Columns:** For column meanings, fetch the related fields resource:
+- `fields://get_all_apps_score_by_user`
+- `fields://get_all_apps_value_by_user`
+- `fields://get_vast_general_by_user`
