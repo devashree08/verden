@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import {
   CssBaseline,
   Container,
@@ -24,24 +24,16 @@ import {
   Accordion,
   AccordionSummary,
   AccordionDetails,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  Drawer,
   List,
   ListItemButton,
   ListItemText,
   Stack,
-  Tooltip,
-  Snackbar,
-  Alert,
   LinearProgress,
   Avatar,
-  IconButton
+  IconButton,
+  Paper
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
-import SaveIcon from "@mui/icons-material/Save";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
 import DescriptionIcon from "@mui/icons-material/Description";
@@ -155,27 +147,15 @@ function AttributeBlock({ attr, value, onChange }) {
   );
 }
 
-// ==== Simple AI mock to preview UX ====
+// ==== AI mock to preview UX (replace with Crew API later) ====
 async function callAgentAPI({ agent, prompt, context }) {
-  // Simulate latency
   await new Promise((r) => setTimeout(r, 900));
-  // Fake score and content
   const score = Math.round(70 + Math.random() * 30); // 70-100
-  const ideas = [
-    {
-      id: Math.random().toString(36).slice(2),
-      field: "exec",
-      label: "Executive Summary",
-      text: `For ${context.org}, consolidate ${context.subcats.length} subcategories into a role-based roadmap. Emphasize L3\u2192L4 progression with measurable KPIs and quarterly artifact reviews.`,
-    },
-    {
-      id: Math.random().toString(36).slice(2),
-      field: "scope",
-      label: "Scope",
-      text: `Include ${context.org} plus shared services; explicitly list ${context.subcats.slice(0,3).join(", ")} as in-scope. Note dependencies on SOC and IAM teams.`,
-    },
+  const suggestions = [
+    `For ${context.org}, highlight L3→L4 progression and quarterly artifact reviews.`,
+    `Explicitly scope ${context.subcats.slice(0,3).join(", ")} and dependencies on SOC/IAM.`,
   ];
-  return { agent, score, ideas, usage: { tokens: 832, ms: 900 } };
+  return { agent, score, text: suggestions.join("\n\n"), usage: { tokens: 832, ms: 900 } };
 }
 
 export default function App() {
@@ -188,12 +168,12 @@ export default function App() {
   const [pct, setPct] = useState(85);
   const [tab, setTab] = useState("L3");
   const [comments, setComments] = useState({});
-  const [aiOpen, setAiOpen] = useState(false);
+
+  // AI panel state
   const [aiAgent, setAiAgent] = useState("Narrative Coach");
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
-  const [aiResult, setAiResult] = useState(null);
-  const [previewOpen, setPreviewOpen] = useState(false);
+  const [history, setHistory] = useState([]); // {id, role: 'user'|'assistant', text, score?}
 
   const narrative = useMemo(() => {
     const lines = [];
@@ -222,20 +202,19 @@ export default function App() {
 
   const runAI = async (seedPrompt) => {
     const prompt = seedPrompt ?? aiPrompt;
+    if (!prompt.trim()) return;
+    setHistory((h)=>[...h,{id:crypto.randomUUID(), role:'user', text: prompt}]);
     setAiBusy(true);
-    setAiResult(null);
-    const res = await callAgentAPI({
-      agent: aiAgent,
-      prompt,
-      context: { org, subcats, execSum, scope, coverage, tab },
-    });
+    const res = await callAgentAPI({ agent: aiAgent, prompt, context: { org, subcats, execSum, scope, coverage, tab } });
     setAiBusy(false);
-    setAiResult(res);
+    setHistory((h)=>[...h,{id:crypto.randomUUID(), role:'assistant', text: res.text, score: res.score, agent: res.agent, usage: res.usage}]);
+    setAiPrompt("");
   };
 
-  const applyIdea = (idea) => {
-    if (idea.field === "exec") setExecSum((v) => (v ? v + "\n\n" : "") + idea.text);
-    if (idea.field === "scope") setScope((v) => (v ? v + "\n\n" : "") + idea.text);
+  const applyToField = (text, field) => {
+    if (field === 'exec') setExecSum((v)=> (v? v+"\n\n":"") + text);
+    if (field === 'scope') setScope((v)=> (v? v+"\n\n":"") + text);
+    if (field === 'coverage') setCoverage((v)=> (v? v+"\n\n":"") + text);
   };
 
   async function exportPDF() {
@@ -281,16 +260,15 @@ export default function App() {
         <Stack direction={{ xs: "column", md: "row" }} alignItems={{ md: "center" }} justifyContent="space-between" spacing={1} sx={{ mb: 1 }}>
           <Typography variant="h5">CSF 2.0 Narrative Generator</Typography>
           <Stack direction="row" spacing={1}>
-            <Button startIcon={<PsychologyIcon />} variant="contained" onClick={() => setAiOpen(true)}>AI Assist</Button>
-            <Button startIcon={<VisibilityIcon />} color="secondary" variant="outlined" onClick={() => setPreviewOpen(true)}>Preview</Button>
+            <Button startIcon={<VisibilityIcon />} color="secondary" variant="outlined" onClick={()=>window.alert('Preview opens in real build')}>Preview</Button>
             <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF}>PDF</Button>
             <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>DOCX</Button>
           </Stack>
         </Stack>
 
-        <Grid container spacing={2} alignItems="flex-start">
-          {/* Left column */}
-          <Grid item xs={12} md={4}>
+        <Grid container spacing={2}>
+          {/* LEFT: Narrative inputs */}
+          <Grid item xs={12} md={6}>
             <Card variant="outlined">
               <CardContent>
                 <Stack spacing={2}>
@@ -308,7 +286,7 @@ export default function App() {
                   <Stack spacing={1}>
                     <Stack direction="row" alignItems="center" justifyContent="space-between">
                       <Typography variant="subtitle2">Executive Summary</Typography>
-                      <Button size="small" onClick={() => runAI("Improve the executive summary for clarity and business value.")}>Enrich with AI</Button>
+                      <Button size="small" onClick={() => runAI("Draft a crisp executive summary using selected subcategories.")}>Enrich with AI</Button>
                     </Stack>
                     <TextField value={execSum} onChange={(e) => setExecSum(e.target.value)} multiline minRows={3} fullWidth placeholder="Exec summary..." />
                   </Stack>
@@ -316,7 +294,7 @@ export default function App() {
                   <Stack spacing={1}>
                     <Stack direction="row" alignItems="center" justifyContent="space-between">
                       <Typography variant="subtitle2">Scope</Typography>
-                      <Button size="small" onClick={() => runAI("Draft a concise, accurate scope statement.")}>Enrich with AI</Button>
+                      <Button size="small" onClick={() => runAI("Draft a precise scope statement for this assessment.")}>Enrich with AI</Button>
                     </Stack>
                     <TextField value={scope} onChange={(e) => setScope(e.target.value)} multiline minRows={2} fullWidth placeholder="Scope..." />
                   </Stack>
@@ -334,8 +312,82 @@ export default function App() {
             </Card>
           </Grid>
 
-          {/* Right column */}
-          <Grid item xs={12} md={8}>
+          {/* RIGHT: Always-visible AI Assist */}
+          <Grid item xs={12} md={6}>
+            <Card variant="outlined" sx={{ height: '100%' }}>
+              <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 1, height: '100%' }}>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Avatar><PsychologyIcon /></Avatar>
+                  <Box>
+                    <Typography variant="h6">AI Assist</Typography>
+                    <Typography variant="caption" color="text.secondary">Pick agent · Ask · Apply suggestions</Typography>
+                  </Box>
+                </Stack>
+
+                <FormControl fullWidth size="small">
+                  <InputLabel id="agent-label">Agent</InputLabel>
+                  <Select labelId="agent-label" value={aiAgent} label="Agent" onChange={(e)=>setAiAgent(e.target.value)}>
+                    <MenuItem value="Narrative Coach">Narrative Coach</MenuItem>
+                    <MenuItem value="Artifact Mapper">Artifact Mapper</MenuItem>
+                    <MenuItem value="Coverage Estimator">Coverage Estimator</MenuItem>
+                  </Select>
+                </FormControl>
+
+                {/* Chat composer */}
+                <Stack direction="row" spacing={1}>
+                  <TextField
+                    placeholder="Ask the agent… (e.g., Improve scope to be outcome‑oriented)"
+                    fullWidth size="small" value={aiPrompt} onChange={(e)=>setAiPrompt(e.target.value)}
+                    onKeyDown={(e)=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); runAI(); } }}
+                  />
+                  <Button startIcon={<SendIcon />} variant="contained" onClick={()=>runAI()}>Send</Button>
+                </Stack>
+
+                {/* Conversation history */}
+                <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: 'auto', minHeight: 220 }}>
+                  <Stack spacing={1}>
+                    {history.length === 0 && (
+                      <Typography variant="body2" color="text.secondary">No conversation yet. Try asking the agent or use the Enrich buttons on the left.</Typography>
+                    )}
+                    {history.map((m) => (
+                      <Box key={m.id} sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+                        {m.role === 'assistant' ? (
+                          <Avatar sx={{ bgcolor: 'primary.main' }}><PsychologyIcon fontSize="small"/></Avatar>
+                        ) : (
+                          <Avatar>U</Avatar>
+                        )}
+                        <Box sx={{ flex: 1 }}>
+                          <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
+                            <Typography variant="subtitle2">{m.role === 'assistant' ? (m.agent || 'Assistant') : 'You'}</Typography>
+                            {m.role === 'assistant' && (
+                              <Chip size="small" label={`Confidence ${m.score ?? 0}%`} color={m.score >= 85 ? 'success' : m.score >= 75 ? 'warning' : 'default'} />
+                            )}
+                          </Stack>
+                          <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{m.text}</Typography>
+                          {m.role === 'assistant' && (
+                            <Stack direction="row" spacing={1} sx={{ mt: 0.5 }}>
+                              <Button size="small" startIcon={<ApplyIcon fontSize="inherit"/>} onClick={()=>applyToField(m.text, 'exec')}>Apply to Executive Summary</Button>
+                              <Button size="small" onClick={()=>applyToField(m.text, 'scope')}>Apply to Scope</Button>
+                              <IconButton size="small" onClick={()=>navigator.clipboard.writeText(m.text)}><ContentCopyIcon fontSize="inherit"/></IconButton>
+                            </Stack>
+                          )}
+                        </Box>
+                      </Box>
+                    ))}
+                    {aiBusy && (
+                      <Box>
+                        <Typography variant="body2">Thinking…</Typography>
+                        <LinearProgress sx={{ my: 1 }} />
+                      </Box>
+                    )}
+                  </Stack>
+                </Paper>
+              </CardContent>
+            </Card>
+          </Grid>
+
+          {/* FULL-WIDTH: Attributes section */}
+          <Grid item xs={12}>
             <Card variant="outlined">
               <CardContent>
                 <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable" aria-label="maturity tabs">
@@ -343,7 +395,6 @@ export default function App() {
                   <Tab label="Level 4" value="L4" />
                 </Tabs>
                 <Divider sx={{ my: 1 }} />
-
                 <Stack spacing={1.25}>
                   {subcats.map((sc) => (
                     <Box key={sc}>
@@ -352,12 +403,7 @@ export default function App() {
                         {fakeDB.maturity[sc][tab].map((attr) => {
                           const key = `${sc}|${tab}|${attr.id}`;
                           return (
-                            <AttributeBlock
-                              key={key}
-                              attr={attr}
-                              value={comments[key]}
-                              onChange={(v) => setComments((c) => ({ ...c, [key]: v }))}
-                            />
+                            <AttributeBlock key={key} attr={attr} value={comments[key]} onChange={(v) => setComments((c) => ({ ...c, [key]: v }))} />
                           );
                         })}
                       </Stack>
@@ -369,106 +415,6 @@ export default function App() {
           </Grid>
         </Grid>
       </Container>
-
-      {/* PREVIEW */}
-      <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} fullWidth maxWidth="md">
-        <DialogTitle>Narrative Preview</DialogTitle>
-        <DialogContent dividers sx={{ maxHeight: { xs: '65vh', md: '70vh' } }}>
-          <Box sx={{ typography: "body1" }}>
-            {narrative.split("\n").map((line, i) => (
-              <Typography key={i} sx={{ fontWeight: line.startsWith("**") ? 600 : undefined, fontSize: line.startsWith("## ") ? 18 : undefined }}>
-                {line.replaceAll("**", "").replace("## ", "")}
-              </Typography>
-            ))}
-          </Box>
-        </DialogContent>
-        <DialogActions>
-          <Button startIcon={<PictureAsPdfIcon />} onClick={exportPDF}>Export PDF</Button>
-          <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>Export DOCX</Button>
-          <Button onClick={() => setPreviewOpen(false)}>Close</Button>
-        </DialogActions>
-      </Dialog>
-
-      {/* AI ASSIST DRAWER */}
-      <Drawer anchor="right" open={aiOpen} onClose={() => setAiOpen(false)}>
-        <Box sx={{ width: 420, maxWidth: '100vw' }} role="presentation">
-          <Stack direction="row" alignItems="center" spacing={1} sx={{ p: 2 }}>
-            <Avatar><PsychologyIcon /></Avatar>
-            <Box>
-              <Typography variant="h6">AI Assist</Typography>
-              <Typography variant="caption" color="text.secondary">Crew agent suggestions with confidence</Typography>
-            </Box>
-          </Stack>
-          <Divider />
-
-          <Box sx={{ p: 2 }}>
-            <FormControl fullWidth size="small" sx={{ mb: 1 }}>
-              <InputLabel id="agent-label">Agent</InputLabel>
-              <Select labelId="agent-label" value={aiAgent} label="Agent" onChange={(e)=>setAiAgent(e.target.value)}>
-                <MenuItem value="Narrative Coach">Narrative Coach</MenuItem>
-                <MenuItem value="Artifact Mapper">Artifact Mapper</MenuItem>
-                <MenuItem value="Coverage Estimator">Coverage Estimator</MenuItem>
-              </Select>
-            </FormControl>
-
-            <TextField
-              label="Ask the agent"
-              placeholder="e.g., Draft a concise executive summary that highlights L3→L4 progression."
-              fullWidth
-              size="small"
-              multiline
-              minRows={3}
-              value={aiPrompt}
-              onChange={(e)=>setAiPrompt(e.target.value)}
-            />
-
-            <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
-              <Button startIcon={<SendIcon />} variant="contained" onClick={()=>runAI()}>Send</Button>
-              <Button onClick={()=>runAI("Review and improve clarity and specificity of all current fields.")}>Auto-suggest</Button>
-            </Stack>
-          </Box>
-
-          <Divider />
-
-          <Box sx={{ p: 2 }}>
-            {!aiResult && !aiBusy && (
-              <Typography variant="body2" color="text.secondary">No suggestions yet. Ask the agent or try Auto‑suggest.</Typography>
-            )}
-            {aiBusy && (
-              <Box>
-                <Typography variant="body2">Thinking…</Typography>
-                <LinearProgress sx={{ my: 1 }} />
-              </Box>
-            )}
-            {aiResult && (
-              <Box>
-                <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
-                  <Typography variant="subtitle2">{aiResult.agent}</Typography>
-                  <Chip size="small" label={`Confidence ${aiResult.score}%`} color={aiResult.score >= 85 ? 'success' : aiResult.score >= 75 ? 'warning' : 'default'} />
-                </Stack>
-                <List dense>
-                  {aiResult.ideas.map(idea => (
-                    <ListItemButton key={idea.id} sx={{ alignItems: 'start' }}>
-                      <ListItemText primary={idea.label} secondary={idea.text} />
-                      <Stack direction="row" spacing={1}>
-                        <Tooltip title="Copy">
-                          <IconButton size="small" onClick={()=>navigator.clipboard.writeText(idea.text)}><ContentCopyIcon fontSize="inherit"/></IconButton>
-                        </Tooltip>
-                        <Tooltip title={`Apply to ${idea.label}`}>
-                          <IconButton size="small" color="primary" onClick={()=>applyIdea(idea)}><ApplyIcon fontSize="inherit"/></IconButton>
-                        </Tooltip>
-                      </Stack>
-                    </ListItemButton>
-                  ))}
-                </List>
-                <Typography variant="caption" color="text.secondary">Tokens ~{aiResult.usage.tokens} · {aiResult.usage.ms} ms</Typography>
-              </Box>
-            )}
-          </Box>
-        </Box>
-      </Drawer>
-
-      <Snackbar open={false} />
     </React.Fragment>
   );
 }
