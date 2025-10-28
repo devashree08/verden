@@ -1,4 +1,474 @@
-curl -v http://127.0.0.1:8080/mcp/ \
-  -H "Content-Type: application/json" \
-  -H "X-User-JWT: $USER_JWT" \
-  --data-binary '{"type":"tools/list"}'
+import * as React from "react";
+import { useMemo, useRef, useState } from "react";
+import {
+  CssBaseline,
+  Container,
+  Grid,
+  Card,
+  CardContent,
+  Typography,
+  Button,
+  ButtonGroup,
+  Box,
+  Chip,
+  TextField,
+  Switch,
+  FormControlLabel,
+  Select,
+  MenuItem,
+  InputLabel,
+  FormControl,
+  Tabs,
+  Tab,
+  Divider,
+  Accordion,
+  AccordionSummary,
+  AccordionDetails,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Drawer,
+  List,
+  ListItemButton,
+  ListItemText,
+  Stack,
+  Tooltip,
+  Snackbar,
+  Alert,
+  LinearProgress,
+  Avatar,
+  IconButton
+} from "@mui/material";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import SaveIcon from "@mui/icons-material/Save";
+import VisibilityIcon from "@mui/icons-material/Visibility";
+import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
+import DescriptionIcon from "@mui/icons-material/Description";
+import PsychologyIcon from "@mui/icons-material/Psychology";
+import SendIcon from "@mui/icons-material/Send";
+import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import ApplyIcon from "@mui/icons-material/TaskAlt";
+
+// === CSF 2.0 realistic test data (subset, 10 subcats) ===
+const SUBCATS = [
+  "GV.RR-01",
+  "DE.AE-02",
+  "DE.AE-03",
+  "PR.AA-01",
+  "PR.AT-01",
+  "PR.DS-01",
+  "PR.PS-01",
+  "RS.MI-01",
+  "RC.RP-01",
+  "ID.IM-01",
+];
+
+const definitions = {
+  "GV.RR-01": "Organizational leadership is responsible and accountable for cybersecurity risk and fosters a risk‑aware culture.",
+  "DE.AE-02": "Potentially adverse events are analyzed to better understand associated activities.",
+  "DE.AE-03": "Information is correlated from multiple sources.",
+  "PR.AA-01": "Identities and credentials are managed for users, services, and hardware.",
+  "PR.AT-01": "Personnel receive awareness and training to perform general tasks with cyber risks in mind.",
+  "PR.DS-01": "Data‑at‑rest is protected (confidentiality, integrity, availability).",
+  "PR.PS-01": "Configuration management practices are established and applied.",
+  "RS.MI-01": "Incidents are contained.",
+  "RC.RP-01": "Recovery portion of the incident response plan is executed when initiated.",
+  "ID.IM-01": "Improvements are identified from evaluations.",
+};
+
+const makeArtifacts = (count, sc, lvl) =>
+  Array.from({ length: count }, (_, i) => ({
+    id: `${sc}-${lvl}-A${i + 1}`,
+    title: `Artifact ${i + 1} for ${sc}`,
+    url: `https://example.com/artifacts/${encodeURIComponent(sc)}/${lvl}/${i + 1}`,
+  }));
+
+const maturity = {};
+SUBCATS.forEach((sc) => {
+  maturity[sc] = {
+    L3: [
+      { id: `${sc}-L3-1`, title: "Attribute 1", definition: `${definitions[sc]} (baseline L3).`, artifacts: makeArtifacts(2, sc, "L3") },
+      { id: `${sc}-L3-2`, title: "Attribute 2", definition: `Documented process and periodic review for ${sc}.`, artifacts: makeArtifacts(2, sc, "L3") },
+    ],
+    L4: [
+      { id: `${sc}-L4-1`, title: "Attribute 1", definition: `Metrics‑driven improvement & automation for ${sc}.`, artifacts: makeArtifacts(3, sc, "L4") },
+      { id: `${sc}-L4-2`, title: "Attribute 2", definition: `Proactive validation and governance for ${sc}.`, artifacts: makeArtifacts(2, sc, "L4") },
+      { id: `${sc}-L4-3`, title: "Attribute 3", definition: `Integrated with enterprise risk metrics for ${sc}.`, artifacts: makeArtifacts(2, sc, "L4") },
+    ],
+  };
+});
+
+const fakeDB = { orgs: ["VCS", "VGS-T", "Network", "TPD"], subcategories: SUBCATS, maturity };
+
+function MultiSelect({ label, options, selected, onChange }) {
+  return (
+    <FormControl fullWidth size="small">
+      <InputLabel id={`${label}-label`}>{label}</InputLabel>
+      <Select
+        labelId={`${label}-label`}
+        multiple
+        value={selected}
+        onChange={(e) => onChange(e.target.value)}
+        label={label}
+        renderValue={(sel) => (
+          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+            {sel.map((v) => (
+              <Chip key={v} label={v} size="small" />
+            ))}
+          </Box>
+        )}
+      >
+        {options.map((opt) => (
+          <MenuItem key={opt} value={opt}>{opt}</MenuItem>
+        ))}
+      </Select>
+    </FormControl>
+  );
+}
+
+function AttributeBlock({ attr, value, onChange }) {
+  return (
+    <Accordion disableGutters>
+      <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 1 }}>
+        <Stack spacing={0.25} sx={{ pr: 1 }}>
+          <Typography fontWeight={600}>{attr.title}</Typography>
+          <Typography variant="body2" color="text.secondary">{attr.definition}</Typography>
+        </Stack>
+      </AccordionSummary>
+      <AccordionDetails>
+        <Stack spacing={1.25}>
+          <Box>
+            <Typography variant="subtitle2">Artifacts</Typography>
+            <List dense>
+              {attr.artifacts.map((a) => (
+                <ListItemButton key={a.id} component="a" href={a.url} target="_blank">
+                  <ListItemText primary={a.title} secondary={a.url} />
+                </ListItemButton>
+              ))}
+            </List>
+          </Box>
+          <TextField label="User comment" fullWidth size="small" multiline minRows={3} value={value || ""} onChange={(e) => onChange(e.target.value)} />
+        </Stack>
+      </AccordionDetails>
+    </Accordion>
+  );
+}
+
+// ==== Simple AI mock to preview UX ====
+async function callAgentAPI({ agent, prompt, context }) {
+  // Simulate latency
+  await new Promise((r) => setTimeout(r, 900));
+  // Fake score and content
+  const score = Math.round(70 + Math.random() * 30); // 70-100
+  const ideas = [
+    {
+      id: Math.random().toString(36).slice(2),
+      field: "exec",
+      label: "Executive Summary",
+      text: `For ${context.org}, consolidate ${context.subcats.length} subcategories into a role-based roadmap. Emphasize L3\u2192L4 progression with measurable KPIs and quarterly artifact reviews.`,
+    },
+    {
+      id: Math.random().toString(36).slice(2),
+      field: "scope",
+      label: "Scope",
+      text: `Include ${context.org} plus shared services; explicitly list ${context.subcats.slice(0,3).join(", ")} as in-scope. Note dependencies on SOC and IAM teams.`,
+    },
+  ];
+  return { agent, score, ideas, usage: { tokens: 832, ms: 900 } };
+}
+
+export default function App() {
+  const [org, setOrg] = useState("VCS");
+  const [subcats, setSubcats] = useState(["GV.RR-01", "DE.AE-02", "DE.AE-03"]);
+  const [execSum, setExecSum] = useState("");
+  const [scope, setScope] = useState("");
+  const [quant, setQuant] = useState(false);
+  const [coverage, setCoverage] = useState("");
+  const [pct, setPct] = useState(85);
+  const [tab, setTab] = useState("L3");
+  const [comments, setComments] = useState({});
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiAgent, setAiAgent] = useState("Narrative Coach");
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiResult, setAiResult] = useState(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+
+  const narrative = useMemo(() => {
+    const lines = [];
+    lines.push(`# Narrative for ${org}`);
+    if (execSum) { lines.push("", `**Executive Summary**\n${execSum}`); }
+    if (scope) { lines.push("", `**Scope**\n${scope}`); }
+    if (quant) lines.push("", `**Coverage / Profile (Quantitative)**\\nAssessed population coverage: ~${pct}%.`);
+    else if (coverage) lines.push("", `**Coverage / Profile (Qualitative)**\\n${coverage}`);
+    lines.push("");
+    subcats.forEach((sc) => {
+      lines.push(`## ${sc}: ${definitions[sc]}`);
+      ["L3","L4"].forEach(lvl => {
+        lines.push(`**Maturity ${lvl.replace("L","Level ")}:**`);
+        fakeDB.maturity[sc][lvl].forEach(a => {
+          const key = `${sc}|${lvl}|${a.id}`;
+          lines.push(`- *${a.title}:* ${a.definition}`);
+          if (comments[key]) lines.push(`  - **Comment:** ${comments[key]}`);
+          const arts = a.artifacts.map(x=>x.title).join(", ");
+          lines.push(`  - **Artifacts:** ${arts}`);
+        });
+        lines.push("");
+      })
+    });
+    return lines.join("\n");
+  }, [org, subcats, execSum, scope, quant, coverage, pct, comments]);
+
+  const runAI = async (seedPrompt) => {
+    const prompt = seedPrompt ?? aiPrompt;
+    setAiBusy(true);
+    setAiResult(null);
+    const res = await callAgentAPI({
+      agent: aiAgent,
+      prompt,
+      context: { org, subcats, execSum, scope, coverage, tab },
+    });
+    setAiBusy(false);
+    setAiResult(res);
+  };
+
+  const applyIdea = (idea) => {
+    if (idea.field === "exec") setExecSum((v) => (v ? v + "\n\n" : "") + idea.text);
+    if (idea.field === "scope") setScope((v) => (v ? v + "\n\n" : "") + idea.text);
+  };
+
+  async function exportPDF() {
+    const { jsPDF } = await import("jspdf");
+    const doc = new jsPDF({ unit: "pt", format: "a4" });
+    const margin = 40;
+    const maxWidth = 515;
+    const text = narrative.replaceAll("\n", "\n\n");
+    const lines = doc.splitTextToSize(text, maxWidth);
+    doc.text(lines, margin, margin);
+    doc.save(`Narrative_${org}.pdf`);
+  }
+
+  async function exportDocx() {
+    const docx = await import("docx");
+    const { Document, Packer, Paragraph, TextRun, HeadingLevel } = docx;
+    const blocks = [];
+    blocks.push(new Paragraph({ heading: HeadingLevel.TITLE, children: [new TextRun(`Narrative for ${org}`)] }));
+    narrative.split("\n").forEach((line) => {
+      if (!line.trim()) { blocks.push(new Paragraph("")); return; }
+      if (line.startsWith("## ")) {
+        blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun(line.replace("## ", ""))] }));
+      } else if (line.startsWith("**") && line.endsWith("**")) {
+        blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_3, children: [new TextRun(line.replaceAll("**", ""))] }));
+      } else {
+        blocks.push(new Paragraph({ children: [new TextRun(line.replaceAll("**", ""))] }));
+      }
+    });
+    const doc = new Document({ sections: [{ children: blocks }] });
+    const blob = await Packer.toBlob(doc);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `Narrative_${org}.docx`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <React.Fragment>
+      <CssBaseline />
+      <Container maxWidth="lg" sx={{ py: 2 }}>
+        <Stack direction={{ xs: "column", md: "row" }} alignItems={{ md: "center" }} justifyContent="space-between" spacing={1} sx={{ mb: 1 }}>
+          <Typography variant="h5">CSF 2.0 Narrative Generator</Typography>
+          <Stack direction="row" spacing={1}>
+            <Button startIcon={<PsychologyIcon />} variant="contained" onClick={() => setAiOpen(true)}>AI Assist</Button>
+            <Button startIcon={<VisibilityIcon />} color="secondary" variant="outlined" onClick={() => setPreviewOpen(true)}>Preview</Button>
+            <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF}>PDF</Button>
+            <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>DOCX</Button>
+          </Stack>
+        </Stack>
+
+        <Grid container spacing={2} alignItems="flex-start">
+          {/* Left column */}
+          <Grid item xs={12} md={4}>
+            <Card variant="outlined">
+              <CardContent>
+                <Stack spacing={2}>
+                  <Box>
+                    <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Organization</Typography>
+                    <ButtonGroup fullWidth>
+                      {fakeDB.orgs.map((o) => (
+                        <Button key={o} variant={org === o ? "contained" : "outlined"} onClick={() => setOrg(o)}>{o}</Button>
+                      ))}
+                    </ButtonGroup>
+                  </Box>
+
+                  <MultiSelect label="Subcategories" options={fakeDB.subcategories} selected={subcats} onChange={setSubcats} />
+
+                  <Stack spacing={1}>
+                    <Stack direction="row" alignItems="center" justifyContent="space-between">
+                      <Typography variant="subtitle2">Executive Summary</Typography>
+                      <Button size="small" onClick={() => runAI("Improve the executive summary for clarity and business value.")}>Enrich with AI</Button>
+                    </Stack>
+                    <TextField value={execSum} onChange={(e) => setExecSum(e.target.value)} multiline minRows={3} fullWidth placeholder="Exec summary..." />
+                  </Stack>
+
+                  <Stack spacing={1}>
+                    <Stack direction="row" alignItems="center" justifyContent="space-between">
+                      <Typography variant="subtitle2">Scope</Typography>
+                      <Button size="small" onClick={() => runAI("Draft a concise, accurate scope statement.")}>Enrich with AI</Button>
+                    </Stack>
+                    <TextField value={scope} onChange={(e) => setScope(e.target.value)} multiline minRows={2} fullWidth placeholder="Scope..." />
+                  </Stack>
+
+                  <Box>
+                    <FormControlLabel control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />} label={quant ? "Quantitative" : "Qualitative"} />
+                    {!quant ? (
+                      <TextField value={coverage} onChange={(e) => setCoverage(e.target.value)} fullWidth placeholder="Qualitative coverage..." />
+                    ) : (
+                      <TextField label="Coverage %" type="number" inputProps={{ min: 0, max:100 }} value={pct} onChange={(e) => setPct(Number(e.target.value))} sx={{ width: 160 }} />
+                    )}
+                  </Box>
+                </Stack>
+              </CardContent>
+            </Card>
+          </Grid>
+
+          {/* Right column */}
+          <Grid item xs={12} md={8}>
+            <Card variant="outlined">
+              <CardContent>
+                <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable" aria-label="maturity tabs">
+                  <Tab label="Level 3" value="L3" />
+                  <Tab label="Level 4" value="L4" />
+                </Tabs>
+                <Divider sx={{ my: 1 }} />
+
+                <Stack spacing={1.25}>
+                  {subcats.map((sc) => (
+                    <Box key={sc}>
+                      <Typography variant="h6" sx={{ mb: 0.5 }}>{sc}: {definitions[sc]}</Typography>
+                      <Stack spacing={1}>
+                        {fakeDB.maturity[sc][tab].map((attr) => {
+                          const key = `${sc}|${tab}|${attr.id}`;
+                          return (
+                            <AttributeBlock
+                              key={key}
+                              attr={attr}
+                              value={comments[key]}
+                              onChange={(v) => setComments((c) => ({ ...c, [key]: v }))}
+                            />
+                          );
+                        })}
+                      </Stack>
+                    </Box>
+                  ))}
+                </Stack>
+              </CardContent>
+            </Card>
+          </Grid>
+        </Grid>
+      </Container>
+
+      {/* PREVIEW */}
+      <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} fullWidth maxWidth="md">
+        <DialogTitle>Narrative Preview</DialogTitle>
+        <DialogContent dividers sx={{ maxHeight: { xs: '65vh', md: '70vh' } }}>
+          <Box sx={{ typography: "body1" }}>
+            {narrative.split("\n").map((line, i) => (
+              <Typography key={i} sx={{ fontWeight: line.startsWith("**") ? 600 : undefined, fontSize: line.startsWith("## ") ? 18 : undefined }}>
+                {line.replaceAll("**", "").replace("## ", "")}
+              </Typography>
+            ))}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button startIcon={<PictureAsPdfIcon />} onClick={exportPDF}>Export PDF</Button>
+          <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>Export DOCX</Button>
+          <Button onClick={() => setPreviewOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* AI ASSIST DRAWER */}
+      <Drawer anchor="right" open={aiOpen} onClose={() => setAiOpen(false)}>
+        <Box sx={{ width: 420, maxWidth: '100vw' }} role="presentation">
+          <Stack direction="row" alignItems="center" spacing={1} sx={{ p: 2 }}>
+            <Avatar><PsychologyIcon /></Avatar>
+            <Box>
+              <Typography variant="h6">AI Assist</Typography>
+              <Typography variant="caption" color="text.secondary">Crew agent suggestions with confidence</Typography>
+            </Box>
+          </Stack>
+          <Divider />
+
+          <Box sx={{ p: 2 }}>
+            <FormControl fullWidth size="small" sx={{ mb: 1 }}>
+              <InputLabel id="agent-label">Agent</InputLabel>
+              <Select labelId="agent-label" value={aiAgent} label="Agent" onChange={(e)=>setAiAgent(e.target.value)}>
+                <MenuItem value="Narrative Coach">Narrative Coach</MenuItem>
+                <MenuItem value="Artifact Mapper">Artifact Mapper</MenuItem>
+                <MenuItem value="Coverage Estimator">Coverage Estimator</MenuItem>
+              </Select>
+            </FormControl>
+
+            <TextField
+              label="Ask the agent"
+              placeholder="e.g., Draft a concise executive summary that highlights L3→L4 progression."
+              fullWidth
+              size="small"
+              multiline
+              minRows={3}
+              value={aiPrompt}
+              onChange={(e)=>setAiPrompt(e.target.value)}
+            />
+
+            <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+              <Button startIcon={<SendIcon />} variant="contained" onClick={()=>runAI()}>Send</Button>
+              <Button onClick={()=>runAI("Review and improve clarity and specificity of all current fields.")}>Auto-suggest</Button>
+            </Stack>
+          </Box>
+
+          <Divider />
+
+          <Box sx={{ p: 2 }}>
+            {!aiResult && !aiBusy && (
+              <Typography variant="body2" color="text.secondary">No suggestions yet. Ask the agent or try Auto‑suggest.</Typography>
+            )}
+            {aiBusy && (
+              <Box>
+                <Typography variant="body2">Thinking…</Typography>
+                <LinearProgress sx={{ my: 1 }} />
+              </Box>
+            )}
+            {aiResult && (
+              <Box>
+                <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
+                  <Typography variant="subtitle2">{aiResult.agent}</Typography>
+                  <Chip size="small" label={`Confidence ${aiResult.score}%`} color={aiResult.score >= 85 ? 'success' : aiResult.score >= 75 ? 'warning' : 'default'} />
+                </Stack>
+                <List dense>
+                  {aiResult.ideas.map(idea => (
+                    <ListItemButton key={idea.id} sx={{ alignItems: 'start' }}>
+                      <ListItemText primary={idea.label} secondary={idea.text} />
+                      <Stack direction="row" spacing={1}>
+                        <Tooltip title="Copy">
+                          <IconButton size="small" onClick={()=>navigator.clipboard.writeText(idea.text)}><ContentCopyIcon fontSize="inherit"/></IconButton>
+                        </Tooltip>
+                        <Tooltip title={`Apply to ${idea.label}`}>
+                          <IconButton size="small" color="primary" onClick={()=>applyIdea(idea)}><ApplyIcon fontSize="inherit"/></IconButton>
+                        </Tooltip>
+                      </Stack>
+                    </ListItemButton>
+                  ))}
+                </List>
+                <Typography variant="caption" color="text.secondary">Tokens ~{aiResult.usage.tokens} · {aiResult.usage.ms} ms</Typography>
+              </Box>
+            )}
+          </Box>
+        </Box>
+      </Drawer>
+
+      <Snackbar open={false} />
+    </React.Fragment>
+  );
+}
