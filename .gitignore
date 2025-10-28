@@ -155,10 +155,13 @@ async function callAgentAPI({ agent, prompt, context }) {
     `For ${context.org}, highlight L3→L4 progression and quarterly artifact reviews.`,
     `Explicitly scope ${context.subcats.slice(0,3).join(", ")} and dependencies on SOC/IAM.`,
   ];
-  return { agent, score, text: suggestions.join("\n\n"), usage: { tokens: 832, ms: 900 } };
+  return { agent, score, text: suggestions.join("
+
+"), usage: { tokens: 832, ms: 900 } };
 }
 
 export default function App() {
+  // ---- Narrative state ----
   const [org, setOrg] = useState("VCS");
   const [subcats, setSubcats] = useState(["GV.RR-01", "DE.AE-02", "DE.AE-03"]);
   const [execSum, setExecSum] = useState("");
@@ -169,11 +172,40 @@ export default function App() {
   const [tab, setTab] = useState("L3");
   const [comments, setComments] = useState({});
 
-  // AI panel state
+  // ---- AI panel state ----
   const [aiAgent, setAiAgent] = useState("Narrative Coach");
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
-  const [history, setHistory] = useState([]); // {id, role: 'user'|'assistant', text, score?}
+  const [history, setHistory] = useState([]);
+
+  // ---- Layout state (split vs drawer) ----
+  const [layoutMode, setLayoutMode] = useState(() => localStorage.getItem("layoutMode") || "split"); // 'split' | 'drawer'
+  const [panePct, setPanePct] = useState(() => Number(localStorage.getItem("panePct") || 50)); // left width percent
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  // simple splitter handlers (no external deps)
+  const resizerRef = React.useRef(null);
+  const containerRef = React.useRef(null);
+  const startDrag = (e) => {
+    if (!containerRef.current) return;
+    const startX = e.clientX;
+    const containerRect = containerRef.current.getBoundingClientRect();
+    const startPct = panePct;
+    const onMove = (ev) => {
+      const delta = ev.clientX - startX;
+      const pct = Math.min(75, Math.max(25, startPct + (delta / containerRect.width) * 100));
+      setPanePct(pct);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      localStorage.setItem("panePct", String(panePct));
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  React.useEffect(()=>{ localStorage.setItem('layoutMode', layoutMode); }, [layoutMode]);
 
   const narrative = useMemo(() => {
     const lines = [];
@@ -263,14 +295,16 @@ export default function App() {
             <Button startIcon={<VisibilityIcon />} color="secondary" variant="outlined" onClick={()=>window.alert('Preview opens in real build')}>Preview</Button>
             <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF}>PDF</Button>
             <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>DOCX</Button>
+            <Button variant="text" onClick={()=> setLayoutMode(m => m==='split' ? 'drawer' : 'split')}>{layoutMode==='split' ? 'Open AI as Drawer' : 'Use Side-by-Side'}</Button>
           </Stack>
         </Stack>
 
-        <Grid container spacing={2}>
-          {/* LEFT: Narrative inputs */}
-          <Grid item xs={12} md={6}>
-            <Card variant="outlined">
-              <CardContent>
+        {/* ====== TOP WORKSPACE: split panes OR drawer mode ====== */}
+        {layoutMode === 'split' ? (
+          <Box ref={containerRef} sx={{ display: { xs: 'block', md: 'grid' }, gridTemplateColumns: { md: `${panePct}% 6px ${100 - panePct}%` }, columnGap: 0, mb: 2 }}>
+            {/* Left pane: narrative inputs */}
+            <Box>
+              <Card variant="outlined"><CardContent>
                 <Stack spacing={2}>
                   <Box>
                     <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Organization</Typography>
@@ -280,9 +314,7 @@ export default function App() {
                       ))}
                     </ButtonGroup>
                   </Box>
-
                   <MultiSelect label="Subcategories" options={fakeDB.subcategories} selected={subcats} onChange={setSubcats} />
-
                   <Stack spacing={1}>
                     <Stack direction="row" alignItems="center" justifyContent="space-between">
                       <Typography variant="subtitle2">Executive Summary</Typography>
@@ -290,7 +322,6 @@ export default function App() {
                     </Stack>
                     <TextField value={execSum} onChange={(e) => setExecSum(e.target.value)} multiline minRows={3} fullWidth placeholder="Exec summary..." />
                   </Stack>
-
                   <Stack spacing={1}>
                     <Stack direction="row" alignItems="center" justifyContent="space-between">
                       <Typography variant="subtitle2">Scope</Typography>
@@ -298,7 +329,6 @@ export default function App() {
                     </Stack>
                     <TextField value={scope} onChange={(e) => setScope(e.target.value)} multiline minRows={2} fullWidth placeholder="Scope..." />
                   </Stack>
-
                   <Box>
                     <FormControlLabel control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />} label={quant ? "Quantitative" : "Qualitative"} />
                     {!quant ? (
@@ -308,112 +338,143 @@ export default function App() {
                     )}
                   </Box>
                 </Stack>
-              </CardContent>
-            </Card>
-          </Grid>
+              </CardContent></Card>
+            </Box>
 
-          {/* RIGHT: Always-visible AI Assist */}
-          <Grid item xs={12} md={6}>
-            <Card variant="outlined" sx={{ height: '100%' }}>
-              <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 1, height: '100%' }}>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <Avatar><PsychologyIcon /></Avatar>
-                  <Box>
-                    <Typography variant="h6">AI Assist</Typography>
-                    <Typography variant="caption" color="text.secondary">Pick agent · Ask · Apply suggestions</Typography>
-                  </Box>
-                </Stack>
+            {/* Resizer */}
+            <Box role="separator" aria-label="Resize panes" onMouseDown={startDrag} sx={{ display: { xs: 'none', md: 'block' }, cursor: 'col-resize', bgcolor: 'divider', '&:hover': { bgcolor: 'primary.main' }, width: 6 }} />
 
-                <FormControl fullWidth size="small">
-                  <InputLabel id="agent-label">Agent</InputLabel>
-                  <Select labelId="agent-label" value={aiAgent} label="Agent" onChange={(e)=>setAiAgent(e.target.value)}>
-                    <MenuItem value="Narrative Coach">Narrative Coach</MenuItem>
-                    <MenuItem value="Artifact Mapper">Artifact Mapper</MenuItem>
-                    <MenuItem value="Coverage Estimator">Coverage Estimator</MenuItem>
-                  </Select>
-                </FormControl>
-
-                {/* Chat composer */}
-                <Stack direction="row" spacing={1}>
-                  <TextField
-                    placeholder="Ask the agent… (e.g., Improve scope to be outcome‑oriented)"
-                    fullWidth size="small" value={aiPrompt} onChange={(e)=>setAiPrompt(e.target.value)}
-                    onKeyDown={(e)=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); runAI(); } }}
-                  />
-                  <Button startIcon={<SendIcon />} variant="contained" onClick={()=>runAI()}>Send</Button>
-                </Stack>
-
-                {/* Conversation history */}
-                <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: 'auto', minHeight: 220 }}>
-                  <Stack spacing={1}>
-                    {history.length === 0 && (
-                      <Typography variant="body2" color="text.secondary">No conversation yet. Try asking the agent or use the Enrich buttons on the left.</Typography>
-                    )}
-                    {history.map((m) => (
-                      <Box key={m.id} sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
-                        {m.role === 'assistant' ? (
-                          <Avatar sx={{ bgcolor: 'primary.main' }}><PsychologyIcon fontSize="small"/></Avatar>
-                        ) : (
-                          <Avatar>U</Avatar>
-                        )}
-                        <Box sx={{ flex: 1 }}>
-                          <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
-                            <Typography variant="subtitle2">{m.role === 'assistant' ? (m.agent || 'Assistant') : 'You'}</Typography>
-                            {m.role === 'assistant' && (
-                              <Chip size="small" label={`Confidence ${m.score ?? 0}%`} color={m.score >= 85 ? 'success' : m.score >= 75 ? 'warning' : 'default'} />
-                            )}
-                          </Stack>
-                          <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{m.text}</Typography>
-                          {m.role === 'assistant' && (
-                            <Stack direction="row" spacing={1} sx={{ mt: 0.5 }}>
-                              <Button size="small" startIcon={<ApplyIcon fontSize="inherit"/>} onClick={()=>applyToField(m.text, 'exec')}>Apply to Executive Summary</Button>
-                              <Button size="small" onClick={()=>applyToField(m.text, 'scope')}>Apply to Scope</Button>
-                              <IconButton size="small" onClick={()=>navigator.clipboard.writeText(m.text)}><ContentCopyIcon fontSize="inherit"/></IconButton>
-                            </Stack>
-                          )}
-                        </Box>
-                      </Box>
-                    ))}
-                    {aiBusy && (
-                      <Box>
-                        <Typography variant="body2">Thinking…</Typography>
-                        <LinearProgress sx={{ my: 1 }} />
-                      </Box>
-                    )}
-                  </Stack>
-                </Paper>
-              </CardContent>
-            </Card>
-          </Grid>
-
-          {/* FULL-WIDTH: Attributes section */}
-          <Grid item xs={12}>
-            <Card variant="outlined">
-              <CardContent>
-                <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable" aria-label="maturity tabs">
-                  <Tab label="Level 3" value="L3" />
-                  <Tab label="Level 4" value="L4" />
-                </Tabs>
-                <Divider sx={{ my: 1 }} />
-                <Stack spacing={1.25}>
-                  {subcats.map((sc) => (
-                    <Box key={sc}>
-                      <Typography variant="h6" sx={{ mb: 0.5 }}>{sc}: {definitions[sc]}</Typography>
-                      <Stack spacing={1}>
-                        {fakeDB.maturity[sc][tab].map((attr) => {
-                          const key = `${sc}|${tab}|${attr.id}`;
-                          return (
-                            <AttributeBlock key={key} attr={attr} value={comments[key]} onChange={(v) => setComments((c) => ({ ...c, [key]: v }))} />
-                          );
-                        })}
-                      </Stack>
+            {/* Right pane: AI assist */}
+            <Box>
+              <Card variant="outlined" sx={{ height: '100%' }}>
+                <CardContent sx={{ display: 'flex', flexDirection: 'column', gap: 1, height: '100%' }}>
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <Avatar><PsychologyIcon /></Avatar>
+                    <Box>
+                      <Typography variant="h6">AI Assist</Typography>
+                      <Typography variant="caption" color="text.secondary">Pick agent · Ask · Apply suggestions</Typography>
                     </Box>
-                  ))}
-                </Stack>
-              </CardContent>
-            </Card>
+                  </Stack>
+
+                  <FormControl fullWidth size="small">
+                    <InputLabel id="agent-label">Agent</InputLabel>
+                    <Select labelId="agent-label" value={aiAgent} label="Agent" onChange={(e)=>setAiAgent(e.target.value)}>
+                      <MenuItem value="Narrative Coach">Narrative Coach</MenuItem>
+                      <MenuItem value="Artifact Mapper">Artifact Mapper</MenuItem>
+                      <MenuItem value="Coverage Estimator">Coverage Estimator</MenuItem>
+                    </Select>
+                  </FormControl>
+
+                  <Stack direction="row" spacing={1}>
+                    <TextField placeholder="Ask the agent…" fullWidth size="small" value={aiPrompt} onChange={(e)=>setAiPrompt(e.target.value)} onKeyDown={(e)=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); runAI(); } }} />
+                    <Button startIcon={<SendIcon />} variant="contained" onClick={()=>runAI()}>Send</Button>
+                  </Stack>
+
+                  <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: 'auto', minHeight: 220 }}>
+                    <Stack spacing={1}>
+                      {history.length === 0 && (
+                        <Typography variant="body2" color="text.secondary">No conversation yet. Try asking the agent or use the Enrich buttons on the left.</Typography>
+                      )}
+                      {history.map((m) => (
+                        <Box key={m.id} sx={{ display: 'flex', gap: 1, alignItems: 'flex-start' }}>
+                          {m.role === 'assistant' ? (
+                            <Avatar sx={{ bgcolor: 'primary.main' }}><PsychologyIcon fontSize="small"/></Avatar>
+                          ) : (
+                            <Avatar>U</Avatar>
+                          )}
+                          <Box sx={{ flex: 1 }}>
+                            <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
+                              <Typography variant="subtitle2">{m.role === 'assistant' ? (m.agent || 'Assistant') : 'You'}</Typography>
+                              {m.role === 'assistant' && (
+                                <Chip size="small" label={`Confidence ${m.score ?? 0}%`} color={m.score >= 85 ? 'success' : m.score >= 75 ? 'warning' : 'default'} />
+                              )}
+                            </Stack>
+                            <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{m.text}</Typography>
+                            {m.role === 'assistant' && (
+                              <Stack direction="row" spacing={1} sx={{ mt: 0.5 }}>
+                                <Button size="small" startIcon={<ApplyIcon fontSize="inherit"/>} onClick={()=>applyToField(m.text, 'exec')}>Apply to Executive Summary</Button>
+                                <Button size="small" onClick={()=>applyToField(m.text, 'scope')}>Apply to Scope</Button>
+                                <IconButton size="small" onClick={()=>navigator.clipboard.writeText(m.text)}><ContentCopyIcon fontSize="inherit"/></IconButton>
+                              </Stack>
+                            )}
+                          </Box>
+                        </Box>
+                      ))}
+                      {aiBusy && (
+                        <Box>
+                          <Typography variant="body2">Thinking…</Typography>
+                          <LinearProgress sx={{ my: 1 }} />
+                        </Box>
+                      )}
+                    </Stack>
+                  </Paper>
+                </CardContent>
+              </Card>
+            </Box>
+          </Box>
+        ) : (
+          <Grid container spacing={2}>
+            <Grid item xs={12}>
+              <Card variant="outlined"><CardContent>
+                <Typography variant="subtitle1" sx={{ mb: 1 }}>AI Assist drawer mode preview (toggle above to switch back to split)</Typography>
+                <Button variant="contained" onClick={()=>setDrawerOpen(true)}>Open AI Drawer</Button>
+              </CardContent></Card>
+            </Grid>
           </Grid>
-        </Grid>
+        )}
+
+        {/* ===== Attributes full width ===== */}
+        <Card variant="outlined">
+          <CardContent>
+            <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable" aria-label="maturity tabs">
+              <Tab label="Level 3" value="L3" />
+              <Tab label="Level 4" value="L4" />
+            </Tabs>
+            <Divider sx={{ my: 1 }} />
+            <Stack spacing={1.25}>
+              {subcats.map((sc) => (
+                <Box key={sc}>
+                  <Typography variant="h6" sx={{ mb: 0.5 }}>{sc}: {definitions[sc]}</Typography>
+                  <Stack spacing={1}>
+                    {fakeDB.maturity[sc][tab].map((attr) => {
+                      const key = `${sc}|${tab}|${attr.id}`;
+                      return (
+                        <AttributeBlock key={key} attr={attr} value={comments[key]} onChange={(v) => setComments((c) => ({ ...c, [key]: v }))} />
+                      );
+                    })}
+                  </Stack>
+                </Box>
+              ))}
+            </Stack>
+          </CardContent>
+        </Card>
+
+        {/* Optional Drawer AI (when layoutMode === 'drawer') */}
+        <Drawer anchor="right" open={drawerOpen} onClose={()=>setDrawerOpen(false)}>
+          <Box sx={{ width: 420, maxWidth: '100vw', p: 2 }}>
+            <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+              <Avatar><PsychologyIcon/></Avatar>
+              <Typography variant="h6">AI Assist</Typography>
+            </Stack>
+            <FormControl fullWidth size="small" sx={{ mb: 1 }}>
+              <InputLabel id="agent-label-d">Agent</InputLabel>
+              <Select labelId="agent-label-d" value={aiAgent} label="Agent" onChange={(e)=>setAiAgent(e.target.value)}>
+                <MenuItem value="Narrative Coach">Narrative Coach</MenuItem>
+                <MenuItem value="Artifact Mapper">Artifact Mapper</MenuItem>
+                <MenuItem value="Coverage Estimator">Coverage Estimator</MenuItem>
+              </Select>
+            </FormControl>
+            <Stack direction="row" spacing={1}>
+              <TextField placeholder="Ask the agent…" fullWidth size="small" value={aiPrompt} onChange={(e)=>setAiPrompt(e.target.value)} />
+              <Button startIcon={<SendIcon />} variant="contained" onClick={()=>runAI()}>Send</Button>
+            </Stack>
+            <List sx={{ mt: 1 }}>
+              {history.map((m)=> (
+                <ListItemText key={m.id} primaryTypographyProps={{ variant: 'body2' }} primary={`${m.role === 'assistant' ? 'Assistant' : 'You'}: ${m.text}`} />
+              ))}
+            </List>
+          </Box>
+        </Drawer>
       </Container>
     </React.Fragment>
   );
