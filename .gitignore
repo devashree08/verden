@@ -1,10 +1,9 @@
 import * as React from "react";
-import { useMemo, useState, useRef, useEffect } from "react";
+import { useMemo, useState, useRef } from "react";
 import {
   CssBaseline,
   Container,
   Box,
-  Grid,
   Card,
   CardContent,
   Typography,
@@ -32,17 +31,9 @@ import {
   Avatar,
   LinearProgress,
   Paper,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  Drawer,
   AppBar,
   Toolbar,
-  Tooltip,
-  useScrollTrigger,
-  Slide,
-  Checkbox
+  Collapse
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import VisibilityIcon from "@mui/icons-material/Visibility";
@@ -60,8 +51,10 @@ import SaveIcon from "@mui/icons-material/Save";
 import AssignmentTurnedInIcon from "@mui/icons-material/AssignmentTurnedIn";
 import FilterListIcon from "@mui/icons-material/FilterList";
 import AssessmentIcon from "@mui/icons-material/Assessment";
+import KeyboardArrowUpIcon from "@mui/icons-material/KeyboardArrowUp";
+import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 
-// ---------- CSF 2.0 realistic test data ----------
+/* ------------------ Realistic CSF 2.0 test data (subset) ------------------ */
 const SUBCATS = [
   "GV.RR-01",
   "PR.AA-01",
@@ -82,8 +75,7 @@ const DEFINITIONS = {
     "Identities and credentials for authorized users, services, and hardware are managed by the organization.",
   "PR.AT-01":
     "Personnel receive awareness and training to perform general tasks with cyber risks in mind.",
-  "PR.DS-01":
-    "Data-at-rest is protected (confidentiality, integrity, availability).",
+  "PR.DS-01": "Data-at-rest is protected (confidentiality, integrity, availability).",
   "PR.PS-01": "Configuration management practices are established and applied.",
   "DE.AE-02":
     "Potentially adverse events are analyzed to better understand associated activities.",
@@ -95,11 +87,12 @@ const DEFINITIONS = {
 };
 
 const ORG_COLORS = {
-  VCS: "#0052cc", // Cyber (blue)
-  "VGS-T": "#7c4dff", // Technology (purple)
-  Network: "#00a65a", // Network (green)
-  TPD: "#e67e22", // Product (orange)
+  VCS: "#0052cc",     // Cyber
+  "VGS-T": "#7c4dff", // Technology
+  Network: "#00a65a", // Network
+  TPD: "#e67e22",     // Product
 };
+const getOrgColor = (org) => ORG_COLORS[org] || "#1976d2";
 
 const makeArtifacts = (count, sc, lvl) =>
   Array.from({ length: count }, (_, i) => ({
@@ -150,7 +143,7 @@ SUBCATS.forEach((sc) => {
 
 const DB = { orgs: ["VCS", "VGS-T", "Network", "TPD"], subcategories: SUBCATS, maturity: MATURITY };
 
-// ---------- Mock directory for filters (owners/custodians/functions) ----------
+/* Directory to power filters (owners/custodians/functions) */
 const DIRECTORY = SUBCATS.reduce((acc, sc, i) => {
   acc[sc] = {
     function: ["Cyber", "Technology", "Network", "Product"][i % 4],
@@ -161,7 +154,7 @@ const DIRECTORY = SUBCATS.reduce((acc, sc, i) => {
   return acc;
 }, {});
 
-// ---------- Helpers ----------
+/* ------------------ UI helpers ------------------ */
 function MultiSelect({ label, options, value, onChange }) {
   return (
     <FormControl fullWidth size="small">
@@ -190,28 +183,24 @@ function MultiSelect({ label, options, value, onChange }) {
   );
 }
 
-// ---------- Mock Crew Agent call (swap with your API later) ----------
+/* ------------------ Mock Crew Agent call (swap with real API) ------------------ */
 async function callAgentAPI({ agent, prompt, target }) {
   await new Promise((r) => setTimeout(r, 900));
   const score = Math.round(70 + Math.random() * 30); // 70–100
+  const base =
+    target?.type === "attribute"
+      ? `Suggested comment for ${target.subcat} ${target.level} • ${target.title}:\n- Align artifacts to acceptance criteria.\n- Add evidence of periodic review.\n- Note exceptions and compensating controls.`
+      : `Narrative Assessor:\n• Strengths: clear scope, L3→L4 roadmap, KPI cadence.\n• Gaps: missing Tier-2 evidence in PR.DS-01.\n• Risks: dependency on legacy platforms.\n• Actions: prioritize IAM hardening, formalize artifact review cadence.`;
+
   return {
     agent,
     score,
-    text:
-      target?.type === "attribute"
-        ? `Suggested comment for ${target.subcat} ${target.level} • ${target.title}:
-- Align artifacts to acceptance criteria.
-- Add evidence of periodic review.
-- Note exceptions and compensating controls.`
-        : `Narrative Assessor:
-- Strengths: clear scope, L3→L4 roadmap, KPI cadence.
-- Gaps: missing Tier-2 evidence in PR.DS-01.
-- Risks: dependency on legacy platforms.
-- Actions: prioritize IAM hardening, formalize artifact review.`,
-    usage: { tokens: 642, ms: 900 },
+    usage: { tokens: 628, ms: 900 },
+    text: base,
   };
 }
 
+/* ------------------ Attribute block ------------------ */
 function AttributeBlock({
   sc,
   level,
@@ -231,18 +220,30 @@ function AttributeBlock({
       <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 1 }}>
         <Stack spacing={0.25} sx={{ pr: 1 }}>
           <Typography fontWeight={600}>{attr.title}</Typography>
-          <Typography variant="body2" color="text.secondary">{attr.definition}</Typography>
+          <Typography variant="body2" color="text.secondary">
+            {attr.definition}
+          </Typography>
         </Stack>
       </AccordionSummary>
       <AccordionDetails>
         <Stack spacing={1.25}>
           <Stack direction="row" spacing={1} justifyContent="flex-end" flexWrap="wrap">
-            <Button size="small" startIcon={<PsychologyIcon />} onClick={() => onAskAI({ type: "attribute", subcat: sc, level, attributeId: attr.id, title: attr.title })}>AI Assist</Button>
+            <Button
+              size="small"
+              startIcon={<PsychologyIcon />}
+              onClick={() =>
+                onAskAI({ type: "attribute", subcat: sc, level, attributeId: attr.id, title: attr.title })
+              }
+            >
+              AI Assist
+            </Button>
             <Button size="small" startIcon={<EditIcon />}>Edit</Button>
           </Stack>
 
           <Box>
-            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Artifacts</Typography>
+            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+              Artifacts
+            </Typography>
             <List dense>
               {artifacts.map((a) => (
                 <ListItemButton key={a.id} component="a" href={a.url} target="_blank">
@@ -254,24 +255,50 @@ function AttributeBlock({
               <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ mt: 1 }}>
                 <TextField size="small" label="Title" value={newTitle} onChange={(e) => setNewTitle(e.target.value)} />
                 <TextField size="small" label="URL" value={newUrl} onChange={(e) => setNewUrl(e.target.value)} />
-                <Button size="small" variant="contained" startIcon={<AddLinkIcon />} onClick={() => { if (newTitle && newUrl) { onAddArtifact({ title: newTitle, url: newUrl }); setNewTitle(""); setNewUrl(""); setAdding(false);} }}>Add</Button>
-                <IconButton size="small" onClick={() => setAdding(false)}><CloseIcon fontSize="inherit"/></IconButton>
+                <Button
+                  size="small"
+                  variant="contained"
+                  startIcon={<AddLinkIcon />}
+                  onClick={() => {
+                    if (newTitle && newUrl) {
+                      onAddArtifact({ title: newTitle, url: newUrl });
+                      setNewTitle("");
+                      setNewUrl("");
+                      setAdding(false);
+                    }
+                  }}
+                >
+                  Add
+                </Button>
+                <IconButton size="small" onClick={() => setAdding(false)}>
+                  <CloseIcon fontSize="inherit" />
+                </IconButton>
               </Stack>
             ) : (
-              <Button size="small" startIcon={<AddLinkIcon />} onClick={() => setAdding(true)} sx={{ mt: 0.5 }}>Add Artifact</Button>
+              <Button size="small" startIcon={<AddLinkIcon />} onClick={() => setAdding(true)} sx={{ mt: 0.5 }}>
+                Add Artifact
+              </Button>
             )}
           </Box>
 
-          <TextField label="Commentary" fullWidth size="small" multiline minRows={3} value={comment || ""} onChange={(e) => onChangeComment(e.target.value)} />
+          <TextField
+            label="Commentary"
+            fullWidth
+            size="small"
+            multiline
+            minRows={3}
+            value={comment || ""}
+            onChange={(e) => onChangeComment(e.target.value)}
+          />
         </Stack>
       </AccordionDetails>
     </Accordion>
   );
 }
 
-// ===================== MAIN APP =====================
+/* =============================== MAIN APP =============================== */
 export default function App() {
-  // Narrative state
+  /* Narrative state */
   const [org, setOrg] = useState("VCS");
   const [subcats, setSubcats] = useState(["GV.RR-01", "DE.AE-02", "DE.AE-03"]);
   const [execSum, setExecSum] = useState("");
@@ -281,6 +308,7 @@ export default function App() {
   const [pct, setPct] = useState(85);
   const [levelTab, setLevelTab] = useState("L3");
 
+  /* Comments & artifacts per attribute */
   const [comments, setComments] = useState({});
   const [artifactMap, setArtifactMap] = useState(() => {
     const init = {};
@@ -295,31 +323,32 @@ export default function App() {
     return init;
   });
 
-  // Save/Load drafts (org+subcats granularity)
-  const [drafts, setDrafts] = useState([]); // {id, org, subcats, complete, narrative, meta}
-  const [filterOpen, setFilterOpen] = useState(false);
+  /* Save / drafts */
+  const [drafts, setDrafts] = useState([]); // {id, org, subcats, complete, narrative, meta, comments, artifacts, updatedAt}
+  const [filterOpen, setFilterOpen] = useState(true);
   const [filters, setFilters] = useState({
     function: [],
     category: [],
     subcat: [],
     owner: [],
     custodian: [],
-    status: [], // Complete/Incomplete
+    status: [], // Complete / Incomplete
     org: [],
   });
 
-  // AI panel state
+  /* AI pane */
   const [aiVisible, setAiVisible] = useState(true);
   const [aiAgent, setAiAgent] = useState("Narrative Coach");
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
-  const [aiTab, setAiTab] = useState(0); // Chat / Audit
-  const [history, setHistory] = useState([]);
+  const [aiTab, setAiTab] = useState(0); // 0 Chat, 1 Audit, 2 Assessor
+  const [history, setHistory] = useState([]); // {id, role, text, score?, agent?, usage?, target?}
   const [audit, setAudit] = useState([]);
+  const [assessorText, setAssessorText] = useState("");
 
-  // Resizable split
+  /* Resizable split */
   const [panePct, setPanePct] = useState(() => {
-    const v = Number(localStorage.getItem("panePctV3") || 60);
+    const v = Number(localStorage.getItem("panePctV4") || 60);
     return Math.min(75, Math.max(35, v));
   });
   const containerRef = useRef(null);
@@ -327,32 +356,28 @@ export default function App() {
     if (!containerRef.current) return;
     const startX = e.clientX;
     const rect = containerRef.current.getBoundingClientRect();
-    const startPct = panePct;
-    const onMove = (ev) => {
-      const pct = Math.min(75, Math.max(35, startPct + ((ev.clientX - startX) / rect.width) * 100));
+    const start = panePct;
+    const move = (ev) => {
+      const pct = Math.min(75, Math.max(35, start + ((ev.clientX - startX) / rect.width) * 100));
       setPanePct(pct);
     };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      localStorage.setItem("panePctV3", String(panePct));
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      localStorage.setItem("panePctV4", String(panePct));
     };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
   };
 
-  // Narrative text
+  /* Narrative string for exports */
   const narrative = useMemo(() => {
     const lines = [];
     lines.push(`# Narrative for ${org}`);
-    if (execSum) lines.push("", `**Executive Summary**
-${execSum}`);
-    if (scope) lines.push("", `**Scope**
-${scope}`);
-    if (quant) lines.push("", `**Coverage / Profile (Quantitative)**
-Assessed population coverage: ~${pct}%.`);
-    else if (coverage) lines.push("", `**Coverage / Profile (Qualitative)**
-${coverage}`);
+    if (execSum) lines.push("", `**Executive Summary**\n${execSum}`);
+    if (scope) lines.push("", `**Scope**\n${scope}`);
+    if (quant) lines.push("", `**Coverage / Profile (Quantitative)**\nAssessed population coverage: ~${pct}%.`);
+    else if (coverage) lines.push("", `**Coverage / Profile (Qualitative)**\n${coverage}`);
     lines.push("");
     subcats.forEach((sc) => {
       lines.push(`## ${sc}: ${DEFINITIONS[sc]}`);
@@ -368,20 +393,16 @@ ${coverage}`);
         lines.push("");
       });
     });
-    return lines.join("
-");
+    return lines.join("\n");
   }, [org, subcats, execSum, scope, quant, coverage, pct, comments, artifactMap]);
 
-  // Export helpers
+  /* Exports */
   async function exportPDF() {
     const { jsPDF } = await import("jspdf");
     const doc = new jsPDF({ unit: "pt", format: "a4" });
     const margin = 40;
     const maxWidth = 515;
-    const text = narrative.replaceAll("
-", "
-
-");
+    const text = narrative.replaceAll("\n", "\n\n");
     const lines = doc.splitTextToSize(text, maxWidth);
     doc.text(lines, margin, margin);
     doc.save(`Narrative_${org}.pdf`);
@@ -390,14 +411,28 @@ ${coverage}`);
     const docx = await import("docx");
     const { Document, Packer, Paragraph, TextRun, HeadingLevel } = docx;
     const blocks = [];
-    blocks.push(new Paragraph({ heading: HeadingLevel.TITLE, children: [new TextRun(`Narrative for ${org}`)] }));
-    narrative.split("
-").forEach((line) => {
-      if (!line.trim()) { blocks.push(new Paragraph("")); return; }
+    blocks.push(
+      new Paragraph({ heading: HeadingLevel.TITLE, children: [new TextRun(`Narrative for ${org}`)] })
+    );
+    narrative.split("\n").forEach((line) => {
+      if (!line.trim()) {
+        blocks.push(new Paragraph(""));
+        return;
+      }
       if (line.startsWith("## ")) {
-        blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun(line.replace("## ", ""))] }));
+        blocks.push(
+          new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            children: [new TextRun(line.replace("## ", ""))],
+          })
+        );
       } else if (line.startsWith("**") && line.endsWith("**")) {
-        blocks.push(new Paragraph({ heading: HeadingLevel.HEADING_3, children: [new TextRun(line.replaceAll("**", ""))] }));
+        blocks.push(
+          new Paragraph({
+            heading: HeadingLevel.HEADING_3,
+            children: [new TextRun(line.replaceAll("**", ""))],
+          })
+        );
       } else {
         blocks.push(new Paragraph({ children: [new TextRun(line.replaceAll("**", ""))] }));
       }
@@ -412,38 +447,63 @@ ${coverage}`);
     URL.revokeObjectURL(url);
   }
 
-  // AI actions
+  /* AI actions */
   const runAI = async (prompt, target) => {
     if (!prompt || !prompt.trim()) return;
     setAiBusy(true);
-    const userMsg = { id: crypto.randomUUID(), role: "user", text: prompt, target };
-    setHistory((h) => [...h, userMsg]);
+    setHistory((h) => [...h, { id: crypto.randomUUID(), role: "user", text: prompt, target }]);
     const res = await callAgentAPI({ agent: aiAgent, prompt, target });
-    const assistantMsg = { id: crypto.randomUUID(), role: "assistant", agent: res.agent, score: res.score, usage: res.usage, text: res.text, target };
-    setHistory((h) => [...h, assistantMsg]);
+    const msg = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: res.text,
+      score: res.score,
+      agent: res.agent,
+      usage: res.usage,
+      target,
+    };
+    setHistory((h) => [...h, msg]);
     setAiBusy(false);
     setAiTab(0);
   };
+
   const applySuggestion = (msg, destination) => {
     if (!msg?.text) return;
-    if (destination === "exec") setExecSum((v) => (v ? v + "
-
-" : "") + msg.text);
-    else if (destination === "scope") setScope((v) => (v ? v + "
-
-" : "") + msg.text);
+    if (destination === "exec") setExecSum((v) => (v ? v + "\n\n" : "") + msg.text);
+    else if (destination === "scope") setScope((v) => (v ? v + "\n\n" : "") + msg.text);
     else if (destination && destination.type === "attribute") {
       const { subcat, level, attributeId } = destination;
       const key = `${subcat}|${level}|${attributeId}`;
-      setComments((c) => ({ ...c, [key]: (c[key] ? c[key] + "
-
-" : "") + msg.text }));
+      setComments((c) => ({ ...c, [key]: (c[key] ? c[key] + "\n\n" : "") + msg.text }));
     }
-    setAudit((a) => [...a, { id: crypto.randomUUID(), timestamp: new Date().toISOString(), appliedTo: destination === "exec" ? "Executive Summary" : destination === "scope" ? "Scope" : `Attribute ${destination?.subcat} ${destination?.level} ${destination?.attributeId}`, text: msg.text }]);
+    setAudit((a) => [
+      ...a,
+      {
+        id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        appliedTo:
+          destination === "exec"
+            ? "Executive Summary"
+            : destination === "scope"
+            ? "Scope"
+            : `Attribute ${destination?.subcat} ${destination?.level} ${destination?.attributeId}`,
+        text: msg.text,
+      },
+    ]);
   };
-  const clearChat = () => setHistory([]);
 
-  // Save/Load
+  const clearChat = () => setHistory([]);
+  const runAssessor = async () => {
+    setAiTab(2);
+    const res = await callAgentAPI({
+      agent: "Narrative Assessor",
+      prompt: "Assess this narrative",
+      target: { type: "narrative" },
+    });
+    setAssessorText(`Confidence ${res.score}%\n\n${res.text}`);
+  };
+
+  /* Save/Load */
   const saveDraft = (complete = false) => {
     const entry = {
       id: crypto.randomUUID(),
@@ -460,118 +520,513 @@ ${coverage}`);
   };
 
   const filteredDrafts = drafts.filter((d) => {
-    // Apply simple filters
     if (filters.org.length && !filters.org.includes(d.org)) return false;
     if (filters.status.length) {
-      const wantComplete = filters.status.includes("Complete");
-      const wantIncomplete = filters.status.includes("Incomplete");
-      if (!( (wantComplete && d.complete) || (wantIncomplete && !d.complete) )) return false;
+      const wantC = filters.status.includes("Complete");
+      const wantI = filters.status.includes("Incomplete");
+      if (!((wantC && d.complete) || (wantI && !d.complete))) return false;
     }
     if (filters.subcat.length && !d.subcats.some((s) => filters.subcat.includes(s))) return false;
-    if (filters.category.length && !d.subcats.some((s) => filters.category.includes(s.split('.')[0]))) return false;
-    if (filters.function.length && !d.subcats.some((s) => filters.function.includes(DIRECTORY[s].function))) return false;
-    if (filters.owner.length && !d.subcats.some((s) => filters.owner.includes(DIRECTORY[s].owner))) return false;
-    if (filters.custodian.length && !d.subcats.some((s) => filters.custodian.includes(DIRECTORY[s].custodian))) return false;
+    if (filters.category.length && !d.subcats.some((s) => filters.category.includes(s.split(".")[0])))
+      return false;
+    if (filters.function.length && !d.subcats.some((s) => filters.function.includes(DIRECTORY[s].function)))
+      return false;
+    if (filters.owner.length && !d.subcats.some((s) => filters.owner.includes(DIRECTORY[s].owner)))
+      return false;
+    if (filters.custodian.length && !d.subcats.some((s) => filters.custodian.includes(DIRECTORY[s].custodian)))
+      return false;
     return true;
   });
 
-  // Sticky toolbar show/hide on scroll
-  function HideOnScroll({ children }) {
-    const trigger = useScrollTrigger();
-    return (
-      <Slide appear={false} direction="down" in={!trigger}>
-        {children}
-      </Slide>
-    );
-  }
+  /* ------------------ UI ------------------ */
+  const primaryColor = getOrgColor(org);
 
-  // Narrative Assessor dialog
-  const [assessorOpen, setAssessorOpen] = useState(false);
-  const [assessorBusy, setAssessorBusy] = useState(false);
-  const [assessorText, setAssessorText] = useState("");
-  const runAssessor = async () => {
-    setAssessorBusy(true);
-    const res = await callAgentAPI({ agent: "Narrative Assessor", prompt: "Assess this narrative", target: { type: "narrative" } });
-    setAssessorText(res.text + "
+  const RightPane = (
+    <Card variant="outlined" sx={{ height: "100%" }}>
+      <CardContent sx={{ display: "flex", flexDirection: "column", gap: 1, height: "100%" }}>
+        <Stack direction="row" spacing={1} alignItems="center">
+          <Avatar sx={{ bgcolor: primaryColor }}>
+            <PsychologyIcon />
+          </Avatar>
+          <Box>
+            <Typography variant="h6">AI Assist</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Chat · Audit · Assessor
+            </Typography>
+          </Box>
+          <Box sx={{ flex: 1 }} />
+          <Button size="small" variant="text" onClick={() => setAiVisible(false)}>
+            Hide
+          </Button>
+        </Stack>
 
-Confidence: " + res.score + "%");
-    setAssessorBusy(false);
-  };
+        <FormControl fullWidth size="small">
+          <InputLabel id="agent-label">Agent</InputLabel>
+          <Select
+            labelId="agent-label"
+            value={aiAgent}
+            label="Agent"
+            onChange={(e) => setAiAgent(e.target.value)}
+          >
+            <MenuItem value="Narrative Coach">Narrative Coach</MenuItem>
+            <MenuItem value="Artifact Mapper">Artifact Mapper</MenuItem>
+            <MenuItem value="Coverage Estimator">Coverage Estimator</MenuItem>
+          </Select>
+        </FormControl>
 
+        <Tabs value={aiTab} onChange={(_, v) => setAiTab(v)}>
+          <Tab label="Chat" />
+          <Tab label="Audit" />
+          <Tab label="Assessor" />
+        </Tabs>
+
+        {/* CHAT TAB */}
+        {aiTab === 0 && (
+          <>
+            <Stack direction="row" spacing={1}>
+              <TextField
+                placeholder="Ask the agent…"
+                fullWidth
+                size="small"
+                value={aiPrompt}
+                onChange={(e) => setAiPrompt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    runAI(aiPrompt);
+                    setAiPrompt("");
+                  }
+                }}
+              />
+              <Button
+                startIcon={<SendIcon />}
+                variant="contained"
+                onClick={() => {
+                  runAI(aiPrompt);
+                  setAiPrompt("");
+                }}
+                sx={{ bgcolor: primaryColor, "&:hover": { bgcolor: primaryColor } }}
+              >
+                Send
+              </Button>
+              <IconButton title="Clear chat" onClick={clearChat}>
+                <ClearAllIcon />
+              </IconButton>
+            </Stack>
+
+            <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: "auto", minHeight: 240 }}>
+              <Stack spacing={1}>
+                {history.length === 0 && (
+                  <Typography variant="body2" color="text.secondary">
+                    No conversation yet. Use “Enrich with AI” on the left, or ask a question here.
+                  </Typography>
+                )}
+                {history.map((m) => (
+                  <Box key={m.id} sx={{ display: "flex", gap: 1, alignItems: "flex-start" }}>
+                    {m.role === "assistant" ? (
+                      <Avatar sx={{ bgcolor: "primary.main" }}>
+                        <PsychologyIcon fontSize="small" />
+                      </Avatar>
+                    ) : (
+                      <Avatar>U</Avatar>
+                    )}
+                    <Box sx={{ flex: 1 }}>
+                      <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
+                        <Typography variant="subtitle2">
+                          {m.role === "assistant" ? m.agent || "Assistant" : "You"}
+                        </Typography>
+                        {m.role === "assistant" && (
+                          <Chip
+                            size="small"
+                            label={`Confidence ${m.score ?? 0}%`}
+                            color={m.score >= 85 ? "success" : m.score >= 75 ? "warning" : "default"}
+                          />
+                        )}
+                      </Stack>
+                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                        {m.text}
+                      </Typography>
+
+                      {m.role === "assistant" && (
+                        <Stack direction="row" spacing={1} sx={{ mt: 0.5 }} useFlexGap flexWrap="wrap">
+                          <Button
+                            size="small"
+                            startIcon={<TaskAltIcon fontSize="inherit" />}
+                            onClick={() => applySuggestion(m, "exec")}
+                            sx={{ bgcolor: primaryColor, color: "#fff", "&:hover": { bgcolor: primaryColor } }}
+                          >
+                            Apply to Exec Summary
+                          </Button>
+                          <Button
+                            size="small"
+                            onClick={() => applySuggestion(m, "scope")}
+                            sx={{ bgcolor: primaryColor, color: "#fff", "&:hover": { bgcolor: primaryColor } }}
+                          >
+                            Apply to Scope
+                          </Button>
+                          {m.target?.type === "attribute" && (
+                            <Button
+                              size="small"
+                              onClick={() => applySuggestion(m, m.target)}
+                              sx={{ bgcolor: primaryColor, color: "#fff", "&:hover": { bgcolor: primaryColor } }}
+                            >
+                              Apply to Attribute Comment
+                            </Button>
+                          )}
+                          <IconButton
+                            size="small"
+                            title="Copy"
+                            onClick={() => navigator.clipboard.writeText(m.text)}
+                          >
+                            <ContentCopyIcon fontSize="inherit" />
+                          </IconButton>
+                        </Stack>
+                      )}
+                    </Box>
+                  </Box>
+                ))}
+                {aiBusy && (
+                  <Box>
+                    <Typography variant="body2">Thinking…</Typography>
+                    <LinearProgress sx={{ my: 1 }} />
+                  </Box>
+                )}
+              </Stack>
+            </Paper>
+          </>
+        )}
+
+        {/* AUDIT TAB */}
+        {aiTab === 1 && (
+          <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: "auto", minHeight: 240 }}>
+            <Stack spacing={1}>
+              {audit.length === 0 && (
+                <Typography variant="body2" color="text.secondary">
+                  No applied AI changes yet.
+                </Typography>
+              )}
+              {audit.map((a) => (
+                <Box key={a.id}>
+                  <Typography variant="caption" color="text.secondary">
+                    {new Date(a.timestamp).toLocaleString()}
+                  </Typography>
+                  <Typography variant="subtitle2">{a.appliedTo}</Typography>
+                  <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                    {a.text}
+                  </Typography>
+                  <Divider sx={{ my: 1 }} />
+                </Box>
+              ))}
+            </Stack>
+          </Paper>
+        )}
+
+        {/* ASSESSOR TAB */}
+        {aiTab === 2 && (
+          <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: "auto", minHeight: 240 }}>
+            {assessorText ? (
+              <Typography sx={{ whiteSpace: "pre-wrap" }}>{assessorText}</Typography>
+            ) : (
+              <Stack alignItems="flex-start" spacing={1}>
+                <Typography variant="body2" color="text.secondary">
+                  Run the GenAI Narrative Assessor from the header to populate this view.
+                </Typography>
+                <Button
+                  startIcon={<AssessmentIcon />}
+                  variant="contained"
+                  onClick={runAssessor}
+                  sx={{ bgcolor: primaryColor, "&:hover": { bgcolor: primaryColor } }}
+                >
+                  Run Assessor
+                </Button>
+              </Stack>
+            )}
+          </Paper>
+        )}
+      </CardContent>
+    </Card>
+  );
+
+  /* ------------------ Render ------------------ */
   return (
     <React.Fragment>
       <CssBaseline />
 
-      {/* Top sticky toolbar with actions; shrinks away on scroll but keeps floating buttons accessible */}
-      <HideOnScroll>
-        <AppBar position="sticky" elevation={0} color="default" sx={{ borderBottom: 1, borderColor: "divider" }}>
-          <Toolbar sx={{ gap: 1, flexWrap: "wrap" }}>
-            <Typography variant="h6" sx={{ flexGrow: 1 }}>CSF 2.0 Narrative Generator</Typography>
-            <Chip label={org} sx={{ bgcolor: ORG_COLORS[org], color: "#fff" }} />
-            <Button startIcon={<VisibilityIcon />} color="secondary" variant="outlined" onClick={() => alert("Preview would render the narrative text.")}>Preview</Button>
-            <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF}>PDF</Button>
-            <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>DOCX</Button>
-            <Button startIcon={<AssessmentIcon />} variant="contained" onClick={() => { setAssessorOpen(true); runAssessor(); }}>GenAI Narrative Assessor</Button>
-            <Divider orientation="vertical" flexItem />
-            <Button startIcon={<SaveIcon />} onClick={() => saveDraft(false)}>Save</Button>
-            <Button startIcon={<AssignmentTurnedInIcon />} onClick={() => saveDraft(true)}>Mark Complete</Button>
-            <Button startIcon={<FilterListIcon />} onClick={() => setFilterOpen(true)}>Filters</Button>
-            {!aiVisible && <Button onClick={() => setAiVisible(true)}>Show AI</Button>}
-          </Toolbar>
-        </AppBar>
-      </HideOnScroll>
+      {/* Sticky header (always visible) */}
+      <AppBar position="sticky" elevation={0} color="default" sx={{ borderBottom: 1, borderColor: "divider" }}>
+        <Toolbar sx={{ gap: 1, flexWrap: "wrap" }}>
+          <Typography variant="h6" sx={{ flexGrow: 1 }}>
+            CSF 2.0 Narrative Generator
+          </Typography>
+          <Chip label={org} sx={{ bgcolor: primaryColor, color: "#fff" }} />
+          <Button
+            startIcon={<VisibilityIcon />}
+            color="secondary"
+            variant="outlined"
+            onClick={() => alert("Preview would render the narrative text.")}
+          >
+            Preview
+          </Button>
+          <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF}>
+            PDF
+          </Button>
+          <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx}>
+            DOCX
+          </Button>
+          <Button
+            startIcon={<AssessmentIcon />}
+            variant="contained"
+            onClick={runAssessor}
+            sx={{ bgcolor: primaryColor, "&:hover": { bgcolor: primaryColor } }}
+          >
+            GenAI Narrative Assessor
+          </Button>
+          <Divider orientation="vertical" flexItem />
+          <Button startIcon={<SaveIcon />} onClick={() => saveDraft(false)} sx={{ color: primaryColor }}>
+            Save
+          </Button>
+          <Button
+            startIcon={<AssignmentTurnedInIcon />}
+            onClick={() => saveDraft(true)}
+            sx={{ color: primaryColor }}
+          >
+            Mark Complete
+          </Button>
+          <Button
+            startIcon={<FilterListIcon />}
+            onClick={() => setFilterOpen((v) => !v)}
+            sx={{ color: primaryColor }}
+          >
+            {filterOpen ? "Hide Filters" : "Show Filters"}
+          </Button>
+          {!aiVisible && (
+            <Button onClick={() => setAiVisible(true)} sx={{ color: primaryColor }}>
+              Show AI
+            </Button>
+          )}
+        </Toolbar>
+      </AppBar>
 
-      <Container maxWidth="lg" sx={{ py: 2 }}>
-        {/* Split pane container */}
-        <Box ref={containerRef} sx={{ display: { xs: "block", md: "grid" }, gridTemplateColumns: aiVisible ? { md: `${panePct}% 6px ${100 - panePct}%` } : { md: "100%" }, columnGap: 0, mb: 2 }}>
-          {/* LEFT: linear narrative template */}
+      {/* Filters bar (persistent, collapsible) */}
+      <Container maxWidth="lg" sx={{ mt: 2 }}>
+        <Card variant="outlined" sx={{ mb: 2 }}>
+          <CardContent>
+            <Stack direction="row" alignItems="center" justifyContent="space-between">
+              <Typography variant="subtitle1">Filters</Typography>
+              <IconButton size="small" onClick={() => setFilterOpen((v) => !v)}>
+                {filterOpen ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
+              </IconButton>
+            </Stack>
+
+            <Collapse in={filterOpen} timeout="auto" unmountOnExit>
+              <Stack spacing={2} sx={{ mt: 1 }}>
+                <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
+                  <MultiSelect
+                    label="Org"
+                    options={DB.orgs}
+                    value={filters.org}
+                    onChange={(v) => setFilters((f) => ({ ...f, org: v }))}
+                  />
+                  <MultiSelect
+                    label="Function"
+                    options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].function))]}
+                    value={filters.function}
+                    onChange={(v) => setFilters((f) => ({ ...f, function: v }))}
+                  />
+                  <MultiSelect
+                    label="Categories"
+                    options={[...new Set(SUBCATS.map((s) => s.split(".")[0]))]}
+                    value={filters.category}
+                    onChange={(v) => setFilters((f) => ({ ...f, category: v }))}
+                  />
+                </Stack>
+
+                <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
+                  <MultiSelect
+                    label="Subcategories"
+                    options={SUBCATS}
+                    value={filters.subcat}
+                    onChange={(v) => setFilters((f) => ({ ...f, subcat: v }))}
+                  />
+                  <MultiSelect
+                    label="SubcatOwner"
+                    options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].owner))]}
+                    value={filters.owner}
+                    onChange={(v) => setFilters((f) => ({ ...f, owner: v }))}
+                  />
+                  <MultiSelect
+                    label="SubcatCustodian"
+                    options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].custodian))]}
+                    value={filters.custodian}
+                    onChange={(v) => setFilters((f) => ({ ...f, custodian: v }))}
+                  />
+                  <MultiSelect
+                    label="Status"
+                    options={["Complete", "Incomplete"]}
+                    value={filters.status}
+                    onChange={(v) => setFilters((f) => ({ ...f, status: v }))}
+                  />
+                </Stack>
+
+                <Divider />
+
+                <Typography variant="subtitle2">Saved Narratives</Typography>
+                <List dense>
+                  {filteredDrafts.length === 0 && (
+                    <ListItemText primary="No saved narratives match filters." />
+                  )}
+                  {filteredDrafts.map((d) => (
+                    <ListItemButton
+                      key={d.id}
+                      onClick={() => {
+                        setOrg(d.org);
+                        setSubcats(d.subcats);
+                        setExecSum(d.meta.execSum);
+                        setScope(d.meta.scope);
+                        setQuant(d.meta.quant);
+                        setCoverage(d.meta.coverage);
+                        setPct(d.meta.pct);
+                        setLevelTab(d.meta.levelTab);
+                        setComments(d.comments);
+                        setArtifactMap(d.artifacts);
+                        window.scrollTo({ top: 0, behavior: "smooth" });
+                      }}
+                    >
+                      <ListItemText
+                        primary={`${d.org} • ${d.complete ? "Complete" : "Draft"} • ${new Date(
+                          d.updatedAt
+                        ).toLocaleString()}`}
+                        secondary={d.subcats.join(", ")}
+                      />
+                    </ListItemButton>
+                  ))}
+                </List>
+              </Stack>
+            </Collapse>
+          </CardContent>
+        </Card>
+      </Container>
+
+      {/* Split panes */}
+      <Container maxWidth="lg" sx={{ pb: 4 }}>
+        <Box
+          ref={containerRef}
+          sx={{
+            display: { xs: "block", md: "grid" },
+            gridTemplateColumns: aiVisible ? { md: `${panePct}% 6px ${100 - panePct}%` } : { md: "100%" },
+            columnGap: 0,
+          }}
+        >
+          {/* LEFT: linear narrative template (including attributes) */}
           <Box>
+            {/* Narrative inputs */}
             <Card variant="outlined" sx={{ mb: 2 }}>
               <CardContent>
                 <Stack spacing={2}>
                   <Box>
-                    <Typography variant="subtitle2" sx={{ mb: 0.5 }}>Organization</Typography>
+                    <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+                      Organization
+                    </Typography>
                     <ButtonGroup fullWidth>
                       {DB.orgs.map((o) => (
-                        <Button key={o} variant={org === o ? "contained" : "outlined"} onClick={() => setOrg(o)} sx={{ bgcolor: org === o ? ORG_COLORS[o] : undefined }}>{o}</Button>
+                        <Button
+                          key={o}
+                          variant={org === o ? "contained" : "outlined"}
+                          onClick={() => setOrg(o)}
+                          sx={{
+                            bgcolor: org === o ? getOrgColor(o) : undefined,
+                            color: org === o ? "#fff" : undefined,
+                            "&:hover": org === o ? { bgcolor: getOrgColor(o) } : undefined,
+                          }}
+                        >
+                          {o}
+                        </Button>
                       ))}
                     </ButtonGroup>
                   </Box>
 
-                  <MultiSelect label="Subcategories" options={DB.subcategories} value={subcats} onChange={setSubcats} />
+                  <MultiSelect
+                    label="Subcategories"
+                    options={DB.subcategories}
+                    value={subcats}
+                    onChange={setSubcats}
+                  />
 
                   <Stack spacing={1}>
                     <Stack direction="row" alignItems="center" justifyContent="space-between">
                       <Typography variant="subtitle2">Executive Summary</Typography>
-                      <Button size="small" onClick={() => runAI("Draft an executive summary highlighting L3→L4 roadmap and KPIs.")}>Enrich with AI</Button>
+                      <Button
+                        size="small"
+                        onClick={() =>
+                          runAI("Draft an executive summary highlighting L3→L4 roadmap and KPIs.")
+                        }
+                        sx={{ color: primaryColor }}
+                      >
+                        Enrich with AI
+                      </Button>
                     </Stack>
-                    <TextField value={execSum} onChange={(e) => setExecSum(e.target.value)} multiline minRows={3} fullWidth placeholder="Exec summary…" />
+                    <TextField
+                      value={execSum}
+                      onChange={(e) => setExecSum(e.target.value)}
+                      multiline
+                      minRows={3}
+                      fullWidth
+                      placeholder="Exec summary…"
+                    />
                   </Stack>
 
                   <Stack spacing={1}>
                     <Stack direction="row" alignItems="center" justifyContent="space-between">
                       <Typography variant="subtitle2">Scope</Typography>
-                      <Button size="small" onClick={() => runAI("Draft a concise scope statement.")}>Enrich with AI</Button>
+                      <Button
+                        size="small"
+                        onClick={() => runAI("Draft a concise scope statement.")}
+                        sx={{ color: primaryColor }}
+                      >
+                        Enrich with AI
+                      </Button>
                     </Stack>
-                    <TextField value={scope} onChange={(e) => setScope(e.target.value)} multiline minRows={2} fullWidth placeholder="Scope…" />
+                    <TextField
+                      value={scope}
+                      onChange={(e) => setScope(e.target.value)}
+                      multiline
+                      minRows={2}
+                      fullWidth
+                      placeholder="Scope…"
+                    />
                   </Stack>
 
                   <Box>
-                    <FormControlLabel control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />} label={quant ? "Quantitative" : "Qualitative"} />
+                    <FormControlLabel
+                      control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />}
+                      label={quant ? "Quantitative" : "Qualitative"}
+                    />
                     {!quant ? (
-                      <TextField value={coverage} onChange={(e) => setCoverage(e.target.value)} fullWidth placeholder="Qualitative coverage…" />
+                      <TextField
+                        value={coverage}
+                        onChange={(e) => setCoverage(e.target.value)}
+                        fullWidth
+                        placeholder="Qualitative coverage…"
+                      />
                     ) : (
-                      <TextField label="Coverage %" type="number" inputProps={{ min: 0, max: 100 }} value={pct} onChange={(e) => setPct(Number(e.target.value))} sx={{ width: 160 }} />
+                      <TextField
+                        label="Coverage %"
+                        type="number"
+                        inputProps={{ min: 0, max: 100 }}
+                        value={pct}
+                        onChange={(e) => setPct(Number(e.target.value))}
+                        sx={{ width: 160 }}
+                      />
                     )}
                   </Box>
                 </Stack>
               </CardContent>
             </Card>
 
-            {/* Attributes (full linear) */}
+            {/* Attributes */}
             <Card variant="outlined">
               <CardContent>
-                <Tabs value={levelTab} onChange={(_, v) => setLevelTab(v)} variant="scrollable" aria-label="maturity tabs">
+                <Tabs value={levelTab} onChange={(_, v) => setLevelTab(v)} variant="scrollable">
                   <Tab label="Level 3" value="L3" />
                   <Tab label="Level 4" value="L4" />
                 </Tabs>
@@ -579,7 +1034,9 @@ Confidence: " + res.score + "%");
                 <Stack spacing={1.25}>
                   {subcats.map((sc) => (
                     <Box key={sc}>
-                      <Typography variant="h6" sx={{ mb: 0.5 }}>{sc}: {DEFINITIONS[sc]}</Typography>
+                      <Typography variant="h6" sx={{ mb: 0.5 }}>
+                        {sc}: {DEFINITIONS[sc]}
+                      </Typography>
                       <Stack spacing={1}>
                         {MATURITY[sc][levelTab].map((attr) => {
                           const key = `${sc}|${levelTab}|${attr.id}`;
@@ -591,9 +1048,21 @@ Confidence: " + res.score + "%");
                               attr={attr}
                               comment={comments[key]}
                               artifacts={artifactMap[key] || []}
-                              onChangeComment={(val) => setComments((c) => ({ ...c, [key]: val }))}
-                              onAddArtifact={(item) => setArtifactMap((m) => ({ ...m, [key]: [...(m[key] || []), { id: crypto.randomUUID(), ...item }] }))}
-                              onAskAI={(target) => runAI(`Draft an evidence-based comment for ${target.subcat} ${target.level} (${attr.title}).`, target)}
+                              onChangeComment={(val) =>
+                                setComments((c) => ({ ...c, [key]: val }))
+                              }
+                              onAddArtifact={(item) =>
+                                setArtifactMap((m) => ({
+                                  ...m,
+                                  [key]: [...(m[key] || []), { id: crypto.randomUUID(), ...item }],
+                                }))
+                              }
+                              onAskAI={(target) =>
+                                runAI(
+                                  `Draft an evidence-based comment for ${target.subcat} ${target.level} (${attr.title}).`,
+                                  target
+                                )
+                              }
                             />
                           );
                         })}
@@ -607,153 +1076,23 @@ Confidence: " + res.score + "%");
 
           {/* Resizer */}
           {aiVisible && (
-            <Box role="separator" aria-label="Resize panes" onMouseDown={startDrag} sx={{ display: { xs: "none", md: "block" }, cursor: "col-resize", bgcolor: "divider", "&:hover": { bgcolor: "primary.main" }, width: 6 }} />
+            <Box
+              role="separator"
+              aria-label="Resize panes"
+              onMouseDown={startDrag}
+              sx={{
+                display: { xs: "none", md: "block" },
+                cursor: "col-resize",
+                bgcolor: "divider",
+                "&:hover": { bgcolor: primaryColor },
+                width: 6,
+              }}
+            />
           )}
 
-          {/* RIGHT: AI Assist panel */}
-          {aiVisible && (
-            <Box>
-              <Card variant="outlined" sx={{ height: "100%" }}>
-                <CardContent sx={{ display: "flex", flexDirection: "column", gap: 1, height: "100%" }}>
-                  <Stack direction="row" spacing={1} alignItems="center">
-                    <Avatar sx={{ bgcolor: ORG_COLORS[org] }}><PsychologyIcon /></Avatar>
-                    <Box>
-                      <Typography variant="h6">AI Assist</Typography>
-                      <Typography variant="caption" color="text.secondary">Pick agent · Ask · Apply · Audit</Typography>
-                    </Box>
-                    <Box sx={{ flex: 1 }} />
-                    <Button size="small" variant="text" onClick={() => setAiVisible(false)}>Hide</Button>
-                  </Stack>
-
-                  <FormControl fullWidth size="small">
-                    <InputLabel id="agent-label">Agent</InputLabel>
-                    <Select labelId="agent-label" value={aiAgent} label="Agent" onChange={(e) => setAiAgent(e.target.value)}>
-                      <MenuItem value="Narrative Coach">Narrative Coach</MenuItem>
-                      <MenuItem value="Artifact Mapper">Artifact Mapper</MenuItem>
-                      <MenuItem value="Coverage Estimator">Coverage Estimator</MenuItem>
-                    </Select>
-                  </FormControl>
-
-                  <Tabs value={aiTab} onChange={(_, v) => setAiTab(v)}>
-                    <Tab label="Chat" />
-                    <Tab label="Audit" />
-                  </Tabs>
-
-                  {aiTab === 0 ? (
-                    <React.Fragment>
-                      <Stack direction="row" spacing={1}>
-                        <TextField placeholder="Ask the agent…" fullWidth size="small" value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); runAI(aiPrompt); setAiPrompt(""); } }} />
-                        <Button startIcon={<SendIcon />} variant="contained" onClick={() => { runAI(aiPrompt); setAiPrompt(""); }}>Send</Button>
-                        <IconButton title="Clear chat" onClick={clearChat}><ClearAllIcon /></IconButton>
-                      </Stack>
-
-                      <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: "auto", minHeight: 240 }}>
-                        <Stack spacing={1}>
-                          {history.length === 0 && (<Typography variant="body2" color="text.secondary">No conversation yet. Use “Enrich with AI” on the left, or ask a question here.</Typography>)}
-                          {history.map((m) => (
-                            <Box key={m.id} sx={{ display: "flex", gap: 1, alignItems: "flex-start" }}>
-                              {m.role === "assistant" ? (<Avatar sx={{ bgcolor: "primary.main" }}><PsychologyIcon fontSize="small" /></Avatar>) : (<Avatar>U</Avatar>)}
-                              <Box sx={{ flex: 1 }}>
-                                <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
-                                  <Typography variant="subtitle2">{m.role === "assistant" ? m.agent || "Assistant" : "You"}</Typography>
-                                  {m.role === "assistant" && (<Chip size="small" label={`Confidence ${m.score ?? 0}%`} color={m.score >= 85 ? "success" : m.score >= 75 ? "warning" : "default"} />)}
-                                </Stack>
-                                <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>{m.text}</Typography>
-                                {m.role === "assistant" && (
-                                  <Stack direction="row" spacing={1} sx={{ mt: 0.5 }} useFlexGap flexWrap="wrap">
-                                    <Button size="small" startIcon={<TaskAltIcon fontSize="inherit" />} onClick={() => applySuggestion(m, "exec")}>Apply to Exec Summary</Button>
-                                    <Button size="small" onClick={() => applySuggestion(m, "scope")}>Apply to Scope</Button>
-                                    {m.target?.type === "attribute" && (<Button size="small" onClick={() => applySuggestion(m, m.target)}>Apply to Attribute Comment</Button>)}
-                                    <IconButton size="small" title="Copy" onClick={() => navigator.clipboard.writeText(m.text)}><ContentCopyIcon fontSize="inherit" /></IconButton>
-                                  </Stack>
-                                )}
-                              </Box>
-                            </Box>
-                          ))}
-                          {aiBusy && (<Box><Typography variant="body2">Thinking…</Typography><LinearProgress sx={{ my: 1 }} /></Box>)}
-                        </Stack>
-                      </Paper>
-                    </React.Fragment>
-                  ) : (
-                    <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: "auto", minHeight: 240 }}>
-                      <Stack spacing={1}>
-                        {audit.length === 0 && (<Typography variant="body2" color="text.secondary">No applied AI changes yet.</Typography>)}
-                        {audit.map((a) => (
-                          <Box key={a.id}>
-                            <Typography variant="caption" color="text.secondary">{new Date(a.timestamp).toLocaleString()}</Typography>
-                            <Typography variant="subtitle2">{a.appliedTo}</Typography>
-                            <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>{a.text}</Typography>
-                            <Divider sx={{ my: 1 }} />
-                          </Box>
-                        ))}
-                      </Stack>
-                    </Paper>
-                  )}
-                </CardContent>
-              </Card>
-            </Box>
-          )}
+          {/* RIGHT: AI Assist */}
+          {aiVisible && <Box>{RightPane}</Box>}
         </Box>
-
-        {/* Filters Drawer */}
-        <Drawer anchor="right" open={filterOpen} onClose={() => setFilterOpen(false)}>
-          <Box sx={{ width: 360, p: 2 }}>
-            <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
-              <Typography variant="h6">Filters</Typography>
-              <IconButton onClick={() => setFilterOpen(false)}><CloseIcon /></IconButton>
-            </Stack>
-            <Divider sx={{ mb: 2 }} />
-            <Stack spacing={2}>
-              <MultiSelect label="Org" options={DB.orgs} value={filters.org} onChange={(v) => setFilters((f) => ({ ...f, org: v }))} />
-              <MultiSelect label="Function" options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].function))]} value={filters.function} onChange={(v) => setFilters((f) => ({ ...f, function: v }))} />
-              <MultiSelect label="Categories" options={[...new Set(SUBCATS.map((s) => s.split('.')[0]))]} value={filters.category} onChange={(v) => setFilters((f) => ({ ...f, category: v }))} />
-              <MultiSelect label="Subcategories" options={SUBCATS} value={filters.subcat} onChange={(v) => setFilters((f) => ({ ...f, subcat: v }))} />
-              <MultiSelect label="SubcatOwner" options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].owner))]} value={filters.owner} onChange={(v) => setFilters((f) => ({ ...f, owner: v }))} />
-              <MultiSelect label="SubcatCustodian" options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].custodian))]} value={filters.custodian} onChange={(v) => setFilters((f) => ({ ...f, custodian: v }))} />
-              <MultiSelect label="Status" options={["Complete", "Incomplete"]} value={filters.status} onChange={(v) => setFilters((f) => ({ ...f, status: v }))} />
-              <Divider />
-              <Typography variant="subtitle2">Saved Narratives</Typography>
-              <List dense>
-                {filteredDrafts.length === 0 && (<ListItemText primary="No saved narratives match filters." />)}
-                {filteredDrafts.map((d) => (
-                  <ListItemButton key={d.id} onClick={() => {
-                    setOrg(d.org);
-                    setSubcats(d.subcats);
-                    setExecSum(d.meta.execSum);
-                    setScope(d.meta.scope);
-                    setQuant(d.meta.quant);
-                    setCoverage(d.meta.coverage);
-                    setPct(d.meta.pct);
-                    setLevelTab(d.meta.levelTab);
-                    setComments(d.comments);
-                    setArtifactMap(d.artifacts);
-                    setFilterOpen(false);
-                  }}>
-                    <ListItemText primary={`${d.org} • ${d.complete ? 'Complete' : 'Draft'}`} secondary={d.subcats.join(', ')} />
-                  </ListItemButton>
-                ))}
-              </List>
-            </Stack>
-          </Box>
-        </Drawer>
-
-        {/* GenAI Narrative Assessor Output */}
-        <Dialog open={assessorOpen} onClose={() => setAssessorOpen(false)} maxWidth="md" fullWidth>
-          <DialogTitle>GenAI Narrative Assessor</DialogTitle>
-          <DialogContent dividers sx={{ maxHeight: { xs: '70vh', md: '75vh' } }}>
-            {assessorBusy ? (
-              <Box>
-                <Typography variant="body2">Analyzing narrative…</Typography>
-                <LinearProgress sx={{ my: 1 }} />
-              </Box>
-            ) : (
-              <Typography sx={{ whiteSpace: 'pre-wrap' }}>{assessorText || 'No output yet.'}</Typography>
-            )}
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={() => setAssessorOpen(false)}>Close</Button>
-          </DialogActions>
-        </Dialog>
       </Container>
     </React.Fragment>
   );
