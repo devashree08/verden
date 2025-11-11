@@ -1,1 +1,191 @@
-python -c "from apache_beam.io.gcp.bigquery import TableSchema; print('Success! The package is correctly installed.')"
+import argparse
+import logging
+import os
+import pyodbc
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions
+from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------
+# THE FIX:
+# We are now importing DIRECTLY from the 'bigquery_schemas' file.
+# This bypasses the 'bigquery' module that was failing to import.
+# ---------------------------------------------------------------------
+from apache_beam.io.gcp.bigquery_schemas import TableSchema, TableFieldSchema
+# ---------------------------------------------------------------------
+
+# --- TYPE MAPPING ---
+PYODBC_TYPE_NAME_TO_BQ = {
+    'int': 'INTEGER',
+    'str': 'STRING',
+    'float': 'FLOAT',
+    'bool': 'BOOLEAN',
+    'bytes': 'BYTES',
+    'Decimal': 'NUMERIC',
+    'datetime': 'TIMESTAMP',
+    'date': 'DATE',
+    'time': 'TIME',
+}
+
+def get_sql_server_schema(conn_str, query):
+    """
+    Connects to SQL Server and runs a schema-only query to
+    dynamically build a BigQuery TableSchema object.
+    """
+    logging.info(f"Connecting to SQL Server for schema discovery...")
+    
+    # This is a robust way to get *only* the schema for *any* query
+    schema_query = f"SELECT TOP 0 * FROM ({query}) AS subquery"
+    
+    bq_schema = TableSchema()
+
+    try:
+        with pyodbc.connect(conn_str) as connection:
+            cursor = connection.cursor()
+            cursor.execute(schema_query)
+            
+            if not cursor.description:
+                raise ValueError(f"Query returned no columns: {query}")
+
+            logging.info(f"Discovered {len(cursor.description)} columns.")
+
+            for col in cursor.description:
+                col_name = col[0]
+                
+                # Get the type's name (e.g., 'int', 'Decimal', 'str')
+                py_type_name = col[1].__name__
+                
+                # Find the corresponding BigQuery type, default to STRING
+                bq_type = PYODBC_TYPE_NAME_TO_BQ.get(py_type_name, 'STRING')
+                
+                mode = 'NULLABLE'
+                
+                field_schema = TableFieldSchema(name=col_name, type=bq_type, mode=mode)
+                logging.info(f"  > Mapping column '{col_name}' (type {py_type_name}) to BQ type {bq_type}")
+                bq_schema.fields.append(field_schema)
+            
+            return bq_schema
+
+    except pyodbc.Error as e:
+        logging.error(f"SQL Server (pyodbc) Error during schema discovery: {e}")
+        logging.error(f"Connection string used: {conn_str.replace(os.environ.get('SQL_PASSWORD', ''), '***REDACTED***')}")
+        raise
+    except Exception as e:
+        logging.error(f"Failed to discover schema: {e}")
+        raise
+
+# ---------------------------------------------------------------------
+# 1. Define the custom step to read from SQL Server (Unchanged)
+# ---------------------------------------------------------------------
+class ReadFromSqlServerFn(beam.DoFn):
+    """
+    A custom DoFn to read data from an on-prem SQL Server.
+    """
+    def __init__(self, server, database, username, password, driver):
+        self.server = server
+        self.database = database
+        self.username = username
+        self.password = password
+        self.driver = driver
+        self.conn_str = (
+            f"DRIVER={{{self.driver}}};"
+            f"SERVER={self.server};"
+            f"DATABASE={self.database};"
+            f"UID={self.username};"
+            f"PWD={self.password};"
+        )
+        
+    def setup(self):
+        import pyodbc
+        self.connection = pyodbc.connect(self.conn_str)
+
+    def process(self, query):
+        try:
+            logging.info(f"Worker executing query: {query}")
+            cursor = self.connection.cursor()
+            cursor.execute(query)
+            
+            columns = [column[0] for column in cursor.description]
+            
+            for row in cursor.fetchall():
+                yield dict(zip(columns, row))
+                
+        except Exception as e:
+            logging.error(f"Worker error executing query: {e}")
+            raise
+        
+    def teardown(self):
+        if hasattr(self, 'connection'):
+            self.connection.close()
+
+# ---------------------------------------------------------------------
+# 2. Define the pipeline arguments (now with .env defaults)
+# ---------------------------------------------------------------------
+class SqlPipelineOptions(PipelineOptions):
+    @classmethod
+    def _add_argparse_args(cls, parser):
+        parser.add_argument("--input_query", required=True)
+        parser.add_argument("--output_table", required=True)
+        
+        # SQL Server connection parameters
+        parser.add_argument("--sql_driver", default=os.environ.get("SQL_DRIVER", "ODBC Driver 18 for SQL Server"))
+        parser.add_argument("--sql_server", default=os.environ.get("SQL_SERVER"))
+        parser.add_argument("--sql_database", default=os.environ.get("SQL_DATABASE"))
+        parser.add_argument("--sql_username", default=os.environ.get("SQL_USERNAME"))
+        parser.add_argument("--sql_password", default=os.environ.get("SQL_PASSWORD"))
+
+# ---------------------------------------------------------------------
+# 3. Define and run the main pipeline
+# ---------------------------------------------------------------------
+def run():
+    # Parse all pipeline arguments
+    pipeline_options = PipelineOptions()
+    sql_options = pipeline_options.view_as(SqlPipelineOptions)
+    
+    if not all([sql_options.sql_server, sql_options.sql_database, sql_options.sql_username, sql_options.sql_password]):
+        logging.fatal("SQL Server connection details are missing. Check .env file or command-line arguments.")
+        return
+
+    conn_str = (
+        f"DRIVER={{{sql_options.sql_driver}}};"
+        f"SERVER={sql_options.sql_server};"
+        f"DATABASE={sql_options.sql_database};"
+        f"UID={sql_options.sql_username};"
+        f"PWD={sql_options.sql_password};"
+    )
+
+    try:
+        bq_table_schema = get_sql_server_schema(conn_str, sql_options.input_query)
+        logging.info(f"Successfully generated BigQuery schema: {bq_table_schema}")
+    except Exception as e:
+        logging.fatal(f"Could not generate schema. Halting pipeline. Error: {e}")
+        return
+
+    with beam.Pipeline(options=pipeline_options) as p:
+        
+        (   p
+            | 'Create Query' >> beam.Create([sql_options.input_query])
+            
+            | 'Read from SQL Server' >> beam.ParDo(
+                ReadFromSqlServerFn(
+                    server=sql_options.sql_server,
+                    database=sql_options.sql_database,
+                    username=sql_options.sql_username,
+                    password=sql_options.sql_password,
+                    driver=sql_options.sql_driver
+                )
+            )
+            
+            | 'Write to BigQuery' >> beam.io.WriteToBigQuery(
+                sql_options.output_table,
+                schema=bq_table_schema,
+                create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED,
+                write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE
+            )
+        )
+
+if __name__ == '__main__':
+    logging.getLogger().setLevel(logging.INFO)
+    load_dotenv()
+    logging.info("Starting pipeline run...")
+    run()
