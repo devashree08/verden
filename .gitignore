@@ -7,17 +7,16 @@ from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.io.gcp.bigquery import TableSchema, TableFieldSchema
 from dotenv import load_dotenv
 
-# Type mapping from pyodbc cursor description types to BigQuery types
-# This is key to the robust schema translation.
-# Types from pyodbc: https://github.com/mkleehammer/pyodbc/wiki/Cursor#description
-PYODBC_TO_BQ_TYPE = {
-    int: 'INTEGER',
-    str: 'STRING',
-    float: 'FLOAT',
-    bool: 'BOOLEAN',
-    bytes: 'BYTES',
-    # Note: pyodbc maps decimal.Decimal, datetime.date, etc.
-    # to Python objects. We check by name for those.
+# --- SIMPLIFIED TYPE MAPPING ---
+# We will map from the *name* of the Python type. This is more explicit.
+# e.g., <class 'int'> -> __name__ is 'int'
+# e.g., <class 'decimal.Decimal'> -> __name__ is 'Decimal'
+PYODBC_TYPE_NAME_TO_BQ = {
+    'int': 'INTEGER',
+    'str': 'STRING',
+    'float': 'FLOAT',
+    'bool': 'BOOLEAN',
+    'bytes': 'BYTES',
     'Decimal': 'NUMERIC',
     'datetime': 'TIMESTAMP',
     'date': 'DATE',
@@ -49,27 +48,26 @@ def get_sql_server_schema(conn_str, query):
             for col in cursor.description:
                 col_name = col[0]
                 
-                # col[1] is the type_code (a Python type object)
-                py_type = col[1]
+                # Get the type's name (e.g., 'int', 'Decimal', 'str')
+                py_type_name = col[1].__name__
                 
-                # Get the type's name (e.g., 'Decimal', 'datetime')
-                py_type_name = py_type.__name__
+                # Find the corresponding BigQuery type, default to STRING
+                bq_type = PYODBC_TYPE_NAME_TO_BQ.get(py_type_name, 'STRING')
                 
-                # Find the corresponding BigQuery type
-                bq_type = PYODBC_TO_BQ_TYPE.get(
-                    py_type, 
-                    PYODBC_TO_BQ_TYPE.get(py_type_name, 'STRING')
-                )
-                
-                # Determine nullability. (col[6] == 'nullability')
                 # We default to 'NULLABLE' for safety.
-                mode = 'NULLABLE' # if col[6] else 'REQUIRED'
+                mode = 'NULLABLE'
                 
                 field_schema = TableFieldSchema(name=col_name, type=bq_type, mode=mode)
+                logging.info(f"  > Mapping column '{col_name}' (type {py_type_name}) to BQ type {bq_type}")
                 bq_schema.fields.append(field_schema)
-                
+            
+            # This 'return' is *outside* the 'for' loop
             return bq_schema
 
+    except pyodbc.Error as e:
+        logging.error(f"SQL Server (pyodbc) Error during schema discovery: {e}")
+        logging.error(f"Connection string used: {conn_str.replace(os.environ.get('SQL_PASSWORD', ''), '***REDACTED***')}")
+        raise
     except Exception as e:
         logging.error(f"Failed to discover schema: {e}")
         raise
@@ -143,6 +141,11 @@ def run():
     pipeline_options = PipelineOptions()
     sql_options = pipeline_options.view_as(SqlPipelineOptions)
     
+    # Check if essential SQL connection args are present
+    if not all([sql_options.sql_server, sql_options.sql_database, sql_options.sql_username, sql_options.sql_password]):
+        logging.fatal("SQL Server connection details are missing. Check .env file or command-line arguments.")
+        return
+
     # Build the connection string FOR THE DRIVER PROGRAM
     # (used only for schema discovery)
     conn_str = (
@@ -153,15 +156,12 @@ def run():
         f"PWD={sql_options.sql_password};"
     )
 
-    # --- ROBUSTNESS UPGRADE ---
-    # 1. Discover the source schema and build the BQ schema object
     try:
         bq_table_schema = get_sql_server_schema(conn_str, sql_options.input_query)
         logging.info(f"Successfully generated BigQuery schema: {bq_table_schema}")
     except Exception as e:
         logging.fatal(f"Could not generate schema. Halting pipeline. Error: {e}")
         return
-    # --- END UPGRADE ---
 
     with beam.Pipeline(options=pipeline_options) as p:
         
@@ -182,7 +182,7 @@ def run():
             # Write to BigQuery using the PRECISE, DISCOVERED schema
             | 'Write to BigQuery' >> beam.io.WriteToBigQuery(
                 sql_options.output_table,
-                schema=bq_table_schema,  # <-- Using our robust schema
+                schema=bq_table_schema,
                 create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED,
                 write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE
             )
