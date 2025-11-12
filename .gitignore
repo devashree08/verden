@@ -1,191 +1,1031 @@
-import argparse
-import logging
-import os
-import pyodbc
-import apache_beam as beam
-from apache_beam.options.pipeline_options import PipelineOptions
-from dotenv import load_dotenv
+import * as React from "react";
+import { useMemo, useRef, useState } from "react";
+import {
+  CssBaseline,
+  Container,
+  Box,
+  Card,
+  CardContent,
+  Typography,
+  Button,
+  ButtonGroup,
+  Stack,
+  TextField,
+  Switch,
+  FormControlLabel,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+  Chip,
+  Tabs,
+  Tab,
+  Divider,
+  Accordion,
+  AccordionSummary,
+  AccordionDetails,
+  List,
+  ListItemButton,
+  ListItemText,
+  IconButton,
+  Avatar,
+  LinearProgress,
+  Paper,
+  AppBar,
+  Toolbar,
+  Collapse,
+} from "@mui/material";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import VisibilityIcon from "@mui/icons-material/Visibility";
+import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
+import DescriptionIcon from "@mui/icons-material/Description";
+import PsychologyIcon from "@mui/icons-material/Psychology";
+import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import TaskAltIcon from "@mui/icons-material/TaskAlt";
+import AddLinkIcon from "@mui/icons-material/AddLink";
+import EditIcon from "@mui/icons-material/Edit";
+import ClearAllIcon from "@mui/icons-material/ClearAll";
+import CloseIcon from "@mui/icons-material/Close";
+import SaveIcon from "@mui/icons-material/Save";
+import AssignmentTurnedInIcon from "@mui/icons-material/AssignmentTurnedIn";
+import FilterListIcon from "@mui/icons-material/FilterList";
+import AssessmentIcon from "@mui/icons-material/Assessment";
 
-# ---------------------------------------------------------------------
-# THE FIX:
-# We are now importing DIRECTLY from the 'bigquery_schemas' file.
-# This bypasses the 'bigquery' module that was failing to import.
-# ---------------------------------------------------------------------
-from apache_beam.io.gcp.bigquery_schemas import TableSchema, TableFieldSchema
-# ---------------------------------------------------------------------
+/* ------------------ CSF 2.0 realistic test data (subset) ------------------ */
+const SUBCATS = [
+  "GV.RR-01",
+  "PR.AA-01",
+  "PR.AT-01",
+  "PR.DS-01",
+  "PR.PS-01",
+  "DE.AE-02",
+  "DE.AE-03",
+  "RS.MI-01",
+  "RC.RP-01",
+  "ID.IM-01",
+];
 
-# --- TYPE MAPPING ---
-PYODBC_TYPE_NAME_TO_BQ = {
-    'int': 'INTEGER',
-    'str': 'STRING',
-    'float': 'FLOAT',
-    'bool': 'BOOLEAN',
-    'bytes': 'BYTES',
-    'Decimal': 'NUMERIC',
-    'datetime': 'TIMESTAMP',
-    'date': 'DATE',
-    'time': 'TIME',
+const DEFINITIONS = {
+  "GV.RR-01":
+    "Organizational leadership is responsible and accountable for cybersecurity risk and fosters a risk-aware, ethical, continually improving culture.",
+  "PR.AA-01":
+    "Identities and credentials for authorized users, services, and hardware are managed by the organization.",
+  "PR.AT-01":
+    "Personnel receive awareness and training to perform general tasks with cyber risks in mind.",
+  "PR.DS-01": "Data-at-rest is protected (confidentiality, integrity, availability).",
+  "PR.PS-01": "Configuration management practices are established and applied.",
+  "DE.AE-02":
+    "Potentially adverse events are analyzed to better understand associated activities.",
+  "DE.AE-03": "Information is correlated from multiple sources.",
+  "RS.MI-01": "Incidents are contained.",
+  "RC.RP-01":
+    "Recovery portion of the incident response plan is executed once initiated from the incident response process.",
+  "ID.IM-01": "Improvements are identified from evaluations.",
+};
+
+const ORG_COLORS = {
+  VCS: "#0052cc", // Cyber
+  "VGS-T": "#7c4dff", // Technology
+  Network: "#00a65a", // Network
+  TPD: "#e67e22", // Product
+};
+const getOrgColor = (org) => ORG_COLORS[org] || "#1976d2";
+
+const makeArtifacts = (count, sc, lvl) =>
+  Array.from({ length: count }, (_, i) => ({
+    id: `${sc}-${lvl}-A${i + 1}`,
+    title: `Artifact ${i + 1} for ${sc}`,
+    url: `https://example.com/artifacts/${encodeURIComponent(sc)}/${lvl}/${i + 1}`,
+  }));
+
+const MATURITY = {};
+SUBCATS.forEach((sc) => {
+  MATURITY[sc] = {
+    L3: [
+      {
+        id: `${sc}-L3-1`,
+        title: "Attribute 1",
+        definition: `${DEFINITIONS[sc]} (baseline L3).`,
+        artifacts: makeArtifacts(2, sc, "L3"),
+      },
+      {
+        id: `${sc}-L3-2`,
+        title: "Attribute 2",
+        definition: `Documented process, periodic review, and stakeholder visibility for ${sc}.`,
+        artifacts: makeArtifacts(2, sc, "L3"),
+      },
+    ],
+    L4: [
+      {
+        id: `${sc}-L4-1`,
+        title: "Attribute 1",
+        definition: `Metrics-driven continuous improvement & automation for ${sc}.`,
+        artifacts: makeArtifacts(3, sc, "L4"),
+      },
+      {
+        id: `${sc}-L4-2`,
+        title: "Attribute 2",
+        definition: `Proactive validation and governance for ${sc}.`,
+        artifacts: makeArtifacts(2, sc, "L4"),
+      },
+      {
+        id: `${sc}-L4-3`,
+        title: "Attribute 3",
+        definition: `Integrated with enterprise risk metrics & assurance for ${sc}.`,
+        artifacts: makeArtifacts(2, sc, "L4"),
+      },
+    ],
+  };
+});
+
+const DB = { orgs: ["VCS", "VGS-T", "Network", "TPD"], subcategories: SUBCATS, maturity: MATURITY };
+
+/* Directory for filters (owners/custodians/functions) */
+const DIRECTORY = SUBCATS.reduce((acc, sc, i) => {
+  acc[sc] = {
+    function: ["Cyber", "Technology", "Network", "Product"][i % 4],
+    category: sc.split(".")[0],
+    owner: ["Nancy Schueller", "Nirvana Smith", "Jason Herden", "Felicia R. Sosa"][i % 4],
+    custodian: ["Arun Iyer", "Priya Shah", "Zoe Kim", "Luis Ortega"][i % 4],
+  };
+  return acc;
+}, {});
+
+/* ------------------ UI helpers ------------------ */
+function MultiSelect({ label, options, value, onChange }) {
+  return (
+    <FormControl fullWidth size="small">
+      <InputLabel id={`${label}-label`}>{label}</InputLabel>
+      <Select
+        labelId={`${label}-label`}
+        multiple
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        label={label}
+        renderValue={(sel) => (
+          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+            {sel.map((v) => (
+              <Chip key={v} label={v} size="small" />
+            ))}
+          </Box>
+        )}
+      >
+        {options.map((opt) => (
+          <MenuItem key={opt} value={opt}>
+            {opt}
+          </MenuItem>
+        ))}
+      </Select>
+    </FormControl>
+  );
 }
 
-def get_sql_server_schema(conn_str, query):
-    """
-    Connects to SQL Server and runs a schema-only query to
-    dynamically build a BigQuery TableSchema object.
-    """
-    logging.info(f"Connecting to SQL Server for schema discovery...")
-    
-    # This is a robust way to get *only* the schema for *any* query
-    schema_query = f"SELECT TOP 0 * FROM ({query}) AS subquery"
-    
-    bq_schema = TableSchema()
+/* ------------------ Mock Crew Agent (replace with your API) ------------------ */
+async function callAgentAPI({ agent, prompt, target }) {
+  await new Promise((r) => setTimeout(r, 800));
+  const score = Math.round(72 + Math.random() * 24);
+  const text =
+    target?.type === "attribute"
+      ? `Suggested comment for ${target.subcat} ${target.level} • ${target.title}:\n- Align artifacts to acceptance criteria.\n- Add evidence of periodic review.\n- Note exceptions and compensating controls.`
+      : `Narrative Assessor:\n• Strengths: clear scope, L3→L4 roadmap, KPI cadence.\n• Gaps: missing Tier-2 evidence in PR.DS-01.\n• Risks: dependency on legacy platforms.\n• Actions: prioritize IAM hardening, formalize artifact reviews.`;
+  return { agent, score, text, usage: { tokens: 600, ms: 800 } };
+}
 
-    try:
-        with pyodbc.connect(conn_str) as connection:
-            cursor = connection.cursor()
-            cursor.execute(schema_query)
-            
-            if not cursor.description:
-                raise ValueError(f"Query returned no columns: {query}")
+/* ------------------ Attribute block ------------------ */
+function AttributeBlock({
+  sc,
+  level,
+  attr,
+  comment,
+  onChangeComment,
+  artifacts,
+  onAddArtifact,
+  onAskAI,
+  blackBtn,
+}) {
+  const [adding, setAdding] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newUrl, setNewUrl] = useState("");
 
-            logging.info(f"Discovered {len(cursor.description)} columns.")
+  return (
+    <Accordion disableGutters>
+      <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 1 }}>
+        <Stack spacing={0.25} sx={{ pr: 1 }}>
+          <Typography fontWeight={600}>{attr.title}</Typography>
+          <Typography variant="body2" color="text.secondary">
+            {attr.definition}
+          </Typography>
+        </Stack>
+      </AccordionSummary>
+      <AccordionDetails>
+        <Stack spacing={1.25}>
+          <Stack direction="row" spacing={1} justifyContent="flex-end" flexWrap="wrap">
+            <Button
+              size="small"
+              startIcon={<PsychologyIcon />}
+              onClick={() =>
+                onAskAI({
+                  type: "attribute",
+                  subcat: sc,
+                  level,
+                  attributeId: attr.id,
+                  title: attr.title,
+                })
+              }
+              {...blackBtn}
+            >
+              AI Assist
+            </Button>
+            <Button size="small" startIcon={<EditIcon />} {...blackBtn}>
+              Edit
+            </Button>
+          </Stack>
 
-            for col in cursor.description:
-                col_name = col[0]
-                
-                # Get the type's name (e.g., 'int', 'Decimal', 'str')
-                py_type_name = col[1].__name__
-                
-                # Find the corresponding BigQuery type, default to STRING
-                bq_type = PYODBC_TYPE_NAME_TO_BQ.get(py_type_name, 'STRING')
-                
-                mode = 'NULLABLE'
-                
-                field_schema = TableFieldSchema(name=col_name, type=bq_type, mode=mode)
-                logging.info(f"  > Mapping column '{col_name}' (type {py_type_name}) to BQ type {bq_type}")
-                bq_schema.fields.append(field_schema)
-            
-            return bq_schema
+          <Box>
+            <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+              Artifacts
+            </Typography>
+            <List dense>
+              {artifacts.map((a) => (
+                <ListItemButton key={a.id} component="a" href={a.url} target="_blank">
+                  <ListItemText primary={a.title} secondary={a.url} />
+                </ListItemButton>
+              ))}
+            </List>
+            {adding ? (
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ mt: 1 }}>
+                <TextField
+                  size="small"
+                  label="Title"
+                  value={newTitle}
+                  onChange={(e) => setNewTitle(e.target.value)}
+                />
+                <TextField size="small" label="URL" value={newUrl} onChange={(e) => setNewUrl(e.target.value)} />
+                <Button
+                  size="small"
+                  startIcon={<AddLinkIcon />}
+                  {...blackBtn}
+                  onClick={() => {
+                    if (newTitle && newUrl) {
+                      onAddArtifact({ title: newTitle, url: newUrl });
+                      setNewTitle("");
+                      setNewUrl("");
+                      setAdding(false);
+                    }
+                  }}
+                >
+                  Add
+                </Button>
+                <IconButton size="small" onClick={() => setAdding(false)}>
+                  <CloseIcon fontSize="inherit" />
+                </IconButton>
+              </Stack>
+            ) : (
+              <Button
+                size="small"
+                startIcon={<AddLinkIcon />}
+                onClick={() => setAdding(true)}
+                sx={{ mt: 0.5 }}
+                {...blackBtn}
+              >
+                Add Artifact
+              </Button>
+            )}
+          </Box>
 
-    except pyodbc.Error as e:
-        logging.error(f"SQL Server (pyodbc) Error during schema discovery: {e}")
-        logging.error(f"Connection string used: {conn_str.replace(os.environ.get('SQL_PASSWORD', ''), '***REDACTED***')}")
-        raise
-    except Exception as e:
-        logging.error(f"Failed to discover schema: {e}")
-        raise
+          <TextField
+            label="Commentary"
+            fullWidth
+            size="small"
+            multiline
+            minRows={3}
+            value={comment || ""}
+            onChange={(e) => onChangeComment(e.target.value)}
+          />
+        </Stack>
+      </AccordionDetails>
+    </Accordion>
+  );
+}
 
-# ---------------------------------------------------------------------
-# 1. Define the custom step to read from SQL Server (Unchanged)
-# ---------------------------------------------------------------------
-class ReadFromSqlServerFn(beam.DoFn):
-    """
-    A custom DoFn to read data from an on-prem SQL Server.
-    """
-    def __init__(self, server, database, username, password, driver):
-        self.server = server
-        self.database = database
-        self.username = username
-        self.password = password
-        self.driver = driver
-        self.conn_str = (
-            f"DRIVER={{{self.driver}}};"
-            f"SERVER={self.server};"
-            f"DATABASE={self.database};"
-            f"UID={self.username};"
-            f"PWD={self.password};"
-        )
-        
-    def setup(self):
-        import pyodbc
-        self.connection = pyodbc.connect(self.conn_str)
+/* =============================== MAIN APP =============================== */
+export default function App() {
+  /* Narrative state */
+  const [org, setOrg] = useState("VCS");
+  const [subcats, setSubcats] = useState(["GV.RR-01", "DE.AE-02", "DE.AE-03"]);
+  const [execSum, setExecSum] = useState("");
+  const [scope, setScope] = useState("");
+  const [quant, setQuant] = useState(false);
+  const [coverage, setCoverage] = useState("");
+  const [pct, setPct] = useState(85);
+  const [levelTab, setLevelTab] = useState("L3");
 
-    def process(self, query):
-        try:
-            logging.info(f"Worker executing query: {query}")
-            cursor = self.connection.cursor()
-            cursor.execute(query)
-            
-            columns = [column[0] for column in cursor.description]
-            
-            for row in cursor.fetchall():
-                yield dict(zip(columns, row))
-                
-        except Exception as e:
-            logging.error(f"Worker error executing query: {e}")
-            raise
-        
-    def teardown(self):
-        if hasattr(self, 'connection'):
-            self.connection.close()
+  /* Comments & artifacts */
+  const [comments, setComments] = useState({});
+  const [artifactMap, setArtifactMap] = useState(() => {
+    const init = {};
+    DB.subcategories.forEach((sc) => {
+      ["L3", "L4"].forEach((lvl) => {
+        MATURITY[sc][lvl].forEach((a) => {
+          const k = `${sc}|${lvl}|${a.id}`;
+          init[k] = a.artifacts;
+        });
+      });
+    });
+    return init;
+  });
 
-# ---------------------------------------------------------------------
-# 2. Define the pipeline arguments (now with .env defaults)
-# ---------------------------------------------------------------------
-class SqlPipelineOptions(PipelineOptions):
-    @classmethod
-    def _add_argparse_args(cls, parser):
-        parser.add_argument("--input_query", required=True)
-        parser.add_argument("--output_table", required=True)
-        
-        # SQL Server connection parameters
-        parser.add_argument("--sql_driver", default=os.environ.get("SQL_DRIVER", "ODBC Driver 18 for SQL Server"))
-        parser.add_argument("--sql_server", default=os.environ.get("SQL_SERVER"))
-        parser.add_argument("--sql_database", default=os.environ.get("SQL_DATABASE"))
-        parser.add_argument("--sql_username", default=os.environ.get("SQL_USERNAME"))
-        parser.add_argument("--sql_password", default=os.environ.get("SQL_PASSWORD"))
+  /* Save / drafts */
+  const [drafts, setDrafts] = useState([]);
+  const [filtersOpen, setFiltersOpen] = useState(true);
+  const [filters, setFilters] = useState({
+    function: [],
+    category: [],
+    subcat: [],
+    owner: [],
+    custodian: [],
+    status: [],
+    org: [],
+  });
 
-# ---------------------------------------------------------------------
-# 3. Define and run the main pipeline
-# ---------------------------------------------------------------------
-def run():
-    # Parse all pipeline arguments
-    pipeline_options = PipelineOptions()
-    sql_options = pipeline_options.view_as(SqlPipelineOptions)
-    
-    if not all([sql_options.sql_server, sql_options.sql_database, sql_options.sql_username, sql_options.sql_password]):
-        logging.fatal("SQL Server connection details are missing. Check .env file or command-line arguments.")
-        return
+  /* AI panel – no chat: History + Assessor */
+  const [aiVisible, setAiVisible] = useState(true);
+  const [aiAgent, setAiAgent] = useState("Narrative Coach");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiTab, setAiTab] = useState(1); // 0 History, 1 Assessor (default Assessor)
+  // History holds both suggestions and applied changes
+  const [history, setHistory] = useState([]); // {id,type:'suggestion'|'applied', text, score?, agent, target?, ts}
+  const [assessorText, setAssessorText] = useState("");
 
-    conn_str = (
-        f"DRIVER={{{sql_options.sql_driver}}};"
-        f"SERVER={sql_options.sql_server};"
-        f"DATABASE={sql_options.sql_database};"
-        f"UID={sql_options.sql_username};"
-        f"PWD={sql_options.sql_password};"
-    )
+  /* Resizable split */
+  const [panePct, setPanePct] = useState(() => {
+    const v = Number(localStorage.getItem("panePctV5") || 60);
+    return Math.min(75, Math.max(35, v));
+  });
+  const containerRef = useRef(null);
+  const startDrag = (e) => {
+    if (!containerRef.current) return;
+    const startX = e.clientX;
+    const rect = containerRef.current.getBoundingClientRect();
+    const start = panePct;
+    const move = (ev) => {
+      const pct = Math.min(75, Math.max(35, start + ((ev.clientX - startX) / rect.width) * 100));
+      setPanePct(pct);
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      localStorage.setItem("panePctV5", String(panePct));
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
 
-    try:
-        bq_table_schema = get_sql_server_schema(conn_str, sql_options.input_query)
-        logging.info(f"Successfully generated BigQuery schema: {bq_table_schema}")
-    except Exception as e:
-        logging.fatal(f"Could not generate schema. Halting pipeline. Error: {e}")
-        return
+  /* Narrative string for export */
+  const narrative = useMemo(() => {
+    const lines = [];
+    lines.push(`# Narrative for ${org}`);
+    if (execSum) lines.push("", `**Executive Summary**\n${execSum}`);
+    if (scope) lines.push("", `**Scope**\n${scope}`);
+    if (quant) lines.push("", `**Coverage / Profile (Quantitative)**\nAssessed population coverage: ~${pct}%.`);
+    else if (coverage) lines.push("", `**Coverage / Profile (Qualitative)**\n${coverage}`);
+    lines.push("");
+    subcats.forEach((sc) => {
+      lines.push(`## ${sc}: ${DEFINITIONS[sc]}`);
+      ["L3", "L4"].forEach((lvl) => {
+        lines.push(`**Maturity ${lvl.replace("L", "Level ")}:**`);
+        MATURITY[sc][lvl].forEach((a) => {
+          const key = `${sc}|${lvl}|${a.id}`;
+          const arts = (artifactMap[key] || []).map((x) => x.title).join(", ");
+          lines.push(`- *${a.title}:* ${a.definition}`);
+          if (comments[key]) lines.push(`  - **Comment:** ${comments[key]}`);
+          lines.push(`  - **Artifacts:** ${arts}`);
+        });
+        lines.push("");
+      });
+    });
+    return lines.join("\n");
+  }, [org, subcats, execSum, scope, quant, coverage, pct, comments, artifactMap]);
 
-    with beam.Pipeline(options=pipeline_options) as p:
-        
-        (   p
-            | 'Create Query' >> beam.Create([sql_options.input_query])
-            
-            | 'Read from SQL Server' >> beam.ParDo(
-                ReadFromSqlServerFn(
-                    server=sql_options.sql_server,
-                    database=sql_options.sql_database,
-                    username=sql_options.sql_username,
-                    password=sql_options.sql_password,
-                    driver=sql_options.sql_driver
-                )
-            )
-            
-            | 'Write to BigQuery' >> beam.io.WriteToBigQuery(
-                sql_options.output_table,
-                schema=bq_table_schema,
-                create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED,
-                write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE
-            )
-        )
+  /* Black button style (sitewide) */
+  const blackBtn = {
+    sx: {
+      bgcolor: "#111",
+      color: "#fff",
+      "&:hover": { bgcolor: "#000", color: "#fff" },
+    },
+  };
 
-if __name__ == '__main__':
-    logging.getLogger().setLevel(logging.INFO)
-    load_dotenv()
-    logging.info("Starting pipeline run...")
-    run()
+  /* Export helpers */
+  async function exportPDF() {
+    const { jsPDF } = await import("jspdf");
+    const doc = new jsPDF({ unit: "pt", format: "a4" });
+    const margin = 40;
+    const maxWidth = 515;
+    const text = narrative.replaceAll("\n", "\n\n");
+    const lines = doc.splitTextToSize(text, maxWidth);
+    doc.text(lines, margin, margin);
+    doc.save(`Narrative_${org}.pdf`);
+  }
+  async function exportDocx() {
+    const docx = await import("docx");
+    const { Document, Packer, Paragraph, TextRun, HeadingLevel } = docx;
+    const blocks = [];
+    blocks.push(
+      new Paragraph({ heading: HeadingLevel.TITLE, children: [new TextRun(`Narrative for ${org}`)] })
+    );
+    narrative.split("\n").forEach((line) => {
+      if (!line.trim()) {
+        blocks.push(new Paragraph(""));
+        return;
+      }
+      if (line.startsWith("## ")) {
+        blocks.push(
+          new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun(line.replace("## ", ""))] })
+        );
+      } else if (line.startsWith("**") && line.endsWith("**")) {
+        blocks.push(
+          new Paragraph({ heading: HeadingLevel.HEADING_3, children: [new TextRun(line.replaceAll("**", ""))] })
+        );
+      } else {
+        blocks.push(new Paragraph({ children: [new TextRun(line.replaceAll("**", ""))] }));
+      }
+    });
+    const doc = new Document({ sections: [{ children: blocks }] });
+    const blob = await Packer.toBlob(doc);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `Narrative_${org}.docx`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /* AI actions (no chat) */
+  const runAI = async (prompt, target) => {
+    setAiBusy(true);
+    const res = await callAgentAPI({ agent: aiAgent, prompt, target });
+    // add as suggestion to History
+    setHistory((h) => [
+      ...h,
+      {
+        id: crypto.randomUUID(),
+        type: "suggestion",
+        agent: res.agent,
+        score: res.score,
+        target,
+        text: res.text,
+        ts: new Date().toISOString(),
+      },
+    ]);
+    setAiBusy(false);
+    setAiTab(0); // show History
+  };
+
+  const applySuggestion = (entry, destinationOverride) => {
+    const destination = destinationOverride || entry.target;
+    if (!entry?.text) return;
+
+    if (destination === "exec") setExecSum((v) => (v ? v + "\n\n" : "") + entry.text);
+    else if (destination === "scope") setScope((v) => (v ? v + "\n\n" : "") + entry.text);
+    else if (destination?.type === "attribute") {
+      const { subcat, level, attributeId } = destination;
+      const key = `${subcat}|${level}|${attributeId}`;
+      setComments((c) => ({ ...c, [key]: (c[key] ? c[key] + "\n\n" : "") + entry.text }));
+    }
+
+    setHistory((h) => [
+      ...h,
+      {
+        id: crypto.randomUUID(),
+        type: "applied",
+        agent: entry.agent,
+        score: entry.score,
+        target: destination,
+        text: entry.text,
+        ts: new Date().toISOString(),
+      },
+    ]);
+  };
+
+  const clearHistory = () => setHistory([]);
+
+  const runAssessor = async () => {
+    setAiTab(1);
+    const res = await callAgentAPI({
+      agent: "Narrative Assessor",
+      prompt: "Assess this narrative",
+      target: { type: "narrative" },
+    });
+    setAssessorText(`Confidence ${res.score}%\n\n${res.text}`);
+  };
+
+  /* Save/Load */
+  const saveDraft = (complete = false) => {
+    const entry = {
+      id: crypto.randomUUID(),
+      org,
+      subcats: [...subcats],
+      complete,
+      narrative,
+      meta: { execSum, scope, quant, coverage, pct, levelTab },
+      comments,
+      artifacts: artifactMap,
+      updatedAt: new Date().toISOString(),
+    };
+    setDrafts((d) => [entry, ...d]);
+  };
+
+  const filteredDrafts = drafts.filter((d) => {
+    if (filters.org.length && !filters.org.includes(d.org)) return false;
+    if (filters.status.length) {
+      const wantC = filters.status.includes("Complete");
+      const wantI = filters.status.includes("Incomplete");
+      if (!((wantC && d.complete) || (wantI && !d.complete))) return false;
+    }
+    if (filters.subcat.length && !d.subcats.some((s) => filters.subcat.includes(s))) return false;
+    if (filters.category.length && !d.subcats.some((s) => filters.category.includes(s.split(".")[0])))
+      return false;
+    if (filters.function.length && !d.subcats.some((s) => filters.function.includes(DIRECTORY[s].function)))
+      return false;
+    if (filters.owner.length && !d.subcats.some((s) => filters.owner.includes(DIRECTORY[s].owner)))
+      return false;
+    if (filters.custodian.length && !d.subcats.some((s) => filters.custodian.includes(DIRECTORY[s].custodian)))
+      return false;
+    return true;
+  });
+
+  /* UI */
+  const primaryColor = getOrgColor(org);
+
+  // Right pane (AI Assist)
+  const RightPane = (
+    <Card variant="outlined" sx={{ height: "100%" }}>
+      <CardContent sx={{ display: "flex", flexDirection: "column", gap: 1, height: "100%" }}>
+        <Stack direction="row" spacing={1} alignItems="center">
+          <Avatar sx={{ bgcolor: primaryColor }}>
+            <PsychologyIcon />
+          </Avatar>
+          <Box>
+            <Typography variant="h6">AI Assist</Typography>
+            <Typography variant="caption" color="text.secondary">
+              History · Assessor
+            </Typography>
+          </Box>
+          <Box sx={{ flex: 1 }} />
+          <Button size="small" variant="text" onClick={() => setAiVisible(false)} {...blackBtn}>
+            Hide
+          </Button>
+        </Stack>
+
+        <FormControl fullWidth size="small">
+          <InputLabel id="agent-label">Agent</InputLabel>
+          <Select
+            labelId="agent-label"
+            value={aiAgent}
+            label="Agent"
+            onChange={(e) => setAiAgent(e.target.value)}
+          >
+            <MenuItem value="Narrative Coach">Narrative Coach</MenuItem>
+            <MenuItem value="Attribute Assessor">Attribute Assessor</MenuItem>
+          </Select>
+        </FormControl>
+
+        <Tabs value={aiTab} onChange={(_, v) => setAiTab(v)}>
+          <Tab label="History" />
+          <Tab label="Assessor" />
+        </Tabs>
+
+        {/* HISTORY TAB */}
+        {aiTab === 0 && (
+          <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: "auto", minHeight: 260 }}>
+            <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+              <Typography variant="subtitle2">History</Typography>
+              <Button startIcon={<ClearAllIcon />} onClick={clearHistory} {...blackBtn}>
+                Clear
+              </Button>
+            </Stack>
+            <Stack spacing={1}>
+              {history.length === 0 && (
+                <Typography variant="body2" color="text.secondary">
+                  No history yet. Use “Enrich with AI” on the left or run the Assessor.
+                </Typography>
+              )}
+              {history.map((h) => (
+                <Box key={h.id}>
+                  <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
+                    <Chip
+                      size="small"
+                      label={h.type === "applied" ? "Applied" : "Suggestion"}
+                      color={h.type === "applied" ? "success" : "default"}
+                    />
+                    <Chip
+                      size="small"
+                      label={`Confidence ${h.score ?? 0}%`}
+                      color={h.score >= 85 ? "success" : h.score >= 75 ? "warning" : "default"}
+                    />
+                    <Typography variant="caption" color="text.secondary">
+                      {new Date(h.ts || Date.now()).toLocaleString()}
+                    </Typography>
+                  </Stack>
+                  <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                    {h.text}
+                  </Typography>
+                  {h.type === "suggestion" && (
+                    <Stack direction="row" spacing={1} sx={{ mt: 0.5 }} useFlexGap flexWrap="wrap">
+                      <Button
+                        size="small"
+                        startIcon={<TaskAltIcon fontSize="inherit" />}
+                        onClick={() => applySuggestion(h, "exec")}
+                        {...blackBtn}
+                      >
+                        Apply to Exec Summary
+                      </Button>
+                      <Button size="small" onClick={() => applySuggestion(h, "scope")} {...blackBtn}>
+                        Apply to Scope
+                      </Button>
+                      {h.target?.type === "attribute" && (
+                        <Button size="small" onClick={() => applySuggestion(h)} {...blackBtn}>
+                          Apply to Attribute Comment
+                        </Button>
+                      )}
+                      <IconButton
+                        size="small"
+                        title="Copy"
+                        onClick={() => navigator.clipboard.writeText(h.text)}
+                      >
+                        <ContentCopyIcon fontSize="inherit" />
+                      </IconButton>
+                    </Stack>
+                  )}
+                  <Divider sx={{ my: 1 }} />
+                </Box>
+              ))}
+              {aiBusy && (
+                <Box>
+                  <Typography variant="body2">Thinking…</Typography>
+                  <LinearProgress sx={{ my: 1 }} />
+                </Box>
+              )}
+            </Stack>
+          </Paper>
+        )}
+
+        {/* ASSESSOR TAB */}
+        {aiTab === 1 && (
+          <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: "auto", minHeight: 260 }}>
+            {assessorText ? (
+              <Typography sx={{ whiteSpace: "pre-wrap" }}>{assessorText}</Typography>
+            ) : (
+              <Stack alignItems="flex-start" spacing={1}>
+                <Typography variant="body2" color="text.secondary">
+                  Run the GenAI Narrative Assessor from the header to populate this view.
+                </Typography>
+                <Button startIcon={<AssessmentIcon />} onClick={runAssessor} {...blackBtn}>
+                  Run Assessor
+                </Button>
+              </Stack>
+            )}
+          </Paper>
+        )}
+      </CardContent>
+    </Card>
+  );
+
+  /* ------------------ Render ------------------ */
+  return (
+    <React.Fragment>
+      <CssBaseline />
+
+      {/* Sticky header */}
+      <AppBar position="sticky" elevation={0} color="default" sx={{ borderBottom: 1, borderColor: "divider" }}>
+        <Toolbar sx={{ gap: 1, flexWrap: "wrap" }}>
+          <Typography variant="h6" sx={{ flexGrow: 1 }}>
+            CSF 2.0 Narrative Generator
+          </Typography>
+          <Chip label={org} sx={{ bgcolor: getOrgColor(org), color: "#fff" }} />
+          <Button startIcon={<VisibilityIcon />} variant="outlined" {...blackBtn}>
+            Preview
+          </Button>
+          <Button startIcon={<PictureAsPdfIcon />} variant="outlined" onClick={exportPDF} {...blackBtn}>
+            PDF
+          </Button>
+          <Button startIcon={<DescriptionIcon />} variant="outlined" onClick={exportDocx} {...blackBtn}>
+            DOCX
+          </Button>
+          <Button startIcon={<AssessmentIcon />} onClick={runAssessor} {...blackBtn}>
+            GenAI Narrative Assessor
+          </Button>
+          <Divider orientation="vertical" flexItem />
+          <Button startIcon={<SaveIcon />} onClick={() => saveDraft(false)} {...blackBtn}>
+            Save
+          </Button>
+          <Button startIcon={<AssignmentTurnedInIcon />} onClick={() => saveDraft(true)} {...blackBtn}>
+            Mark Complete
+          </Button>
+          <Button startIcon={<FilterListIcon />} onClick={() => setFiltersOpen((v) => !v)} {...blackBtn}>
+            {filtersOpen ? "Hide Filters" : "Show Filters"}
+          </Button>
+          {!aiVisible && (
+            <Button onClick={() => setAiVisible(true)} {...blackBtn}>
+              Show AI
+            </Button>
+          )}
+        </Toolbar>
+      </AppBar>
+
+      {/* Filters (top, collapsible) */}
+      <Container maxWidth="lg" sx={{ mt: 2 }}>
+        <Card variant="outlined" sx={{ mb: 2 }}>
+          <CardContent>
+            <Stack direction="row" alignItems="center" justifyContent="space-between">
+              <Typography variant="subtitle1">Filters</Typography>
+              <Button size="small" onClick={() => setFiltersOpen((v) => !v)} {...blackBtn}>
+                {filtersOpen ? "Collapse" : "Expand"}
+              </Button>
+            </Stack>
+
+            <Collapse in={filtersOpen} timeout="auto" unmountOnExit>
+              <Stack spacing={2} sx={{ mt: 1 }}>
+                <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
+                  <MultiSelect label="Org" options={DB.orgs} value={filters.org} onChange={(v) => setFilters((f) => ({ ...f, org: v }))} />
+                  <MultiSelect
+                    label="Function"
+                    options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].function))]}
+                    value={filters.function}
+                    onChange={(v) => setFilters((f) => ({ ...f, function: v }))}
+                  />
+                  <MultiSelect
+                    label="Categories"
+                    options={[...new Set(SUBCATS.map((s) => s.split(".")[0]))]}
+                    value={filters.category}
+                    onChange={(v) => setFilters((f) => ({ ...f, category: v }))}
+                  />
+                </Stack>
+
+                <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
+                  <MultiSelect label="Subcategories" options={SUBCATS} value={filters.subcat} onChange={(v) => setFilters((f) => ({ ...f, subcat: v }))} />
+                  <MultiSelect
+                    label="SubcatOwner"
+                    options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].owner))]}
+                    value={filters.owner}
+                    onChange={(v) => setFilters((f) => ({ ...f, owner: v }))}
+                  />
+                  <MultiSelect
+                    label="SubcatCustodian"
+                    options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].custodian))]}
+                    value={filters.custodian}
+                    onChange={(v) => setFilters((f) => ({ ...f, custodian: v }))}
+                  />
+                  <MultiSelect label="Status" options={["Complete", "Incomplete"]} value={filters.status} onChange={(v) => setFilters((f) => ({ ...f, status: v }))} />
+                </Stack>
+              </Stack>
+            </Collapse>
+          </CardContent>
+        </Card>
+      </Container>
+
+      {/* Split panes (independent scroll areas) */}
+      <Container maxWidth="lg" sx={{ pb: 4 }}>
+        <Box
+          ref={containerRef}
+          sx={{
+            display: { xs: "block", md: "grid" },
+            gridTemplateColumns: aiVisible ? { md: `${panePct}% 6px ${100 - panePct}%` } : { md: "100%" },
+            columnGap: 0,
+            height: { md: "calc(100vh - 220px)" }, // independent scroll below header/filters
+          }}
+        >
+          {/* LEFT: linear narrative pane with left rail for saved narratives */}
+          <Box sx={{ overflowY: "auto" }}>
+            {/* Inner grid: left rail + content */}
+            <Box
+              sx={{
+                display: { xs: "block", md: "grid" },
+                gridTemplateColumns: { md: "280px 16px 1fr" },
+                columnGap: { md: 0 },
+                pr: { md: 1 },
+              }}
+            >
+              {/* Saved narratives rail */}
+              <Box sx={{ position: { md: "sticky" }, top: { md: 8 }, alignSelf: "start" }}>
+                <Card variant="outlined" sx={{ mb: 2 }}>
+                  <CardContent>
+                    <Typography variant="subtitle1">Saved Narratives</Typography>
+                    <Divider sx={{ my: 1 }} />
+                    <List dense sx={{ maxHeight: 420, overflowY: "auto" }}>
+                      {filteredDrafts.length === 0 && (
+                        <ListItemText primary="No saved narratives match filters." />
+                      )}
+                      {filteredDrafts.map((d) => (
+                        <ListItemButton
+                          key={d.id}
+                          onClick={() => {
+                            setOrg(d.org);
+                            setSubcats(d.subcats);
+                            setExecSum(d.meta.execSum);
+                            setScope(d.meta.scope);
+                            setQuant(d.meta.quant);
+                            setCoverage(d.meta.coverage);
+                            setPct(d.meta.pct);
+                            setLevelTab(d.meta.levelTab);
+                            setComments(d.comments);
+                            setArtifactMap(d.artifacts);
+                          }}
+                        >
+                          <ListItemText
+                            primary={`${d.org} • ${d.complete ? "Complete" : "Draft"}`}
+                            secondary={d.subcats.join(", ")}
+                          />
+                        </ListItemButton>
+                      ))}
+                    </List>
+                  </CardContent>
+                </Card>
+              </Box>
+
+              {/* Spacer between rail and content */}
+              <Box sx={{ display: { xs: "none", md: "block" } }} />
+
+              {/* Narrative content */}
+              <Box>
+                <Card variant="outlined" sx={{ mb: 2 }}>
+                  <CardContent>
+                    <Stack spacing={2}>
+                      <Box>
+                        <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+                          Organization
+                        </Typography>
+                        <ButtonGroup fullWidth>
+                          {DB.orgs.map((o) => (
+                            <Button
+                              key={o}
+                              variant={org === o ? "contained" : "outlined"}
+                              onClick={() => setOrg(o)}
+                              sx={{
+                                bgcolor: org === o ? getOrgColor(o) : undefined,
+                                color: org === o ? "#fff" : undefined,
+                                "&:hover": org === o ? { bgcolor: getOrgColor(o) } : undefined,
+                              }}
+                            >
+                              {o}
+                            </Button>
+                          ))}
+                        </ButtonGroup>
+                      </Box>
+
+                      <MultiSelect
+                        label="Subcategories"
+                        options={DB.subcategories}
+                        value={subcats}
+                        onChange={setSubcats}
+                      />
+
+                      <Stack spacing={1}>
+                        <Stack direction="row" alignItems="center" justifyContent="space-between">
+                          <Typography variant="subtitle2">Executive Summary</Typography>
+                          <Button
+                            size="small"
+                            onClick={() =>
+                              runAI("Draft an executive summary highlighting L3→L4 roadmap and KPIs.", "exec")
+                            }
+                            {...blackBtn}
+                          >
+                            Enrich with AI
+                          </Button>
+                        </Stack>
+                        <TextField
+                          value={execSum}
+                          onChange={(e) => setExecSum(e.target.value)}
+                          multiline
+                          minRows={3}
+                          fullWidth
+                          placeholder="Exec summary…"
+                        />
+                      </Stack>
+
+                      <Stack spacing={1}>
+                        <Stack direction="row" alignItems="center" justifyContent="space-between">
+                          <Typography variant="subtitle2">Scope</Typography>
+                          <Button
+                            size="small"
+                            onClick={() => runAI("Draft a concise scope statement.", "scope")}
+                            {...blackBtn}
+                          >
+                            Enrich with AI
+                          </Button>
+                        </Stack>
+                        <TextField
+                          value={scope}
+                          onChange={(e) => setScope(e.target.value)}
+                          multiline
+                          minRows={2}
+                          fullWidth
+                          placeholder="Scope…"
+                        />
+                      </Stack>
+
+                      <Box>
+                        <FormControlLabel
+                          control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />}
+                          label={quant ? "Quantitative" : "Qualitative"}
+                        />
+                        {!quant ? (
+                          <TextField
+                            value={coverage}
+                            onChange={(e) => setCoverage(e.target.value)}
+                            fullWidth
+                            placeholder="Qualitative coverage…"
+                          />
+                        ) : (
+                          <TextField
+                            label="Coverage %"
+                            type="number"
+                            inputProps={{ min: 0, max: 100 }}
+                            value={pct}
+                            onChange={(e) => setPct(Number(e.target.value))}
+                            sx={{ width: 160 }}
+                          />
+                        )}
+                      </Box>
+                    </Stack>
+                  </CardContent>
+                </Card>
+
+                {/* Attributes */}
+                <Card variant="outlined">
+                  <CardContent>
+                    <Tabs value={levelTab} onChange={(_, v) => setLevelTab(v)} variant="scrollable">
+                      <Tab label="Level 3" value="L3" />
+                      <Tab label="Level 4" value="L4" />
+                    </Tabs>
+                    <Divider sx={{ my: 1 }} />
+                    <Stack spacing={1.25}>
+                      {subcats.map((sc) => (
+                        <Box key={sc}>
+                          <Typography variant="h6" sx={{ mb: 0.5 }}>
+                            {sc}: {DEFINITIONS[sc]}
+                          </Typography>
+                          <Stack spacing={1}>
+                            {MATURITY[sc][levelTab].map((attr) => {
+                              const key = `${sc}|${levelTab}|${attr.id}`;
+                              return (
+                                <AttributeBlock
+                                  key={key}
+                                  sc={sc}
+                                  level={levelTab}
+                                  attr={attr}
+                                  comment={comments[key]}
+                                  artifacts={artifactMap[key] || []}
+                                  onChangeComment={(val) =>
+                                    setComments((c) => ({ ...c, [key]: val }))
+                                  }
+                                  onAddArtifact={(item) =>
+                                    setArtifactMap((m) => ({
+                                      ...m,
+                                      [key]: [...(m[key] || []), { id: crypto.randomUUID(), ...item }],
+                                    }))
+                                  }
+                                  onAskAI={(target) =>
+                                    runAI(
+                                      `Provide an evidence-based comment for ${target.subcat} ${target.level} (${attr.title}).`,
+                                      target
+                                    )
+                                  }
+                                  blackBtn={blackBtn}
+                                />
+                              );
+                            })}
+                          </Stack>
+                        </Box>
+                      ))}
+                    </Stack>
+                  </CardContent>
+                </Card>
+              </Box>
+            </Box>
+          </Box>
+
+          {/* Resizer between narrative and AI */}
+          {aiVisible && (
+            <Box
+              role="separator"
+              aria-label="Resize panes"
+              onMouseDown={startDrag}
+              sx={{
+                display: { xs: "none", md: "block" },
+                cursor: "col-resize",
+                bgcolor: "divider",
+                "&:hover": { bgcolor: "text.primary" },
+                width: 6,
+              }}
+            />
+          )}
+
+          {/* RIGHT: AI Assist – independently scrollable */}
+          {aiVisible && <Box sx={{ overflowY: "auto" }}>{RightPane}</Box>}
+        </Box>
+      </Container>
+    </React.Fragment>
+  );
+}
