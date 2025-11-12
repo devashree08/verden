@@ -30,7 +30,7 @@ import {
   Avatar,
   LinearProgress,
   Paper,
-  Collapse
+  Collapse,
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import VisibilityIcon from "@mui/icons-material/Visibility";
@@ -48,7 +48,6 @@ import AssignmentTurnedInIcon from "@mui/icons-material/AssignmentTurnedIn";
 import FilterListIcon from "@mui/icons-material/FilterList";
 import AssessmentIcon from "@mui/icons-material/Assessment";
 
-// Align sticky offsets with your layout
 import { NAVBAR_HEIGHT } from "../layouts/LayoutUIContext";
 
 /* ------------------ CSF 2.0 realistic test data (subset) ------------------ */
@@ -140,7 +139,7 @@ SUBCATS.forEach((sc) => {
 
 const DB = { orgs: ["VCS", "VGS-T", "Network", "TPD"], subcategories: SUBCATS, maturity: MATURITY };
 
-/* Directory to power filters */
+/* Directory to power filters + owners/custodians */
 const DIRECTORY = SUBCATS.reduce((acc, sc, i) => {
   acc[sc] = {
     function: ["Cyber", "Technology", "Network", "Product"][i % 4],
@@ -181,14 +180,15 @@ function MultiSelect({ label, options, value, onChange }) {
 }
 
 /* ------------------ Mock Crew Agent (replace with your API) ------------------ */
-async function callAgentAPI({ agent, prompt, target }) {
-  await new Promise((r) => setTimeout(r, 700));
+async function callAgentAPI({ agent, prompt, target, userComment }) {
+  await new Promise((r) => setTimeout(r, 650));
   const score = Math.round(72 + Math.random() * 24);
+  const contextNote = userComment ? `\n(User commentary included.)` : "";
   const text =
     target?.type === "attribute"
-      ? `Suggested comment for ${target.subcat} ${target.level} • ${target.title}:\n- Align artifacts to acceptance criteria.\n- Add evidence of periodic review.\n- Note exceptions and compensating controls.`
+      ? `Attribute Assessor for ${target.subcat} ${target.level} • ${target.title}:${contextNote}\n- Align artifacts to acceptance criteria.\n- Add evidence of periodic review.\n- Note exceptions and compensating controls.\n- Map gaps to L4 transition plan.`
       : `Narrative Assessor:\n• Strengths: clear scope, L3→L4 roadmap, KPI cadence.\n• Gaps: missing Tier-2 evidence in PR.DS-01.\n• Risks: dependency on legacy platforms.\n• Actions: prioritize IAM hardening, formalize artifact reviews.`;
-  return { agent, score, text, usage: { tokens: 600, ms: 700 } };
+  return { agent, score, text, usage: { tokens: 590, ms: 650 } };
 }
 
 /* ------------------ Attribute block ------------------ */
@@ -196,8 +196,10 @@ function AttributeBlock({
   sc,
   level,
   attr,
-  comment,
-  onChangeComment,
+  userComment,
+  onChangeUserComment,
+  aiComment,
+  onChangeAiComment,
   artifacts,
   onAddArtifact,
   onAskAI,
@@ -219,16 +221,31 @@ function AttributeBlock({
         </Stack>
       </AccordionSummary>
       <AccordionDetails>
-        <Stack spacing={1.25}>
+        <Stack spacing={1.5}>
+          {/* Action buttons */}
           <Stack direction="row" spacing={1} justifyContent="flex-end" flexWrap="wrap">
-            <Button size="small" startIcon={<PsychologyIcon />} onClick={() =>
-              onAskAI({ type: "attribute", subcat: sc, level, attributeId: attr.id, title: attr.title })
-            } {...aiBtn}>
+            <Button
+              size="small"
+              startIcon={<PsychologyIcon />}
+              onClick={() =>
+                onAskAI({
+                  type: "attribute",
+                  subcat: sc,
+                  level,
+                  attributeId: attr.id,
+                  title: attr.title,
+                })
+              }
+              {...aiBtn}
+            >
               AI Assist
             </Button>
-            <Button size="small" startIcon={<EditIcon />} {...actBtn}>Edit</Button>
+            <Button size="small" startIcon={<EditIcon />} {...actBtn}>
+              Edit
+            </Button>
           </Stack>
 
+          {/* Artifacts */}
           <Box>
             <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
               Artifacts
@@ -244,12 +261,19 @@ function AttributeBlock({
               <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ mt: 1 }}>
                 <TextField size="small" label="Title" value={newTitle} onChange={(e) => setNewTitle(e.target.value)} />
                 <TextField size="small" label="URL" value={newUrl} onChange={(e) => setNewUrl(e.target.value)} />
-                <Button size="small" startIcon={<AddLinkIcon />} {...actBtn} onClick={() => {
-                  if (newTitle && newUrl) {
-                    onAddArtifact({ title: newTitle, url: newUrl });
-                    setNewTitle(""); setNewUrl(""); setAdding(false);
-                  }
-                }}>
+                <Button
+                  size="small"
+                  startIcon={<AddLinkIcon />}
+                  {...actBtn}
+                  onClick={() => {
+                    if (newTitle && newUrl) {
+                      onAddArtifact({ title: newTitle, url: newUrl });
+                      setNewTitle("");
+                      setNewUrl("");
+                      setAdding(false);
+                    }
+                  }}
+                >
                   Add
                 </Button>
                 <IconButton size="small" onClick={() => setAdding(false)}>
@@ -263,15 +287,27 @@ function AttributeBlock({
             )}
           </Box>
 
-          <TextField
-            label="Commentary"
-            fullWidth
-            size="small"
-            multiline
-            minRows={3}
-            value={comment || ""}
-            onChange={(e) => onChangeComment(e.target.value)}
-          />
+          {/* Commentary (User & AI) */}
+          <Stack direction={{ xs: "column", md: "row" }} spacing={1}>
+            <TextField
+              label="User Commentary"
+              fullWidth
+              size="small"
+              multiline
+              minRows={3}
+              value={userComment || ""}
+              onChange={(e) => onChangeUserComment(e.target.value)}
+            />
+            <TextField
+              label="AI Notes"
+              fullWidth
+              size="small"
+              multiline
+              minRows={3}
+              value={aiComment || ""}
+              onChange={(e) => onChangeAiComment(e.target.value)}
+            />
+          </Stack>
         </Stack>
       </AccordionDetails>
     </Accordion>
@@ -290,8 +326,12 @@ export default function NarrativePage() {
   const [pct, setPct] = useState(85);
   const [levelTab, setLevelTab] = useState("L3");
 
+  /* Per-subcategory extras */
+  const [tracfone, setTracfone] = useState({}); // { [subcat]: string }
+
   /* Comments & artifacts */
-  const [comments, setComments] = useState({});
+  const [userComments, setUserComments] = useState({}); // { key: string }
+  const [aiComments, setAiComments] = useState({});     // { key: string }
   const [artifactMap, setArtifactMap] = useState(() => {
     const init = {};
     DB.subcategories.forEach((sc) => {
@@ -318,24 +358,24 @@ export default function NarrativePage() {
     org: [],
   });
 
-  /* AI panel – no chat: History + Assessor */
+  /* AI panel – tabs: History, Assessor, AI Result (no chat) */
   const [aiVisible, setAiVisible] = useState(true);
   const [aiAgent, setAiAgent] = useState("Narrative Coach");
   const [aiBusy, setAiBusy] = useState(false);
-  const [aiTab, setAiTab] = useState(1); // 0 History, 1 Assessor
+  const [aiTab, setAiTab] = useState(2); // 0 History, 1 Assessor, 2 AI Result
   const [history, setHistory] = useState([]); // {id,type:'suggestion'|'applied', text, score?, agent, target?, ts}
   const [assessorText, setAssessorText] = useState("");
+  const [aiResult, setAiResult] = useState(null); // { text, score, agent, target }
 
-  /* Split-resize: initial size adapts to viewport, persists on drag */
+  /* Split-resize: viewport-aware init, persistent thereafter */
   const [panePct, setPanePct] = useState(() => {
-    // first load: pick based on viewport if nothing saved
-    const saved = localStorage.getItem("ngPanePct");
+    const saved = localStorage.getItem("ngPanePct_v2");
     if (saved) return Number(saved);
     const w = window.innerWidth;
-    if (w >= 1600) return 62;   // wide screens: more narrative
-    if (w >= 1280) return 60;   // lg
-    if (w >= 1024) return 58;   // md
-    return 100;                 // stack on small (AI auto-hidden below)
+    if (w >= 1600) return 62;
+    if (w >= 1280) return 60;
+    if (w >= 1024) return 58;
+    return 100;
   });
   const containerRef = useRef(null);
   const startDrag = (e) => {
@@ -350,35 +390,28 @@ export default function NarrativePage() {
     const up = () => {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
-      localStorage.setItem("ngPanePct", String(panePct));
+      localStorage.setItem("ngPanePct_v2", String(panePct));
     };
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
   };
-
-  // If user resizes window and never dragged, re-evaluate initial split once.
-  const hasUserSetSplit = useRef(!!localStorage.getItem("ngPanePct"));
+  const hasUserSetSplit = useRef(!!localStorage.getItem("ngPanePct_v2"));
   useEffect(() => {
     if (hasUserSetSplit.current) return;
     const onResize = () => {
       if (hasUserSetSplit.current) return;
       const w = window.innerWidth;
-      const next =
-        w >= 1600 ? 62 :
-        w >= 1280 ? 60 :
-        w >= 1024 ? 58 : 100;
+      const next = w >= 1600 ? 62 : w >= 1280 ? 60 : w >= 1024 ? 58 : 100;
       setPanePct(next);
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
   useEffect(() => {
-    // Once user drags, stop auto-resize
-    const saved = localStorage.getItem("ngPanePct");
-    if (saved) hasUserSetSplit.current = true;
+    if (localStorage.getItem("ngPanePct_v2")) hasUserSetSplit.current = true;
   }, [panePct]);
 
-  /* Narrative text for export */
+  /* Narrative text for export (includes Tracfone Integration) */
   const narrative = useMemo(() => {
     const lines = [];
     lines.push(`# Narrative for ${org}`);
@@ -389,26 +422,30 @@ export default function NarrativePage() {
     lines.push("");
     subcats.forEach((sc) => {
       lines.push(`## ${sc}: ${DEFINITIONS[sc]}`);
+      lines.push(
+        `Owners: ${DIRECTORY[sc].owner} • Custodians: ${DIRECTORY[sc].custodian}`,
+        tracfone[sc] ? `Tracfone Integration: ${tracfone[sc]}` : ""
+      );
       ["L3", "L4"].forEach((lvl) => {
         lines.push(`**Maturity ${lvl.replace("L", "Level ")}:**`);
         MATURITY[sc][lvl].forEach((a) => {
           const key = `${sc}|${lvl}|${a.id}`;
           const arts = (artifactMap[key] || []).map((x) => x.title).join(", ");
           lines.push(`- *${a.title}:* ${a.definition}`);
-          if (comments[key]) lines.push(`  - **Comment:** ${comments[key]}`);
+          if (userComments[key]) lines.push(`  - **User Commentary:** ${userComments[key]}`);
+          if (aiComments[key]) lines.push(`  - **AI Notes:** ${aiComments[key]}`);
           lines.push(`  - **Artifacts:** ${arts}`);
         });
         lines.push("");
       });
     });
     return lines.join("\n");
-  }, [org, subcats, execSum, scope, quant, coverage, pct, comments, artifactMap]);
+  }, [org, subcats, execSum, scope, quant, coverage, pct, userComments, aiComments, artifactMap, tracfone]);
 
   /* Button styles */
   const aiBtn = { sx: { bgcolor: "#111", color: "#fff", "&:hover": { bgcolor: "#000" } } }; // AI-only
-  const primaryAct = { sx: { bgcolor: "#001C4D", color: "#fff", "&:hover": { bgcolor: "#001540" } } }; // brand navy
-  const neutralAct = { sx: { bgcolor: "#3C4858", color: "#fff", "&:hover": { bgcolor: "#2E3744" } } }; // slate
-  const outlineAct = { variant: "outlined", sx: { borderColor: "#001C4D", color: "#001C4D" } };
+  const primaryAct = { sx: { bgcolor: "#001C4D", color: "#fff", "&:hover": { bgcolor: "#001540" } } }; // brand navy (PDF/DOCX)
+  const neutralAct = { sx: { bgcolor: "#3C4858", color: "#fff", "&:hover": { bgcolor: "#2E3744" } } }; // slate (Save/Complete/Edit/Add)
 
   /* Export helpers */
   async function exportPDF() {
@@ -444,56 +481,85 @@ export default function NarrativePage() {
     URL.revokeObjectURL(url);
   }
 
-  /* AI actions (no chat) */
-  const runAI = async (prompt, target) => {
+  /* AI actions */
+  const runAttributeAI = async ({ subcat, level, attributeId, title }) => {
+    // Auto-select Attribute Assessor and switch to AI Result tab
+    setAiAgent("Attribute Assessor");
+    setAiTab(2);
+
+    // include user commentary for better answers
+    const key = `${subcat}|${level}|${attributeId}`;
+    const userComment = userComments[key];
+
     setAiBusy(true);
-    const res = await callAgentAPI({ agent: aiAgent, prompt, target });
-    setHistory((h) => [...h, {
-      id: crypto.randomUUID(),
-      type: "suggestion",
-      agent: res.agent,
-      score: res.score,
-      target,
-      text: res.text,
-      ts: new Date().toISOString(),
-    }]);
+    const res = await callAgentAPI({
+      agent: "Attribute Assessor",
+      prompt: `Assess attribute: ${subcat} ${level} - ${title}`,
+      target: { type: "attribute", subcat, level, attributeId, title },
+      userComment,
+    });
     setAiBusy(false);
-    setAiTab(0); // show History
+
+    // Put result into the AI Notes box for that attribute
+    setAiComments((m) => ({ ...m, [key]: (m[key] ? m[key] + "\n\n" : "") + res.text }));
+
+    // Show in AI Result tab and log in History
+    setAiResult({ text: res.text, score: res.score, agent: res.agent, target: { subcat, level, attributeId, title } });
+    setHistory((h) => [
+      ...h,
+      {
+        id: crypto.randomUUID(),
+        type: "suggestion",
+        agent: res.agent,
+        score: res.score,
+        target: { type: "attribute", subcat, level, attributeId, title },
+        text: res.text,
+        ts: new Date().toISOString(),
+      },
+    ]);
   };
-
-  const applySuggestion = (entry, destinationOverride) => {
-    const destination = destinationOverride || entry.target;
-    if (!entry?.text) return;
-
-    if (destination === "exec") setExecSum((v) => (v ? v + "\n\n" : "") + entry.text);
-    else if (destination === "scope") setScope((v) => (v ? v + "\n\n" : "") + entry.text);
-    else if (destination?.type === "attribute") {
-      const { subcat, level, attributeId } = destination;
-      const key = `${subcat}|${level}|${attributeId}`;
-      setComments((c) => ({ ...c, [key]: (c[key] ? c[key] + "\n\n" : "") + entry.text }));
-    }
-
-    setHistory((h) => [...h, {
-      id: crypto.randomUUID(),
-      type: "applied",
-      agent: entry.agent,
-      score: entry.score,
-      target: destination,
-      text: entry.text,
-      ts: new Date().toISOString(),
-    }]);
-  };
-  const clearHistory = () => setHistory([]);
 
   const runAssessor = async () => {
+    setAiAgent("Narrative Coach");
     setAiTab(1);
+    setAiBusy(true);
     const res = await callAgentAPI({
       agent: "Narrative Assessor",
       prompt: "Assess this narrative",
       target: { type: "narrative" },
     });
     setAssessorText(`Confidence ${res.score}%\n\n${res.text}`);
+    setAiBusy(false);
   };
+
+  const applyHistorySuggestion = (entry, destinationOverride) => {
+    const destination = destinationOverride || entry.target;
+    if (!entry?.text) return;
+
+    if (destination === "exec") {
+      // keep Exec AI (Phase 1 allows attribute AI, but leaving Exec apply handy)
+      setExecSum((v) => (v ? v + "\n\n" : "") + entry.text);
+    } else if (destination?.type === "attribute") {
+      const { subcat, level, attributeId } = destination;
+      const key = `${subcat}|${level}|${attributeId}`;
+      setAiComments((m) => ({ ...m, [key]: (m[key] ? m[key] + "\n\n" : "") + entry.text }));
+    }
+
+    setHistory((h) => [
+      ...h,
+      {
+        id: crypto.randomUUID(),
+        type: "applied",
+        agent: entry.agent,
+        score: entry.score,
+        target: destination,
+        text: entry.text,
+        ts: new Date().toISOString(),
+      },
+    ]);
+  };
+
+  const clearHistory = () => setHistory([]);
 
   /* Save/Load */
   const saveDraft = (complete = false) => {
@@ -503,8 +569,9 @@ export default function NarrativePage() {
       subcats: [...subcats],
       complete,
       narrative,
-      meta: { execSum, scope, quant, coverage, pct, levelTab },
-      comments,
+      meta: { execSum, scope, quant, coverage, pct, levelTab, tracfone },
+      userComments,
+      aiComments,
       artifacts: artifactMap,
       updatedAt: new Date().toISOString(),
     };
@@ -527,18 +594,16 @@ export default function NarrativePage() {
     return true;
   });
 
-  /* ---------- Layout blocks ---------- */
+  /* Styles */
+  const aiBtn = { sx: { bgcolor: "#111", color: "#fff", "&:hover": { bgcolor: "#000" } } };
+  const primaryAct = { sx: { bgcolor: "#001C4D", color: "#fff", "&:hover": { bgcolor: "#001540" } } };
+  const neutralAct = { sx: { bgcolor: "#3C4858", color: "#fff", "&:hover": { bgcolor: "#2E3744" } } };
 
-  // Sticky page action bar (sits under your Navbar)
+  /* ---------- Layout blocks ---------- */
   const ActionBar = (
     <Card
       variant="outlined"
-      sx={{
-        position: "sticky",
-        top: NAVBAR_HEIGHT + 8, // a little breathing room under Navbar
-        zIndex: (t) => t.zIndex.appBar - 1,
-        mb: 2,
-      }}
+      sx={{ position: "sticky", top: NAVBAR_HEIGHT + 8, zIndex: (t) => t.zIndex.appBar - 1, mb: 2 }}
     >
       <CardContent sx={{ py: 1.25 }}>
         <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap">
@@ -546,7 +611,7 @@ export default function NarrativePage() {
             CSF 2.0 Narrative
           </Typography>
           <Chip label={org} sx={{ bgcolor: getOrgColor(org), color: "#fff" }} />
-          <Button startIcon={<VisibilityIcon />} {...outlineAct}>
+          <Button startIcon={<VisibilityIcon />} variant="outlined" sx={{ borderColor: "#001C4D", color: "#001C4D" }}>
             Preview
           </Button>
           <Button startIcon={<PictureAsPdfIcon />} onClick={exportPDF} {...primaryAct}>
@@ -578,7 +643,6 @@ export default function NarrativePage() {
     </Card>
   );
 
-  // Top filters (collapsible)
   const FiltersBar = (
     <Card variant="outlined" sx={{ mb: 2 }}>
       <CardContent>
@@ -629,7 +693,6 @@ export default function NarrativePage() {
     </Card>
   );
 
-  // RIGHT: AI Assist (independent scroll)
   const RightPane = (
     <Card variant="outlined" sx={{ height: 1 }}>
       <CardContent sx={{ display: "flex", flexDirection: "column", gap: 1, height: 1 }}>
@@ -640,11 +703,11 @@ export default function NarrativePage() {
           <Box>
             <Typography variant="h6">AI Assist</Typography>
             <Typography variant="caption" color="text.secondary">
-              History · Assessor
+              History · Assessor · AI Result
             </Typography>
           </Box>
           <Box sx={{ flex: 1 }} />
-          <Button size="small" variant="text" onClick={() => setAiVisible(false)} {...aiBtn}>
+          <Button size="small" variant="text" onClick={() => setAiVisible(false)} sx={{ color: "#111" }}>
             Hide
           </Button>
         </Stack>
@@ -660,6 +723,7 @@ export default function NarrativePage() {
         <Tabs value={aiTab} onChange={(_, v) => setAiTab(v)}>
           <Tab label="History" />
           <Tab label="Assessor" />
+          <Tab label="AI Result" />
         </Tabs>
 
         {/* HISTORY */}
@@ -667,14 +731,14 @@ export default function NarrativePage() {
           <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: "auto", minHeight: 260 }}>
             <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
               <Typography variant="subtitle2">History</Typography>
-              <Button startIcon={<ClearAllIcon />} onClick={clearHistory} {...aiBtn}>
+              <Button startIcon={<ClearAllIcon />} onClick={clearHistory} sx={{ bgcolor: "#111", color: "#fff", "&:hover": { bgcolor: "#000" } }}>
                 Clear
               </Button>
             </Stack>
             <Stack spacing={1}>
               {history.length === 0 && (
                 <Typography variant="body2" color="text.secondary">
-                  No history yet. Use “Enrich with AI” on the left or run the Assessor.
+                  No history yet. Use “AI Assist” at the attribute level or run the Assessor.
                 </Typography>
               )}
               {history.map((h) => (
@@ -697,19 +761,11 @@ export default function NarrativePage() {
                   <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
                     {h.text}
                   </Typography>
-                  {h.type === "suggestion" && (
+                  {h.type === "suggestion" && h.target?.type === "attribute" && (
                     <Stack direction="row" spacing={1} sx={{ mt: 0.5 }} useFlexGap flexWrap="wrap">
-                      <Button size="small" startIcon={<TaskAltIcon fontSize="inherit" />} onClick={() => applySuggestion(h, "exec")} {...aiBtn}>
-                        Apply to Exec Summary
+                      <Button size="small" startIcon={<TaskAltIcon fontSize="inherit" />} onClick={() => applyHistorySuggestion(h, h.target)} sx={{ bgcolor: "#111", color: "#fff", "&:hover": { bgcolor: "#000" } }}>
+                        Apply to Attribute AI Notes
                       </Button>
-                      <Button size="small" onClick={() => applySuggestion(h, "scope")} {...aiBtn}>
-                        Apply to Scope
-                      </Button>
-                      {h.target?.type === "attribute" && (
-                        <Button size="small" onClick={() => applySuggestion(h)} {...aiBtn}>
-                          Apply to Attribute Comment
-                        </Button>
-                      )}
                       <IconButton size="small" title="Copy" onClick={() => navigator.clipboard.writeText(h.text)}>
                         <ContentCopyIcon fontSize="inherit" />
                       </IconButton>
@@ -738,10 +794,36 @@ export default function NarrativePage() {
                 <Typography variant="body2" color="text.secondary">
                   Run the GenAI Narrative Assessor from the Action Bar to populate this view.
                 </Typography>
-                <Button startIcon={<AssessmentIcon />} onClick={runAssessor} {...aiBtn}>
+                <Button startIcon={<AssessmentIcon />} onClick={runAssessor} sx={{ bgcolor: "#111", color: "#fff", "&:hover": { bgcolor: "#000" } }}>
                   Run Assessor
                 </Button>
               </Stack>
+            )}
+          </Paper>
+        )}
+
+        {/* AI RESULT (from clicking attribute-level AI Assist) */}
+        {aiTab === 2 && (
+          <Paper variant="outlined" sx={{ p: 1, flex: 1, overflow: "auto", minHeight: 260 }}>
+            {aiResult ? (
+              <Stack spacing={1}>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Chip size="small" label={`Agent: ${aiResult.agent}`} />
+                  <Chip
+                    size="small"
+                    label={`Confidence ${aiResult.score}%`}
+                    color={aiResult.score >= 85 ? "success" : aiResult.score >= 75 ? "warning" : "default"}
+                  />
+                </Stack>
+                <Typography variant="body2" color="text.secondary">
+                  Target: {aiResult.target?.subcat} {aiResult.target?.level} • {aiResult.target?.title}
+                </Typography>
+                <Typography sx={{ whiteSpace: "pre-wrap" }}>{aiResult.text}</Typography>
+              </Stack>
+            ) : (
+              <Typography variant="body2" color="text.secondary">
+                Trigger this tab by clicking “AI Assist” on any attribute.
+              </Typography>
             )}
           </Paper>
         )}
@@ -752,21 +834,97 @@ export default function NarrativePage() {
   /* ------------------ Render ------------------ */
   return (
     <Box sx={{ px: { xs: 2, md: 3 }, py: { xs: 2, md: 3 } }}>
-      {ActionBar}
-      {FiltersBar}
+      {/* Sticky page actions + top filters */}
+      <Card variant="outlined" sx={{ position: "sticky", top: NAVBAR_HEIGHT + 8, zIndex: (t) => t.zIndex.appBar - 1, mb: 2 }}>
+        <CardContent sx={{ py: 1.25 }}>
+          <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap">
+            <Typography variant="h6" sx={{ flexGrow: 1 }}>
+              CSF 2.0 Narrative
+            </Typography>
+            <Chip label={org} sx={{ bgcolor: getOrgColor(org), color: "#fff" }} />
+            <Button startIcon={<VisibilityIcon />} variant="outlined" sx={{ borderColor: "#001C4D", color: "#001C4D" }}>
+              Preview
+            </Button>
+            <Button startIcon={<PictureAsPdfIcon />} onClick={exportPDF} sx={{ bgcolor: "#001C4D", color: "#fff", "&:hover": { bgcolor: "#001540" } }}>
+              PDF
+            </Button>
+            <Button startIcon={<DescriptionIcon />} onClick={exportDocx} sx={{ bgcolor: "#001C4D", color: "#fff", "&:hover": { bgcolor: "#001540" } }}>
+              DOCX
+            </Button>
+            <Button startIcon={<AssessmentIcon />} onClick={runAssessor} sx={{ bgcolor: "#111", color: "#fff", "&:hover": { bgcolor: "#000" } }}>
+              GenAI Narrative Assessor
+            </Button>
+            <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+            <Button startIcon={<SaveIcon />} onClick={() => saveDraft(false)} sx={{ bgcolor: "#3C4858", color: "#fff", "&:hover": { bgcolor: "#2E3744" } }}>
+              Save
+            </Button>
+            <Button startIcon={<AssignmentTurnedInIcon />} onClick={() => saveDraft(true)} sx={{ bgcolor: "#3C4858", color: "#fff", "&:hover": { bgcolor: "#2E3744" } }}>
+              Mark Complete
+            </Button>
+            <Button startIcon={<FilterListIcon />} onClick={() => setFiltersOpen((v) => !v)} sx={{ bgcolor: "#3C4858", color: "#fff", "&:hover": { bgcolor: "#2E3744" } }}>
+              {filtersOpen ? "Hide Filters" : "Show Filters"}
+            </Button>
+            {!aiVisible && (
+              <Button onClick={() => setAiVisible(true)} sx={{ bgcolor: "#111", color: "#fff", "&:hover": { bgcolor: "#000" } }}>
+                Show AI
+              </Button>
+            )}
+          </Stack>
+        </CardContent>
+      </Card>
 
-      {/* Split grid – independent scroll panes. Height is viewport minus Navbar and some margins. */}
+      {/* Filters */}
+      <Card variant="outlined" sx={{ mb: 2 }}>
+        <CardContent>
+          <Stack direction="row" alignItems="center" justifyContent="space-between">
+            <Typography variant="subtitle1">Filters</Typography>
+            <Button size="small" onClick={() => setFiltersOpen((v) => !v)} sx={{ bgcolor: "#3C4858", color: "#fff", "&:hover": { bgcolor: "#2E3744" } }}>
+              {filtersOpen ? "Collapse" : "Expand"}
+            </Button>
+          </Stack>
+
+          <Collapse in={filtersOpen} timeout="auto" unmountOnExit>
+            <Stack spacing={2} sx={{ mt: 1 }}>
+              <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
+                <MultiSelect label="Org" options={DB.orgs} value={filters.org} onChange={(v) => setFilters((f) => ({ ...f, org: v }))} />
+                <MultiSelect label="Function" options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].function))]} value={filters.function} onChange={(v) => setFilters((f) => ({ ...f, function: v }))} />
+                <MultiSelect label="Categories" options={[...new Set(SUBCATS.map((s) => s.split(".")[0]))]} value={filters.category} onChange={(v) => setFilters((f) => ({ ...f, category: v }))} />
+              </Stack>
+
+              <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
+                <MultiSelect label="Subcategories" options={SUBCATS} value={filters.subcat} onChange={(v) => setFilters((f) => ({ ...f, subcat: v }))} />
+                <MultiSelect label="SubcatOwner" options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].owner))]} value={filters.owner} onChange={(v) => setFilters((f) => ({ ...f, owner: v }))} />
+                <MultiSelect label="SubcatCustodian" options={[...new Set(SUBCATS.map((s) => DIRECTORY[s].custodian))]} value={filters.custodian} onChange={(v) => setFilters((f) => ({ ...f, custodian: v }))} />
+                <MultiSelect label="Status" options={["Complete", "Incomplete"]} value={filters.status} onChange={(v) => setFilters((f) => ({ ...f, status: v }))} />
+              </Stack>
+
+              {/* Saved narratives list under filters on small screens (extra access); on desktop it's also in left rail */}
+              <Collapse in={false} unmountOnExit>
+                <List dense>
+                  {filteredDrafts.map((d) => (
+                    <ListItemButton key={d.id}>
+                      <ListItemText primary={`${d.org} • ${d.complete ? "Complete" : "Draft"}`} secondary={d.subcats.join(", ")} />
+                    </ListItemButton>
+                  ))}
+                </List>
+              </Collapse>
+            </Stack>
+          </Collapse>
+        </CardContent>
+      </Card>
+
+      {/* Split grid */}
       <Box
         ref={containerRef}
         sx={{
           display: { xs: "block", md: "grid" },
           gridTemplateColumns: aiVisible ? { md: `${panePct}% 6px ${100 - panePct}%` } : { md: "100%" },
           columnGap: 0,
-          height: { md: `calc(100vh - ${NAVBAR_HEIGHT + 160}px)` }, // approx minus action+filters height
+          height: { md: `calc(100vh - ${NAVBAR_HEIGHT + 160}px)` },
           minHeight: 480,
         }}
       >
-        {/* LEFT: scrollable narrative column with left Saved Narratives rail */}
+        {/* LEFT: scrollable narrative column with saved narratives rail */}
         <Box sx={{ overflowY: { md: "auto" } }}>
           <Box
             sx={{
@@ -783,9 +941,7 @@ export default function NarrativePage() {
                   <Typography variant="subtitle1">Saved Narratives</Typography>
                   <Divider sx={{ my: 1 }} />
                   <List dense sx={{ maxHeight: 420, overflowY: "auto" }}>
-                    {filteredDrafts.length === 0 && (
-                      <ListItemText primary="No saved narratives match filters." />
-                    )}
+                    {filteredDrafts.length === 0 && <ListItemText primary="No saved narratives match filters." />}
                     {filteredDrafts.map((d) => (
                       <ListItemButton
                         key={d.id}
@@ -798,7 +954,9 @@ export default function NarrativePage() {
                           setCoverage(d.meta.coverage);
                           setPct(d.meta.pct);
                           setLevelTab(d.meta.levelTab);
-                          setComments(d.comments);
+                          setTracfone(d.meta.tracfone || {});
+                          setUserComments(d.userComments || {});
+                          setAiComments(d.aiComments || {});
                           setArtifactMap(d.artifacts);
                         }}
                       >
@@ -821,6 +979,7 @@ export default function NarrativePage() {
               <Card variant="outlined" sx={{ mb: 2 }}>
                 <CardContent>
                   <Stack spacing={2}>
+                    {/* Org selector */}
                     <Box>
                       <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
                         Organization
@@ -843,25 +1002,20 @@ export default function NarrativePage() {
                       </ButtonGroup>
                     </Box>
 
-                    <MultiSelect
-                      label="Subcategories"
-                      options={DB.subcategories}
-                      value={subcats}
-                      onChange={setSubcats}
-                    />
+                    {/* Subcats */}
+                    <MultiSelect label="Subcategories" options={DB.subcategories} value={subcats} onChange={setSubcats} />
 
+                    {/* Exec Summary (keep AI enrich) */}
                     <Stack spacing={1}>
                       <Stack direction="row" alignItems="center" justifyContent="space-between">
                         <Typography variant="subtitle2">Executive Summary</Typography>
                         <Button
                           size="small"
                           onClick={() =>
-                            runAI(
-                              "Draft an executive summary highlighting L3→L4 roadmap and KPIs.",
-                              "exec"
-                            )
+                            // Phase 1 focuses on attribute AI, but we keep exec enrich available
+                            setAiResult(null) || setAiAgent("Narrative Coach") || setAiTab(1) || null
                           }
-                          {...aiBtn}
+                          sx={{ bgcolor: "#111", color: "#fff", "&:hover": { bgcolor: "#000" } }}
                         >
                           Enrich with AI
                         </Button>
@@ -876,17 +1030,9 @@ export default function NarrativePage() {
                       />
                     </Stack>
 
+                    {/* Scope (NO AI assist per request) */}
                     <Stack spacing={1}>
-                      <Stack direction="row" alignItems="center" justifyContent="space-between">
-                        <Typography variant="subtitle2">Scope</Typography>
-                        <Button
-                          size="small"
-                          onClick={() => runAI("Draft a concise scope statement.", "scope")}
-                          {...aiBtn}
-                        >
-                          Enrich with AI
-                        </Button>
-                      </Stack>
+                      <Typography variant="subtitle2">Scope</Typography>
                       <TextField
                         value={scope}
                         onChange={(e) => setScope(e.target.value)}
@@ -897,6 +1043,7 @@ export default function NarrativePage() {
                       />
                     </Stack>
 
+                    {/* Coverage */}
                     <Box>
                       <FormControlLabel
                         control={<Switch checked={quant} onChange={(e) => setQuant(e.target.checked)} />}
@@ -924,7 +1071,7 @@ export default function NarrativePage() {
                 </CardContent>
               </Card>
 
-              {/* Attributes */}
+              {/* Attributes per subcategory, including Tracfone + Owner/Custodian */}
               <Card variant="outlined">
                 <CardContent>
                   <Tabs value={levelTab} onChange={(_, v) => setLevelTab(v)} variant="scrollable">
@@ -932,12 +1079,28 @@ export default function NarrativePage() {
                     <Tab label="Level 4" value="L4" />
                   </Tabs>
                   <Divider sx={{ my: 1 }} />
-                  <Stack spacing={1.25}>
+                  <Stack spacing={1.5}>
                     {subcats.map((sc) => (
                       <Box key={sc}>
-                        <Typography variant="h6" sx={{ mb: 0.5 }}>
-                          {sc}: {DEFINITIONS[sc]}
-                        </Typography>
+                        <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ xs: "flex-start", md: "center" }} sx={{ mb: 0.5 }}>
+                          <Typography variant="h6">{sc}: {DEFINITIONS[sc]}</Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Owners: <strong>{DIRECTORY[sc].owner}</strong> • Custodians: <strong>{DIRECTORY[sc].custodian}</strong>
+                          </Typography>
+                        </Stack>
+
+                        {/* Tracfone Integration box */}
+                        <TextField
+                          label="Tracfone Integration"
+                          fullWidth
+                          size="small"
+                          multiline
+                          minRows={2}
+                          sx={{ mb: 1 }}
+                          value={tracfone[sc] || ""}
+                          onChange={(e) => setTracfone((m) => ({ ...m, [sc]: e.target.value }))}
+                        />
+
                         <Stack spacing={1}>
                           {MATURITY[sc][levelTab].map((attr) => {
                             const key = `${sc}|${levelTab}|${attr.id}`;
@@ -947,21 +1110,18 @@ export default function NarrativePage() {
                                 sc={sc}
                                 level={levelTab}
                                 attr={attr}
-                                comment={comments[key]}
+                                userComment={userComments[key]}
+                                onChangeUserComment={(val) => setUserComments((c) => ({ ...c, [key]: val }))}
+                                aiComment={aiComments[key]}
+                                onChangeAiComment={(val) => setAiComments((c) => ({ ...c, [key]: val }))}
                                 artifacts={artifactMap[key] || []}
-                                onChangeComment={(val) => setComments((c) => ({ ...c, [key]: val }))}
                                 onAddArtifact={(item) =>
                                   setArtifactMap((m) => ({
                                     ...m,
                                     [key]: [...(m[key] || []), { id: crypto.randomUUID(), ...item }],
                                   }))
                                 }
-                                onAskAI={(target) =>
-                                  runAI(
-                                    `Provide an evidence-based comment for ${target.subcat} ${target.level} (${attr.title}).`,
-                                    target
-                                  )
-                                }
+                                onAskAI={(target) => runAttributeAI(target)}
                                 aiBtn={aiBtn}
                                 actBtn={neutralAct}
                               />
