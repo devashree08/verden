@@ -49,7 +49,7 @@ const DEFINITIONS = {
 const ORG_COLORS = {
   VCS: "#0052cc",
   "VGS-T": "#7c4dff",
-  Network: "#f5b700",   // changed to yellow
+  Network: "#f5b700",   // yellow
   TPD: "#e67e22",
 };
 const getOrgColor = (org) => ORG_COLORS[org] || "#1976d2";
@@ -89,13 +89,15 @@ const DIRECTORY = SUBCATS.reduce((acc, sc, i) => {
   return acc;
 }, {});
 
-/* --------- MultiSelect with checkbox list (like your screenshot) ---------- */
-const MENU_PROPS = {
-  PaperProps: { style: { maxHeight: 360 } },
-};
+/* --------- MultiSelect with checkbox list + removable chips ---------- */
+const MENU_PROPS = { PaperProps: { style: { maxHeight: 360 } } };
 
 function MultiCheckboxSelect({ label, options, value, onChange, renderOption }) {
-  const allSelectedLabels = value;
+  const handleDelete = (val) => {
+    const newVals = value.filter((v) => v !== val);
+    onChange(newVals);
+  };
+
   return (
     <FormControl fullWidth size="small">
       <InputLabel id={`${label}-label`}>{label}</InputLabel>
@@ -106,17 +108,23 @@ function MultiCheckboxSelect({ label, options, value, onChange, renderOption }) 
         onChange={(e) => onChange(e.target.value)}
         label={label}
         MenuProps={MENU_PROPS}
-        renderValue={(sel) => (
+        renderValue={(selected) => (
           <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
-            {sel.map((v) => (
-              <Chip key={v} label={renderOption ? renderOption(v) : v} size="small" />
+            {selected.map((v) => (
+              <Chip
+                key={v}
+                label={renderOption ? renderOption(v) : v}
+                size="small"
+                onMouseDown={(e) => e.stopPropagation()} // keep menu closed when clicking X
+                onDelete={() => handleDelete(v)}
+              />
             ))}
           </Box>
         )}
       >
         {options.map((opt) => {
           const labelText = renderOption ? renderOption(opt) : opt;
-          const checked = allSelectedLabels.indexOf(opt) > -1;
+          const checked = value.indexOf(opt) > -1;
           return (
             <MenuItem key={opt} value={opt}>
               <ListItemIcon>
@@ -194,9 +202,19 @@ function AttributeBlock({
               <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ mt: 1 }}>
                 <TextField size="small" label="Title" value={newTitle} onChange={(e) => setNewTitle(e.target.value)} />
                 <TextField size="small" label="URL" value={newUrl} onChange={(e) => setNewUrl(e.target.value)} />
-                <Button size="small" startIcon={<AddLinkIcon />} {...actBtn} onClick={() => {
-                  if (newTitle && newUrl) { onAddArtifact({ title: newTitle, url: newUrl }); setNewTitle(""); setNewUrl(""); setAdding(false); }
-                }}>Add</Button>
+                <Button
+                  size="small"
+                  startIcon={<AddLinkIcon />}
+                  {...actBtn}
+                  onClick={() => {
+                    if (newTitle && newUrl) {
+                      onAddArtifact({ title: newTitle, url: newUrl });
+                      setNewTitle(""); setNewUrl(""); setAdding(false);
+                    }
+                  }}
+                >
+                  Add
+                </Button>
                 <IconButton size="small" onClick={() => setAdding(false)}><CloseIcon fontSize="inherit" /></IconButton>
               </Stack>
             ) : (
@@ -246,8 +264,8 @@ export default function NarrativePage() {
   const [pct, setPct] = useState(85);
   const [levelTab, setLevelTab] = useState("L3");
 
-  /* Per-subcategory Tracfone Integration text */
-  const [tracfone, setTracfone] = useState({});
+  /* Single Tracfone Integration field for this narrative */
+  const [tracfoneNote, setTracfoneNote] = useState("");
 
   /* Commentary and artifacts */
   const [userComments, setUserComments] = useState({});
@@ -271,7 +289,7 @@ export default function NarrativePage() {
   const [aiVisible, setAiVisible] = useState(true);
   const [aiAgent, setAiAgent] = useState("Narrative Coach");
   const [aiBusy, setAiBusy] = useState(false);
-  const [aiTab, setAiTab] = useState(0); // 0 AI Result, 1 Assessor, 2 History (new order)
+  const [aiTab, setAiTab] = useState(0); // 0 AI Result, 1 Assessor, 2 History
   const [history, setHistory] = useState([]);
   const [assessorText, setAssessorText] = useState("");
   const [aiResult, setAiResult] = useState(null);
@@ -327,7 +345,6 @@ export default function NarrativePage() {
   const narrative = useMemo(() => {
     const lines = [];
     lines.push(`# Narrative for ${org}`);
-    // Subcategory info first: Owners/Custodians for selected subcats
     if (subcats.length) {
       lines.push("", "**Subcategory Info**");
       subcats.forEach(sc => {
@@ -336,9 +353,7 @@ export default function NarrativePage() {
     }
     if (execSum) lines.push("", `**Executive Summary**\n${execSum}`);
     if (scope) lines.push("", `**Scope**\n${scope}`);
-    // Tracfone Integration after Scope
-    const tfNotes = subcats.map(sc => tracfone[sc] && `• ${sc}: ${tracfone[sc]}`).filter(Boolean).join("\n");
-    if (tfNotes) lines.push("", `**Tracfone Integration**\n${tfNotes}`);
+    if (tracfoneNote) lines.push("", `**Tracfone Integration**\n${tracfoneNote}`);
     if (quant) lines.push("", `**Coverage / Profile (Quantitative)**\nAssessed population coverage: ~${pct}%.`);
     else if (coverage) lines.push("", `**Coverage / Profile (Qualitative)**\n${coverage}`);
     lines.push("");
@@ -358,7 +373,7 @@ export default function NarrativePage() {
       });
     });
     return lines.join("\n");
-  }, [org, subcats, execSum, scope, tracfone, quant, coverage, pct, userComments, aiComments, artifactMap]);
+  }, [org, subcats, execSum, scope, tracfoneNote, quant, coverage, pct, userComments, aiComments, artifactMap]);
 
   /* Styles */
   const aiBtn = { sx: { bgcolor: "#111", color: "#fff", "&:hover": { bgcolor: "#000" } } };
@@ -393,7 +408,7 @@ export default function NarrativePage() {
   /* AI actions (attribute-focused) */
   const runAttributeAI = async ({ subcat, level, attributeId, title }) => {
     setAiAgent("Attribute Assessor");
-    setAiTab(0); // AI Result first
+    setAiTab(0); // AI Result
     const key = `${subcat}|${level}|${attributeId}`;
     setAiBusy(true);
     const res = await callAgentAPI({
@@ -403,7 +418,6 @@ export default function NarrativePage() {
       userComment: userComments[key],
     });
     setAiBusy(false);
-    // Fill AI Notes on that attribute
     setAiComments((m) => ({ ...m, [key]: (m[key] ? m[key] + "\n\n" : "") + res.text }));
     setAiResult({ text: res.text, score: res.score, agent: res.agent, target: { subcat, level, attributeId, title } });
     setHistory((h) => [...h, { id: crypto.randomUUID(), type: "suggestion", agent: res.agent, score: res.score, target: { type:"attribute", subcat, level, attributeId, title }, text: res.text, ts: new Date().toISOString() }]);
@@ -433,7 +447,7 @@ export default function NarrativePage() {
       subcats: [...subcats],
       complete,
       narrative,
-      meta: { execSum, scope, quant, coverage, pct, levelTab, tracfone },
+      meta: { execSum, scope, quant, coverage, pct, levelTab, tracfoneNote },
       userComments, aiComments, artifacts: artifactMap,
       updatedAt: new Date().toISOString(),
     };
@@ -556,7 +570,6 @@ export default function NarrativePage() {
           </Select>
         </FormControl>
 
-        {/* Tabs: AI Result, Assessor, History */}
         <Tabs value={aiTab} onChange={(_,v)=>setAiTab(v)}>
           <Tab label="AI Result" />
           <Tab label="Assessor" />
@@ -659,45 +672,50 @@ export default function NarrativePage() {
           minHeight:480,
         }}
       >
-        {/* LEFT column */}
+        {/* LEFT column (narrative + optional saved rail) */}
         <Box sx={{ overflowY:{ md:"auto" } }}>
           <Box
             sx={{
               display:{ xs:"block", md:"grid" },
-              gridTemplateColumns:{ md: `${savedOpen ? "280px" : "0px"}  ${savedOpen ? "16px" : "0px"} 1fr` },
+              gridTemplateColumns: savedOpen ? { md:"280px 16px 1fr" } : { md:"1fr" },
               columnGap:{ md:0 },
               pr:{ md:1 },
-              transition: "grid-template-columns 200ms ease",
             }}
           >
-            {/* Saved rail (toggle) */}
-            <Box sx={{ display: savedOpen ? "block" : "none", position:{ md:"sticky" }, top:{ md:0 }, alignSelf:"start" }}>
-              <Card variant="outlined" sx={{ mb:2 }}>
-                <CardContent>
-                  <Typography variant="subtitle1">Saved Narratives</Typography>
-                  <Divider sx={{ my:1 }}/>
-                  <List dense sx={{ maxHeight:420, overflowY:"auto" }}>
-                    {filteredDrafts.length===0 && <ListItemText primary="No saved narratives match filters." />}
-                    {filteredDrafts.map((d)=>(
-                      <ListItemButton key={d.id} onClick={()=> {
-                        setOrg(d.org); setSubcats(d.subcats);
-                        setExecSum(d.meta.execSum); setScope(d.meta.scope);
-                        setQuant(d.meta.quant); setCoverage(d.meta.coverage);
-                        setPct(d.meta.pct); setLevelTab(d.meta.levelTab);
-                        setTracfone(d.meta.tracfone || {});
-                        setUserComments(d.userComments || {}); setAiComments(d.aiComments || {});
-                        setArtifactMap(d.artifacts);
-                      }}>
-                        <ListItemText primary={`${d.org} • ${d.complete?"Complete":"Draft"}`} secondary={d.subcats.join(", ")} />
-                      </ListItemButton>
-                    ))}
-                  </List>
-                </CardContent>
-              </Card>
-            </Box>
-
-            {/* spacer */}
-            <Box sx={{ display: { xs:"none", md: savedOpen ? "block" : "none" } }} />
+            {savedOpen && (
+              <>
+                {/* Saved rail */}
+                <Box sx={{ position:{ md:"sticky" }, top:{ md:0 }, alignSelf:"start" }}>
+                  <Card variant="outlined" sx={{ mb:2 }}>
+                    <CardContent>
+                      <Typography variant="subtitle1">Saved Narratives</Typography>
+                      <Divider sx={{ my:1 }}/>
+                      <List dense sx={{ maxHeight:420, overflowY:"auto" }}>
+                        {filteredDrafts.length===0 && <ListItemText primary="No saved narratives match filters." />}
+                        {filteredDrafts.map((d)=>(
+                          <ListItemButton
+                            key={d.id}
+                            onClick={()=>{
+                              setOrg(d.org); setSubcats(d.subcats);
+                              setExecSum(d.meta.execSum); setScope(d.meta.scope);
+                              setQuant(d.meta.quant); setCoverage(d.meta.coverage);
+                              setPct(d.meta.pct); setLevelTab(d.meta.levelTab);
+                              setTracfoneNote(d.meta.tracfoneNote || "");
+                              setUserComments(d.userComments || {}); setAiComments(d.aiComments || {});
+                              setArtifactMap(d.artifacts);
+                            }}
+                          >
+                            <ListItemText primary={`${d.org} • ${d.complete?"Complete":"Draft"}`} secondary={d.subcats.join(", ")} />
+                          </ListItemButton>
+                        ))}
+                      </List>
+                    </CardContent>
+                  </Card>
+                </Box>
+                {/* spacer */}
+                <Box sx={{ display:{ xs:"none", md:"block" } }} />
+              </>
+            )}
 
             {/* Narrative content */}
             <Box>
@@ -723,16 +741,15 @@ export default function NarrativePage() {
                       </ButtonGroup>
                     </Box>
 
-                    {/* Subcategories (checkbox style) */}
+                    {/* Subcategories */}
                     <MultiCheckboxSelect
                       label="Subcategories"
                       options={DB.subcategories}
                       value={subcats}
                       onChange={setSubcats}
-                      renderOption={(sc) => `${sc}`}
                     />
 
-                    {/* Subcategory Info (Owners/Custodians) BEFORE Exec Summary */}
+                    {/* Subcategory Info */}
                     {subcats.length > 0 && (
                       <Card variant="outlined" sx={{ bgcolor:"background.default" }}>
                         <CardContent sx={{ py:1.5 }}>
@@ -757,7 +774,7 @@ export default function NarrativePage() {
                         <Typography variant="subtitle2">Executive Summary</Typography>
                         <Button
                           size="small"
-                          onClick={()=>{ /* Phase 1 focuses on attribute AI; keeping entry point to open AI pane */ setAiTab(1); setAiAgent("Narrative Coach"); }}
+                          onClick={()=>{ setAiTab(1); setAiAgent("Narrative Coach"); }}
                           sx={{ bgcolor:"#111", color:"#fff", "&:hover":{ bgcolor:"#000" } }}
                         >
                           Enrich with AI
@@ -766,30 +783,23 @@ export default function NarrativePage() {
                       <TextField value={execSum} onChange={(e)=>setExecSum(e.target.value)} multiline minRows={3} fullWidth placeholder="Exec summary…" />
                     </Stack>
 
-                    {/* Scope (manual) */}
+                    {/* Scope */}
                     <Stack spacing={1}>
                       <Typography variant="subtitle2">Scope</Typography>
                       <TextField value={scope} onChange={(e)=>setScope(e.target.value)} multiline minRows={2} fullWidth placeholder="Scope…" />
                     </Stack>
 
-                    {/* Tracfone Integration AFTER scope */}
-                    <Card variant="outlined">
-                      <CardContent sx={{ py:1.5 }}>
-                        <Typography variant="subtitle2" sx={{ mb:1 }}>Tracfone Integration</Typography>
-                        <Stack spacing={1}>
-                          {subcats.map(sc=>(
-                            <TextField
-                              key={sc}
-                              size="small"
-                              label={`${sc} — Tracfone note`}
-                              multiline minRows={2} fullWidth
-                              value={tracfone[sc] || ""}
-                              onChange={(e)=>setTracfone(m=>({ ...m, [sc]: e.target.value }))}
-                            />
-                          ))}
-                        </Stack>
-                      </CardContent>
-                    </Card>
+                    {/* Tracfone Integration – single field */}
+                    <Stack spacing={1}>
+                      <Typography variant="subtitle2">Tracfone Integration</Typography>
+                      <TextField
+                        value={tracfoneNote}
+                        onChange={(e)=>setTracfoneNote(e.target.value)}
+                        multiline minRows={2}
+                        fullWidth
+                        placeholder="Summary of Tracfone integration for this narrative…"
+                      />
+                    </Stack>
 
                     {/* Coverage */}
                     <Box>
@@ -804,7 +814,7 @@ export default function NarrativePage() {
                 </CardContent>
               </Card>
 
-              {/* Attributes block */}
+              {/* Attributes */}
               <Card variant="outlined">
                 <CardContent>
                   <Tabs value={levelTab} onChange={(_,v)=>setLevelTab(v)} variant="scrollable">
@@ -815,7 +825,6 @@ export default function NarrativePage() {
                   <Stack spacing={1.5}>
                     {subcats.map((sc)=>(
                       <Box key={sc}>
-                        {/* slimmer header */}
                         <Typography variant="subtitle1" fontWeight={800}>{sc}</Typography>
                         <Typography variant="body2" color="text.secondary" sx={{ mb:1 }}>
                           {DEFINITIONS[sc]}
